@@ -35,16 +35,17 @@ namespace MountedNPCCombatVR
 	extern RelocAddr<_PushActorAway> PushActorAway;
 	
 	// Task delegate for thread-safe PushActorAway
+	// Stores FormIDs instead of raw pointers for safety
 	class taskPushActorAway : public TaskDelegate
 	{
 	public:
 		virtual void Run();
 		virtual void Dispose();
 
-		taskPushActorAway(TESObjectREFR* akSource, Actor* akActor, float afKnockbackForce);
+		taskPushActorAway(UInt32 sourceFormID, UInt32 targetFormID, float afKnockbackForce);
 		
-		TESObjectREFR* m_akSource;
-		Actor* m_akActor;
+		UInt32 m_sourceFormID;
+		UInt32 m_targetFormID;
 		float m_afKnockbackForce;
 	};
 }

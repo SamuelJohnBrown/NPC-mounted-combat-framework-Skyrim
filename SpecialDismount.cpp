@@ -11,20 +11,52 @@
 
 namespace MountedNPCCombatVR
 {
+	// ============================================
+	// Forward declarations
+	// ============================================
+	static bool IsActorMounted(Actor* actor);
+	static bool IsActorBeingRidden(Actor* actor);
+	
 	// PushActorAway native function address (SKSEVR offset)
 	RelocAddr<_PushActorAway> PushActorAway(0x009D0E60);
 	
-	// Task delegate implementation
-	taskPushActorAway::taskPushActorAway(TESObjectREFR* akSource, Actor* akActor, float afKnockbackForce)
+	// Task delegate implementation - uses FormIDs for safety
+	taskPushActorAway::taskPushActorAway(UInt32 sourceFormID, UInt32 targetFormID, float afKnockbackForce)
 	{
-		m_akSource = akSource;
-		m_akActor = akActor;
+		m_sourceFormID = sourceFormID;
+		m_targetFormID = targetFormID;
 		m_afKnockbackForce = afKnockbackForce;
 	}
 
 	void taskPushActorAway::Run()
 	{
-		PushActorAway((*g_skyrimVM)->GetClassRegistry(), 0, m_akSource, m_akActor, m_afKnockbackForce);
+		// Re-lookup actors from FormIDs to ensure they're still valid
+		TESForm* sourceForm = LookupFormByID(m_sourceFormID);
+		TESForm* targetForm = LookupFormByID(m_targetFormID);
+		
+		if (!sourceForm || !targetForm)
+		{
+			_MESSAGE("SpecialDismount: PushActorAway skipped - source or target no longer valid");
+			return;
+		}
+		
+		TESObjectREFR* source = DYNAMIC_CAST(sourceForm, TESForm, TESObjectREFR);
+		Actor* target = DYNAMIC_CAST(targetForm, TESForm, Actor);
+		
+		if (!source || !target)
+		{
+			_MESSAGE("SpecialDismount: PushActorAway skipped - invalid cast");
+			return;
+		}
+		
+		// Check if target is still alive
+		if (target->IsDead(1))
+		{
+			_MESSAGE("SpecialDismount: PushActorAway skipped - target is dead");
+			return;
+		}
+		
+		PushActorAway((*g_skyrimVM)->GetClassRegistry(), 0, source, target, m_afKnockbackForce);
 	}
 
 	void taskPushActorAway::Dispose()
@@ -120,64 +152,32 @@ namespace MountedNPCCombatVR
 			force, targetName ? targetName : "Unknown", target->formID);
 		
 		// Queue the push via task interface for thread safety
-		g_task->AddTask(new taskPushActorAway(player, target, force));
+		// Pass FormIDs instead of raw pointers for safety
+		g_task->AddTask(new taskPushActorAway(player->formID, target->formID, force));
 	}
 
 	// Apply stagger spell to a mounted NPC, then ragdoll after a short delay
-	// The hostile stagger spell will make the rider enter combat with the player
 	static void ApplyStaggerAndRagdollToActor(Actor* target)
 	{
 		if (!target) return;
 		
-		if (!InitStaggerSpell())
+		// CRITICAL: Only apply ragdoll if the target is STILL MOUNTED
+		// Don't ragdoll them repeatedly after they've been dismounted
+		if (!IsActorMounted(target))
 		{
-			_MESSAGE("SpecialDismount: Cannot apply stagger - spell not initialized");
-			return;
-		}
-		
-		// Get player as the caster
-		if (!g_thePlayer || !(*g_thePlayer)) return;
-		Actor* player = *g_thePlayer;
-		
-		// Get magic caster from player (use left hand caster, slot 0)
-		ActorMagicCaster* caster = player->magicCasters[0]; // 0 = left hand
-		if (!caster)
-		{
-			caster = player->magicCasters[1]; // 1 = right hand
-		}
-		
-		if (!caster)
-		{
-			_MESSAGE("SpecialDismount: No magic caster available to cast stagger spell");
+			_MESSAGE("SpecialDismount: Target is no longer mounted - skipping ragdoll");
 			return;
 		}
 		
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-		_MESSAGE("SpecialDismount: Casting stagger spell on '%s' (FormID: %08X)", 
+		_MESSAGE("SpecialDismount: Applying ragdoll to '%s' (FormID: %08X)", 
 			targetName ? targetName : "Unknown", target->formID);
 		
-		// Cast the spell immediately on the target
-		// The hostile spell will cause the rider to enter combat with the player
-		caster->CastSpellImmediate(g_staggerSpell, false, target, 1.0f, false, 0.0f, player);
+		// Note: Stagger spell casting via ActorMagicCaster->CastSpellImmediate is not available
+		// in this SKSE version. Just apply ragdoll directly instead.
 		
-		// Store target formID for the delayed ragdoll
-		UInt32 targetFormID = target->formID;
-		
-		// Schedule ragdoll after a short delay (let stagger animation start)
-		std::thread([targetFormID]() {
-			std::this_thread::sleep_for(std::chrono::milliseconds(RAGDOLL_DELAY_MS));
-			
-			// Re-lookup the actor (it might have been unloaded)
-			TESForm* form = LookupFormByID(targetFormID);
-			if (form)
-			{
-				Actor* actor = DYNAMIC_CAST(form, TESForm, Actor);
-				if (actor && !actor->IsDead(1))
-				{
-					ApplyRagdollToActor(actor, RAGDOLL_FORCE);
-				}
-			}
-		}).detach();
+		// Apply ragdoll immediately
+		ApplyRagdollToActor(target, RAGDOLL_FORCE);
 	}
 
 	// Recursive node search by name
@@ -239,7 +239,30 @@ namespace MountedNPCCombatVR
 			{
 				if (g_grabs[i].isValid && !g_grabs[i].isMount)
 				{
-					// This is a rider grab - get controller Z
+					// This is a rider grab - first check if they're still mounted
+					TESForm* form = LookupFormByID(g_grabs[i].grabbedFormID);
+					if (!form)
+					{
+						g_grabs[i].isValid = false;
+						continue;
+					}
+					
+					Actor* grabbedActor = DYNAMIC_CAST(form, TESForm, Actor);
+					if (!grabbedActor)
+					{
+						g_grabs[i].isValid = false;
+						continue;
+					}
+					
+					// If rider is no longer mounted, stop tracking this grab
+					if (!IsActorMounted(grabbedActor))
+					{
+						_MESSAGE("SpecialDismount: Rider %08X dismounted - stopping pull detection", g_grabs[i].grabbedFormID);
+						g_grabs[i].isValid = false;
+						continue;
+					}
+					
+					// Get controller Z
 					float currentZ = GetControllerWorldZ(g_grabs[i].isLeftHand);
 					
 					if (g_hasLastZ)
@@ -257,16 +280,13 @@ namespace MountedNPCCombatVR
 								g_lastControllerZ,
 								currentZ);
 							
-							// Apply stagger spell and then ragdoll to the grabbed rider
-							TESForm* form = LookupFormByID(g_grabs[i].grabbedFormID);
-							if (form)
-							{
-								Actor* grabbedActor = DYNAMIC_CAST(form, TESForm, Actor);
-								if (grabbedActor)
-								{
-									ApplyStaggerAndRagdollToActor(grabbedActor);
-								}
-							}
+							// Apply ragdoll (function will check if still mounted)
+							ApplyStaggerAndRagdollToActor(grabbedActor);
+							
+							// Mark this grab as processed so we don't ragdoll again
+							// The rider will either dismount or stay mounted, but we only ragdoll once per grab
+							g_grabs[i].isValid = false;
+							_MESSAGE("SpecialDismount: Grab processed - will not ragdoll again for this grab");
 						}
 					}
 					

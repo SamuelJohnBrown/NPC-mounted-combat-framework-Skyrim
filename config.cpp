@@ -7,6 +7,12 @@ namespace MountedNPCCombatVR {
 	
 	// NPC Dismount Prevention - enabled by default
 	bool PreventNPCDismountOnAttack = true;
+	
+	// Weapon switch distance - default 230 units
+	float WeaponSwitchDistance = 230.0f;
+	
+	// Horse Stabilization - enabled by default
+	bool EnableHorseStabilization = true;
 
     void loadConfig() 
     {
@@ -24,7 +30,7 @@ namespace MountedNPCCombatVR {
             {
   transform(filepath.begin(), filepath.end(), filepath.begin(), ::tolower);
      _MESSAGE("loadConfig: Trying lowercase path: %s", filepath.c_str());
-                file.open(filepath);
+ file.open(filepath);
           }
 
 if (file.is_open()) 
@@ -37,58 +43,73 @@ if (file.is_open())
       while (std::getline(file, line)) 
    {
   trim(line);
-            skipComments(line);
+        skipComments(line);
 
           if (line.empty()) continue;
 
        if (line[0] == '[') 
        {
   // New section
-            size_t endBracket = line.find(']');
+   size_t endBracket = line.find(']');
     if (endBracket != std::string::npos) 
     {
            currentSection = line.substr(1, endBracket - 1);
-       trim(currentSection);
+    trim(currentSection);
         _MESSAGE("loadConfig: Entering section [%s]", currentSection.c_str());
          }
     }
-            else if (currentSection == "Settings") 
+     else if (currentSection == "Settings") 
         {
-      std::string variableName;
+    std::string variableName;
       std::string variableValueStr = GetConfigSettingsStringValue(line, variableName);
 
    if (variableName == "Logging") 
        {
-               logging = std::stoi(variableValueStr);
+          logging = std::stoi(variableValueStr);
      _MESSAGE("loadConfig: Logging level set to %d", logging);
      }
-           else if (variableName == "PreventNPCDismountOnAttack")
-                   {
+ else if (variableName == "PreventNPCDismountOnAttack")
+        {
         PreventNPCDismountOnAttack = (std::stoi(variableValueStr) != 0);
-             _MESSAGE("loadConfig: PreventNPCDismountOnAttack set to %s", 
+     _MESSAGE("loadConfig: PreventNPCDismountOnAttack set to %s", 
            PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
+         }
+         else if (variableName == "WeaponSwitchDistance")
+    {
+   WeaponSwitchDistance = std::stof(variableValueStr);
+ _MESSAGE("loadConfig: WeaponSwitchDistance set to %.0f", WeaponSwitchDistance);
+         }
+    else if (variableName == "EnableHorseStabilization")
+         {
+       EnableHorseStabilization = (std::stoi(variableValueStr) != 0);
+             _MESSAGE("loadConfig: EnableHorseStabilization set to %s", 
+ EnableHorseStabilization ? "ENABLED" : "DISABLED");
          }
        }  
         } 
      
       file.close();
-            }
+       }
         else
             {
-         _MESSAGE("loadConfig: Config file not found, using defaults:");
+   _MESSAGE("loadConfig: Config file not found, using defaults:");
    _MESSAGE("  - Logging: %d", logging);
-       _MESSAGE("  - PreventNPCDismountOnAttack: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
+  _MESSAGE("  - PreventNPCDismountOnAttack: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
+     _MESSAGE("  - WeaponSwitchDistance: %.0f", WeaponSwitchDistance);
+     _MESSAGE("  - EnableHorseStabilization: %s", EnableHorseStabilization ? "ENABLED" : "DISABLED");
      }
        
         _MESSAGE("loadConfig: Configuration loaded:");
-          _MESSAGE("  - Logging level: %d (0=ERR, 1=WARN, 2=INFO)", logging);
-            _MESSAGE("  - PreventNPCDismountOnAttack: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
+     _MESSAGE("  - Logging level: %d (0=ERR, 1=WARN, 2=INFO)", logging);
+      _MESSAGE("  - PreventNPCDismountOnAttack: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
+   _MESSAGE("  - WeaponSwitchDistance: %.0f", WeaponSwitchDistance);
+   _MESSAGE("  - EnableHorseStabilization: %s", EnableHorseStabilization ? "ENABLED" : "DISABLED");
        
 return;
         }
-        
+  
         _MESSAGE("loadConfig: Runtime directory is empty, using defaults");
-     return;
+   return;
     }
 
 	void Log(const int msgLogLevel, const char* fmt, ...)

@@ -2,10 +2,11 @@
 #include "DynamicPackages.h"
 #include "Helper.h"
 #include "SingleMountedCombat.h"
+#include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "WeaponDetection.h"
+#include "ArrowSystem.h"
 #include "AILogging.h"
-#include "TargetSelection.h"
 #include "skse64/GameData.h"
 #include "skse64/GameReferences.h"
 #include "skse64/GameForms.h"
@@ -23,7 +24,7 @@ namespace MountedNPCCombatVR
 	const float RANGED_MAX_RANGE = 2048.0f;
 	const float WEAPON_DRAW_DELAY = 0.2f;  // 200ms delay before drawing weapon
 	const float FOLLOW_UPDATE_INTERVAL = 0.1f;  // Update every 100ms for smooth rotation
-	const float MAX_COMBAT_DISTANCE = 2300.0f;  // If player gets this far, disengage combat
+	const float MAX_COMBAT_DISTANCE = 3500.0f;  // If target gets this far, disengage combat
 	
 	// ============================================
 	// Attack Animation Configuration
@@ -56,7 +57,7 @@ namespace MountedNPCCombatVR
 	static TESIdleForm* g_idlePowerAttackRight = nullptr;
 	
 	// ============================================
-	// Attack Animation Tracking (declared early for reset function)
+	// Attack Animation Tracking
 	// ============================================
 	
 	struct RiderAttackData
@@ -72,102 +73,6 @@ namespace MountedNPCCombatVR
 	static int g_riderAttackCount = 0;
 	
 	// ============================================
-	// Mount Tracking (declared early for reset function)
-	// ============================================
-	
-	static UInt32 g_controlledMounts[5] = {0};
-	static int g_controlledMountCount = 0;
-	
-	// ============================================
-	// Follow Player Tracking (declared early for reset function)
-	// ============================================
-	
-	struct FollowingNPCData
-	{
-		UInt32 actorFormID;
-		UInt32 targetFormID;
-		bool hasInjectedPackage;
-		float lastFollowUpdateTime;
-		int reinforceCount;
-		bool isValid;
-		bool inMeleeRange;
-		bool inAttackPosition;
-	};
-	
-	static FollowingNPCData g_followingNPCs[5];
-	static int g_followingNPCCount = 0;
-	
-	// ============================================
-	// Hit Detection Data (declared early for reset function)
-	// ============================================
-	
-	struct MountedAttackHitData
-	{
-		UInt32 riderFormID;
-		bool hitRegistered;
-		bool isPowerAttack;
-		float attackStartTime;
-		bool isValid;
-	};
-	
-	static MountedAttackHitData g_hitData[5];
-	static int g_hitDataCount = 0;
-	
-	// ============================================
-	// Reset Combat Styles System
-	// Called on game load/new game to clear stale state
-	// ============================================
-	
-	void ResetCombatStylesSystem()
-	{
-		_MESSAGE("CombatStyles: Resetting combat styles system...");
-		
-		// Reset initialization flags - forms will be re-looked up on next use
-		g_combatStylesInitialized = false;
-		g_attackAnimsInitialized = false;
-		
-		// Clear cached forms (they may be invalid after load)
-		g_idleAttackLeft = nullptr;
-		g_idleAttackRight = nullptr;
-		g_idlePowerAttackLeft = nullptr;
-		g_idlePowerAttackRight = nullptr;
-		
-		// Clear attack tracking
-		g_riderAttackCount = 0;
-		for (int i = 0; i < 5; i++)
-		{
-			g_riderAttackData[i].isValid = false;
-			g_riderAttackData[i].riderFormID = 0;
-		}
-		
-		// Clear mount control tracking
-		g_controlledMountCount = 0;
-		for (int i = 0; i < 5; i++)
-		{
-			g_controlledMounts[i] = 0;
-		}
-		
-		// Clear follow tracking - IMPORTANT: reset count FIRST
-		g_followingNPCCount = 0;
-		for (int i = 0; i < 5; i++)
-		{
-			g_followingNPCs[i].isValid = false;
-			g_followingNPCs[i].actorFormID = 0;
-			g_followingNPCs[i].targetFormID = 0;
-		}
-		
-		// Clear hit data
-		g_hitDataCount = 0;
-		for (int i = 0; i < 5; i++)
-		{
-			g_hitData[i].isValid = false;
-			g_hitData[i].riderFormID = 0;
-		}
-		
-		_MESSAGE("CombatStyles: System reset complete");
-	}
-	
-	// ============================================
 	// Attack Animation Functions
 	// ============================================
 	
@@ -181,16 +86,11 @@ namespace MountedNPCCombatVR
 	{
 		if (g_attackAnimsInitialized) return true;
 		
-		_MESSAGE("CombatStyles: Initializing attack animations from %s...", ESP_NAME);
+		_MESSAGE("CombatStyles: Initializing attack animations...");
 		
 		// Get the full FormIDs using the ESP lookup function
 		UInt32 leftFormID = GetFullFormIdMine(ESP_NAME, IDLE_ATTACK_LEFT_BASE_FORMID);
 		UInt32 rightFormID = GetFullFormIdMine(ESP_NAME, IDLE_ATTACK_RIGHT_BASE_FORMID);
-		
-		_MESSAGE("CombatStyles: Looking up LEFT attack - Base: %08X, Full: %08X", 
-			IDLE_ATTACK_LEFT_BASE_FORMID, leftFormID);
-		_MESSAGE("CombatStyles: Looking up RIGHT attack - Base: %08X, Full: %08X", 
-			IDLE_ATTACK_RIGHT_BASE_FORMID, rightFormID);
 		
 		if (leftFormID != 0)
 		{
@@ -198,14 +98,9 @@ namespace MountedNPCCombatVR
 			if (leftForm)
 			{
 				g_idleAttackLeft = DYNAMIC_CAST(leftForm, TESForm, TESIdleForm);
-				if (g_idleAttackLeft)
+				if (!g_idleAttackLeft)
 				{
-					_MESSAGE("CombatStyles: Found IDLE_ATTACK_LEFT (FormID: %08X)", leftFormID);
-				}
-				else
-				{
-					_MESSAGE("CombatStyles: ERROR - FormID %08X is not a TESIdleForm (type: %d)!", 
- 						leftFormID, leftForm->formType);
+					_MESSAGE("CombatStyles: ERROR - FormID %08X is not a TESIdleForm!", leftFormID);
 				}
 			}
 			else
@@ -224,14 +119,9 @@ namespace MountedNPCCombatVR
 			if (rightForm)
 			{
 				g_idleAttackRight = DYNAMIC_CAST(rightForm, TESForm, TESIdleForm);
-				if (g_idleAttackRight)
+				if (!g_idleAttackRight)
 				{
-					_MESSAGE("CombatStyles: Found IDLE_ATTACK_RIGHT (FormID: %08X)", rightFormID);
-				}
-				else
-				{
-					_MESSAGE("CombatStyles: ERROR - FormID %08X is not a TESIdleForm (type: %d)!", 
-						rightFormID, rightForm->formType);
+					_MESSAGE("CombatStyles: ERROR - FormID %08X is not a TESIdleForm!", rightFormID);
 				}
 			}
 			else
@@ -244,22 +134,12 @@ namespace MountedNPCCombatVR
 			_MESSAGE("CombatStyles: ERROR - Could not resolve FormID for IDLE_ATTACK_RIGHT from %s", ESP_NAME);
 		}
 		
-		// ============================================
 		// Load Power Attack Idles from Update.esm
-		// ============================================
-		
-		_MESSAGE("CombatStyles: Loading power attack animations from Update.esm...");
-		
-		// Power attacks use direct FormIDs since Update.esm is always loaded at index 01
 		TESForm* powerLeftForm = LookupFormByID(IDLE_POWER_ATTACK_LEFT_FORMID);
 		if (powerLeftForm)
 		{
 			g_idlePowerAttackLeft = DYNAMIC_CAST(powerLeftForm, TESForm, TESIdleForm);
-			if (g_idlePowerAttackLeft)
-			{
-				_MESSAGE("CombatStyles: Found IDLE_POWER_ATTACK_LEFT (FormID: %08X)", IDLE_POWER_ATTACK_LEFT_FORMID);
-			}
-			else
+			if (!g_idlePowerAttackLeft)
 			{
 				_MESSAGE("CombatStyles: ERROR - Power attack left FormID %08X is not a TESIdleForm!", IDLE_POWER_ATTACK_LEFT_FORMID);
 			}
@@ -273,11 +153,7 @@ namespace MountedNPCCombatVR
 		if (powerRightForm)
 		{
 			g_idlePowerAttackRight = DYNAMIC_CAST(powerRightForm, TESForm, TESIdleForm);
-			if (g_idlePowerAttackRight)
-			{
-				_MESSAGE("CombatStyles: Found IDLE_POWER_ATTACK_RIGHT (FormID: %08X)", IDLE_POWER_ATTACK_RIGHT_FORMID);
-			}
-			else
+			if (!g_idlePowerAttackRight)
 			{
 				_MESSAGE("CombatStyles: ERROR - Power attack right FormID %08X is not a TESIdleForm!", IDLE_POWER_ATTACK_RIGHT_FORMID);
 			}
@@ -291,9 +167,9 @@ namespace MountedNPCCombatVR
 		
 		bool success = (g_idleAttackLeft != nullptr && g_idleAttackRight != nullptr);
 		bool powerSuccess = (g_idlePowerAttackLeft != nullptr && g_idlePowerAttackRight != nullptr);
-		_MESSAGE("CombatStyles: Attack animations initialized - Regular: %s, Power: %s", 
-			success ? "SUCCESS" : "PARTIAL/FAILED",
-			powerSuccess ? "SUCCESS" : "PARTIAL/FAILED");
+		_MESSAGE("CombatStyles: Attack animations - Regular: %s, Power: %s", 
+			success ? "OK" : "FAILED",
+			powerSuccess ? "OK" : "FAILED");
 		
 		return success;
 	}
@@ -362,9 +238,17 @@ namespace MountedNPCCombatVR
 		return get_vfunc<_IAnimationGraphManagerHolder_NotifyAnimationGraph>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, event);
 	}
 	
-	bool PlayMountedAttackAnimation(Actor* rider, const char* playerSide)
+	bool PlayMountedAttackAnimation(Actor* rider, const char* targetSide)
 	{
 		if (!rider) return false;
+		
+		// ============================================
+		// SAFEGUARD: Only play melee attack if melee weapon is equipped
+		// ============================================
+		if (!IsMeleeEquipped(rider))
+		{
+			return false;
+		}
 		
 		// Initialize animations if not done
 		if (!g_attackAnimsInitialized)
@@ -376,22 +260,21 @@ namespace MountedNPCCombatVR
 		RiderAttackData* attackData = GetOrCreateRiderAttackData(rider->formID);
 		if (!attackData) return false;
 		
-		// Check cooldown - must wait full cooldown regardless of success/fail
+		// Check cooldown
 		float currentTime = GetAttackTimeSeconds();
 		float timeSinceLastAttack = currentTime - attackData->lastAttackTime;
 		
 		if (timeSinceLastAttack < ATTACK_COOLDOWN)
 		{
-			return false;  // Still on cooldown - silent fail, no log spam
+			return false;  // Still on cooldown
 		}
 		
-		// Reset attack state if cooldown has passed (attack animation should be done by now)
+		// Reset attack state if cooldown has passed
 		if (attackData->state != RiderAttackState::None && timeSinceLastAttack >= ATTACK_COOLDOWN)
 		{
 			attackData->state = RiderAttackState::None;
 		}
 		
-		// Check if already attacking (shouldn't happen after above reset, but safety check)
 		if (attackData->state != RiderAttackState::None)
 		{
 			return false;
@@ -400,12 +283,12 @@ namespace MountedNPCCombatVR
 		// Determine if this should be a power attack (5% chance)
 		bool isPowerAttack = (rand() % 100) < POWER_ATTACK_CHANCE;
 		
-		// Determine which idle to use based on player side and attack type
+		// Determine which idle to use
 		TESIdleForm* idleToPlay = nullptr;
 		const char* animName = "";
 		const char* attackType = "";
 		
-		if (strcmp(playerSide, "LEFT") == 0)
+		if (strcmp(targetSide, "LEFT") == 0)
 		{
 			if (isPowerAttack && g_idlePowerAttackLeft)
 			{
@@ -420,7 +303,7 @@ namespace MountedNPCCombatVR
 				attackType = "normal";
 			}
 		}
-		else if (strcmp(playerSide, "RIGHT") == 0)
+		else if (strcmp(targetSide, "RIGHT") == 0)
 		{
 			if (isPowerAttack && g_idlePowerAttackRight)
 			{
@@ -445,7 +328,6 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
-		// Get the animation event name from the TESIdleForm
 		const char* animEventName = idleToPlay->animationEvent.c_str();
 		
 		if (!animEventName || strlen(animEventName) == 0)
@@ -453,61 +335,50 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
-		// Check if rider is in a valid state for animation
-		// Must have 3D loaded and AI enabled
 		if (!rider->GetNiNode())
 		{
-			_MESSAGE("CombatStyles: Rider %08X has no 3D loaded - skipping attack", rider->formID);
-			attackData->lastAttackTime = currentTime;  // Still set cooldown
+			attackData->lastAttackTime = currentTime;
 			return false;
 		}
 		
 		if (!rider->processManager)
 		{
-			_MESSAGE("CombatStyles: Rider %08X has no process manager - skipping attack", rider->formID);
 			attackData->lastAttackTime = currentTime;
 			return false;
 		}
 		
-		// Check if rider is still mounted
 		NiPointer<Actor> mount;
 		if (!CALL_MEMBER_FN(rider, GetMount)(mount) || !mount)
 		{
-			_MESSAGE("CombatStyles: Rider %08X is not mounted - skipping attack", rider->formID);
 			attackData->lastAttackTime = currentTime;
 			return false;
 		}
 		
-		// Send the animation event via NotifyAnimationGraph
 		bool result = SendAnimationEvent(rider, animEventName);
 		
 		if (result)
 		{
-			// Update attack state and cooldown only on success
 			attackData->state = RiderAttackState::WindingUp;
 			attackData->stateStartTime = currentTime;
 			attackData->lastAttackTime = currentTime;
 			
-			// Reset hit detection for this new attack and set power attack flag
 			ResetHitData(rider->formID);
 			SetHitDataPowerAttack(rider->formID, isPowerAttack);
 			
-			_MESSAGE("CombatStyles: Rider %08X playing %s %s attack animation (event: %s)", 
-				rider->formID, attackType, animName, animEventName);
+			// Only log successful attacks (removed rejected animation logs)
+			_MESSAGE("CombatStyles: Rider %08X %s %s attack", rider->formID, attackType, animName);
 		}
-		else
-		{
-			// Log failure reason - but don't set cooldown so we can retry quickly
-			_MESSAGE("CombatStyles: Rider %08X animation event '%s' rejected (graph busy?)", 
-				rider->formID, animEventName);
-		}
+		// Removed the "animation rejected" log - too spammy
 		
 		return result;
 	}
 	
 	// ============================================
-	// Mount Control Release (for cleanup)
+	// Mount Tracking (for cleanup purposes only)
 	// ============================================
+	
+	static UInt32 g_controlledMounts[5] = {0};
+	static int g_controlledMountCount = 0;
 	
 	void ReleaseAllMountControl()
 	{
@@ -516,8 +387,23 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
-	// Follow Player Helper Functions
+	// Follow Target Tracking
 	// ============================================
+	
+	struct FollowingNPCData
+	{
+		UInt32 actorFormID;
+		UInt32 targetFormID;   // The target this NPC is following/attacking
+		bool hasInjectedPackage;
+		float lastFollowUpdateTime;
+		int reinforceCount;
+		bool isValid;
+		bool inMeleeRange;          // True when horse is close enough for melee
+		bool inAttackPosition;      // True when horse has turned sideways (90 deg)
+	};
+	
+	static FollowingNPCData g_followingNPCs[5];
+	static int g_followingNPCCount = 0;
 	
 	int FindFollowingNPCSlot(UInt32 formID)
 	{
@@ -529,189 +415,109 @@ namespace MountedNPCCombatVR
 		return -1;
 	}
 	
-	bool IsNPCFollowingPlayer(Actor* actor)
+	bool IsNPCFollowingTarget(Actor* actor)
 	{
 		if (!actor) return false;
 		return FindFollowingNPCSlot(actor->formID) >= 0;
 	}
 	
-	void SetNPCFollowPlayer(Actor* actor)
+	void SetNPCFollowTarget(Actor* actor, Actor* target)
 	{
 		if (!actor) return;
 		
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		
-		// Get the rider's combat target (could be player or another NPC)
-		Actor* target = GetRiderCombatTarget(actor);
+		// Default to player if no target specified
 		if (!target)
 		{
-			// Fallback to player if no valid target
-			if (g_thePlayer && *g_thePlayer)
-			{
-				target = *g_thePlayer;
-			}
-			else
-			{
-				_MESSAGE("CombatStyles: No valid target for '%s' - cannot set up follow", 
-					actorName ? actorName : "Unknown");
-				return;
-			}
+			if (!g_thePlayer || !(*g_thePlayer)) return;
+			target = *g_thePlayer;
 		}
 		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
 		
 		// Check if already tracked
 		int existingSlot = FindFollowingNPCSlot(actor->formID);
 		if (existingSlot >= 0)
 		{
-			// Already tracked - update target and re-inject the package
-			g_followingNPCs[existingSlot].targetFormID = target->formID;
-			
-			_MESSAGE("CombatStyles: Re-injecting follow package for '%s' (%08X) targeting '%s' (%08X)", 
-				actorName ? actorName : "Unknown", actor->formID,
-				targetName ? targetName : "Unknown", target->formID);
+			// Already tracked - just re-inject the package (no log needed)
 			InjectFollowPackage(actor, target);
 			g_followingNPCs[existingSlot].lastFollowUpdateTime = GetCurrentGameTime();
 			return;
 		}
 		
-		_MESSAGE("CombatStyles: ========================================");
-		_MESSAGE("CombatStyles: SETTING UP FOLLOW BEHAVIOR");
-		_MESSAGE("CombatStyles: NPC: '%s' (FormID: %08X)", actorName ? actorName : "Unknown", actor->formID);
-		_MESSAGE("CombatStyles: Target: '%s' (FormID: %08X)", targetName ? targetName : "Unknown", target->formID);
-		_MESSAGE("CombatStyles: ========================================");
+		// Only log new follow setups
+		_MESSAGE("CombatStyles: Setting up follow - '%s' -> '%s'", 
+			actorName ? actorName : "Unknown",
+			targetName ? targetName : "Unknown");
 		
 		// If this is the first NPC to start combat, notify the combat system
 		if (g_followingNPCCount == 0)
 		{
 			NotifyCombatStarted();
-			NotifyRangedCombatStarted();
 		}
 		
 		// Initialize dynamic package system if needed
 		if (!g_combatStylesInitialized)
 		{
-			_MESSAGE("CombatStyles: Initializing dynamic package system...");
 			InitDynamicPackageSystem();
 			g_combatStylesInitialized = true;
 		}
 		
-		// ============================================
-		// ADD COMBAT ARROWS TO INVENTORY (for bow users)
-		// ============================================
-		if (HasBowInInventory(actor))
-		{
-			AddArrowsToInventory(actor, 100);
-			_MESSAGE("CombatStyles: Added 100 arrows to '%s' for combat", actorName ? actorName : "Unknown");
-		}
-		
-		// Ensure weapon is drawn
 		SetWeaponDrawn(actor, true);
-		
-		// Set aggressive flag
 		actor->flags2 |= Actor::kFlag_kAttackOnSight;
 		
-		// Inject the follow package with the target
-		if (InjectFollowPackage(actor, target))
-		{
-			_MESSAGE("CombatStyles: Follow package injected successfully");
-		}
-		else
-		{
-			_MESSAGE("CombatStyles: ERROR - Follow package injection failed!");
-		}
+		InjectFollowPackage(actor, target);
 		
 		// Add to tracking list
-		if (g_followingNPCCount >= 0 && g_followingNPCCount < 5)
+		if (g_followingNPCCount < 5)
 		{
-			int slot = g_followingNPCCount;
-			g_followingNPCs[slot].actorFormID = actor->formID;
-			g_followingNPCs[slot].targetFormID = target->formID;
-			g_followingNPCs[slot].hasInjectedPackage = true;
-			g_followingNPCs[slot].lastFollowUpdateTime = GetCurrentGameTime();
-			g_followingNPCs[slot].reinforceCount = 0;
-			g_followingNPCs[slot].isValid = true;
-			g_followingNPCs[slot].inMeleeRange = false;
-			g_followingNPCs[slot].inAttackPosition = false;
+			g_followingNPCs[g_followingNPCCount].actorFormID = actor->formID;
+			g_followingNPCs[g_followingNPCCount].targetFormID = target->formID;
+			g_followingNPCs[g_followingNPCCount].hasInjectedPackage = true;
+			g_followingNPCs[g_followingNPCCount].lastFollowUpdateTime = GetCurrentGameTime();
+			g_followingNPCs[g_followingNPCCount].reinforceCount = 0;
+			g_followingNPCs[g_followingNPCCount].isValid = true;
+			g_followingNPCs[g_followingNPCCount].inMeleeRange = false;
+			g_followingNPCs[g_followingNPCCount].inAttackPosition = false;
 			g_followingNPCCount++;
-			
-			_MESSAGE("CombatStyles: Added to follow tracking list (count: %d)", g_followingNPCCount);
 		}
-		else
-		{
-			_MESSAGE("CombatStyles: ERROR - Cannot add to tracking, count out of bounds: %d", g_followingNPCCount);
-		}
-		
-		_MESSAGE("CombatStyles: ========================================");
 	}
 	
-	void ClearNPCFollowPlayer(Actor* actor)
+	// REMOVED: Single-argument overload that defaulted to player
+	// This was causing guards to target the player instead of hostiles!
+	// void SetNPCFollowTarget(Actor* actor) - DO NOT USE
+	// Always use SetNPCFollowTarget(actor, target) with explicit target
+	
+	void ClearNPCFollowTarget(Actor* actor)
 	{
 		if (!actor) return;
 		
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		
 		int slot = FindFollowingNPCSlot(actor->formID);
-		if (slot >= 0 && slot < 5)
+		if (slot >= 0)
 		{
-			_MESSAGE("CombatStyles: ========================================");
-			_MESSAGE("CombatStyles: CLEARING FOLLOW BEHAVIOR");
-			_MESSAGE("CombatStyles: NPC: '%s' (FormID: %08X)", actorName ? actorName : "Unknown", actor->formID);
-			_MESSAGE("CombatStyles: ========================================");
+			const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+			_MESSAGE("CombatStyles: Clearing follow for '%s'", actorName ? actorName : "Unknown");
 			
-			// Clear any injected packages on the rider
 			ClearInjectedPackages(actor);
-			
-			// Clear attack on sight flag on rider
 			actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
 			
-			// ============================================
-			// REMOVE COMBAT ARROWS FROM INVENTORY
-			// ============================================
-			RemoveArrowsFromInventory(actor, 100);
+			ResetBowAttackState(actor->formID);
+			ResetRapidFireBowAttack(actor->formID);
 			
-			// ============================================
-			// CLEAR HORSE PACKAGES AND OFFSET
-			// ============================================
 			NiPointer<Actor> mount;
 			if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
 			{
-				_MESSAGE("CombatStyles: Clearing horse %08X packages and movement offset", mount->formID);
-				
-				// Clear any injected packages on the horse (restore original AI)
 				ClearInjectedPackages(mount.get());
-				
-				// Clear any KeepOffset commands on the horse
 				Actor_ClearKeepOffsetFromActor(mount.get());
-				
-				// Clear turn direction tracking
-				ClearHorseTurnDirection(mount->formID);
-				
-				// Clear combat target and flags on horse
+				ClearAllMovesetData(mount->formID);
 				mount->currentCombatTarget = 0;
 				mount->flags2 &= ~Actor::kFlag_kAttackOnSight;
 			}
 			
-			// Mark slot as invalid first
-			g_followingNPCs[slot].isValid = false;
-			
-			// Shift remaining entries down (only if not the last entry)
-			if (slot < g_followingNPCCount - 1)
-			{
-				for (int i = slot; i < g_followingNPCCount - 1 && i < 4; i++)
-				{
-					g_followingNPCs[i] = g_followingNPCs[i + 1];
-				}
-			}
-			
-			// Clear the last slot and decrement count
-			if (g_followingNPCCount > 0)
-			{
-				g_followingNPCCount--;
-				g_followingNPCs[g_followingNPCCount].isValid = false;
-			}
-			
-			_MESSAGE("CombatStyles: Cleared, removed from tracking (count: %d)", g_followingNPCCount);
+			// Remove from tracking
+			for (int i = slot; i < g_followingNPCCount - 1; i++)
+				g_followingNPCs[i] = g_followingNPCs[i + 1];
+			g_followingNPCCount--;
 		}
 	}
 	
@@ -741,7 +547,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Continuous Follow Update
 	// Re-injects travel package periodically to update destination
-	// Stops following if player gets too far away or rider exits combat
+	// Stops following if target gets too far away or rider exits combat
 	// ============================================
 	
 	void UpdateFollowBehavior()
@@ -767,6 +573,14 @@ namespace MountedNPCCombatVR
 			
 			Actor* actor = static_cast<Actor*>(form);
 			
+			// Safety check - verify actor has process manager
+			if (!actor->processManager)
+			{
+				_MESSAGE("CombatStyles: NPC %08X has no process manager - removing from tracking", actor->formID);
+				g_followingNPCs[i].isValid = false;
+				continue;
+			}
+			
 			// Check if still alive
 			if (actor->IsDead(1))
 			{
@@ -782,50 +596,12 @@ namespace MountedNPCCombatVR
 				continue;
 			}
 			
-			// ============================================
-			// GET CURRENT COMBAT TARGET (may have changed)
-			// ============================================
-			Actor* target = GetRiderCombatTarget(actor);
-			
-			// If target changed, update tracking
-			if (target && target->formID != g_followingNPCs[i].targetFormID)
+			// Safety check - verify mount has process manager
+			if (!mount->processManager)
 			{
-				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-				const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-				_MESSAGE("CombatStyles: Rider '%s' target changed to '%s' (%08X)",
-					actorName ? actorName : "Unknown",
-					targetName ? targetName : "Unknown", target->formID);
-				g_followingNPCs[i].targetFormID = target->formID;
-			}
-			
-			// If no valid target, try to get from stored FormID
-			if (!target && g_followingNPCs[i].targetFormID != 0)
-			{
-				TESForm* targetForm = LookupFormByID(g_followingNPCs[i].targetFormID);
-				if (targetForm && targetForm->formType == kFormType_Character)
-				{
-					target = static_cast<Actor*>(targetForm);
-					if (!IsValidCombatTarget(actor, target))
-					{
-						target = nullptr;
-					}
-				}
-			}
-			
-			// Fallback to player if still no target
-			if (!target && g_thePlayer && *g_thePlayer)
-			{
-				target = *g_thePlayer;
-				g_followingNPCs[i].targetFormID = target->formID;
-			}
-			
-			if (!target)
-			{
-				// No valid target - clear follow behavior
-				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-				_MESSAGE("CombatStyles: Rider '%s' has no valid target - clearing follow",
-					actorName ? actorName : "Unknown");
-				ClearNPCFollowPlayer(actor);
+				_MESSAGE("CombatStyles: Mount %08X has no process manager - removing NPC %08X from tracking", 
+					mount->formID, actor->formID);
+				g_followingNPCs[i].isValid = false;
 				continue;
 			}
 			
@@ -835,132 +611,95 @@ namespace MountedNPCCombatVR
 			if (!actor->IsInCombat())
 			{
 				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-				_MESSAGE("CombatStyles: Rider '%s' (%08X) exited combat state - clearing follow behavior",
+				_MESSAGE("CombatStyles: Rider '%s' (%08X) exited combat - clearing follow",
 					actorName ? actorName : "Unknown", actor->formID);
 				
-				// End any active rapid fire
-				EndStationaryRapidFire(actor->formID);
-				
-				// Clear the follow tracking and horse offset
-				ClearNPCFollowPlayer(actor);
+				ClearNPCFollowTarget(actor);
 				continue;
 			}
 			
 			// ============================================
-			// CHECK DISTANCE TO TARGET - DISENGAGE IF TOO FAR
+			// GET THE TARGET FOR THIS NPC
 			// ============================================
+			Actor* target = nullptr;
+			UInt32 targetFormID = g_followingNPCs[i].targetFormID;
 			
-			float distanceToTarget = GetDistanceToTarget(actor, target);
+			if (targetFormID != 0)
+			{
+				TESForm* targetForm = LookupFormByID(targetFormID);
+				if (targetForm && targetForm->formType == kFormType_Character)
+				{
+					target = static_cast<Actor*>(targetForm);
+					
+					if (target->IsDead(1))
+					{
+						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+						_MESSAGE("CombatStyles: Target died - NPC '%s' disengaging",
+							actorName ? actorName : "Unknown");
+						ClearNPCFollowTarget(actor);
+						continue;
+					}
+				}
+				else
+				{
+					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+					_MESSAGE("CombatStyles: Target invalid - NPC '%s' disengaging",
+						actorName ? actorName : "Unknown");
+					ClearNPCFollowTarget(actor);
+					continue;
+				}
+			}
+			else
+			{
+				if (g_thePlayer && (*g_thePlayer))
+				{
+					target = *g_thePlayer;
+					g_followingNPCs[i].targetFormID = target->formID;
+				}
+				else
+				{
+					continue;
+				}
+			}
+			
+			// ============================================
+			// CHECK DISTANCE - DISENGAGE IF TOO FAR (3500 units)
+			// ============================================
+			float dx = target->pos.x - actor->pos.x;
+			float dy = target->pos.y - actor->pos.y;
+			float distanceToTarget = sqrt(dx * dx + dy * dy);
 			
 			if (distanceToTarget > MAX_COMBAT_DISTANCE)
 			{
 				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-				const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-				_MESSAGE("CombatStyles: Target '%s' too far (%.0f units > %.0f max) - NPC '%s' disengaging",
-					targetName ? targetName : "Unknown",
-					distanceToTarget, MAX_COMBAT_DISTANCE, actorName ? actorName : "Unknown");
-					
-				// End any active rapid fire
-				EndStationaryRapidFire(actor->formID);
+				_MESSAGE("CombatStyles: Target too far (%.0f) - NPC '%s' disengaging",
+					distanceToTarget, actorName ? actorName : "Unknown");
 				
-				// Rotate horse to face AWAY from target (opposite direction)
-				float dx = target->pos.x - actor->pos.x;
-				float dy = target->pos.y - actor->pos.y;
 				float angleAwayFromTarget = atan2(-dx, -dy);
 				mount->rot.z = angleAwayFromTarget;
 				
-				// Stop the rider's combat
 				StopActorCombatAlarm(actor);
-				
-				// Clear the follow tracking
-				ClearNPCFollowPlayer(actor);
-				
+				ClearNPCFollowTarget(actor);
 				continue;
 			}
 			
 			g_followingNPCs[i].lastFollowUpdateTime = currentTime;
 			g_followingNPCs[i].reinforceCount++;
 			
-			// ============================================
-			// STATIONARY RAPID FIRE CHECK (Ranged Only)
-			// When active, horse STOPS MOVING but still ROTATES to face target
-			// ============================================
-			
-			if (IsBowEquipped(actor))
-			{
-				// Check if already in rapid fire
-				if (IsInStationaryRapidFire(actor->formID))
-				{
-					// Update rapid fire (fires shots, checks duration)
-					bool stillActive = UpdateStationaryRapidFire(actor, mount.get(), target);
-					
-					if (stillActive)
-					{
-						// Horse is STATIONARY but ROTATES to face target
-						// Faster/smoother rotation while drawing bow
-						float dx = target->pos.x - mount->pos.x;
-						float dy = target->pos.y - mount->pos.y;
-						float angleToTarget = atan2(dx, dy);
-						
-						float currentAngle = mount->rot.z;
-						float angleDiff = angleToTarget - currentAngle;
-						while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-						while (angleDiff < -3.14159f) angleDiff += 6.28318f;
-						
-						if (fabs(angleDiff) > 0.03f)  // Tighter threshold for smoother stop
-						{
-							// Faster rotation while drawing (0.25), normal speed otherwise (0.15)
-							bool isDrawing = IsRapidFireDrawing(actor->formID);
-							float rotationSpeed = isDrawing ? 0.25f : 0.15f;
-							
-							float newAngle = currentAngle + (angleDiff * rotationSpeed);
-							while (newAngle > 3.14159f) newAngle -= 6.28318f;
-							while (newAngle < -3.14159f) newAngle += 6.28318f;
-							mount->rot.z = newAngle;
-						}
-						
-						// Skip follow package injection - horse stays put
-						continue;
-					}
-					else
-					{
-						// Rapid fire just ended - RESUME FOLLOWING
-						_MESSAGE("CombatStyles: Rider %08X rapid fire ENDED - resuming follow!", actor->formID);
-						
-						// 20% chance to play rear up animation before resuming
-						if ((rand() % 100) < 20)
-						{
-							PlayHorseRearUpAnimation(mount.get());
-							_MESSAGE("CombatStyles: Horse %08X REAR UP after rapid fire!", mount->formID);
-						}
-						
-						// Re-inject follow package to get horse moving again
-						ForceHorseCombatWithPlayer(mount.get());
-						InjectFollowPackage(actor, target);
-					}
-				}
-			}
-			
-			// ============================================
-			// NORMAL FOLLOW BEHAVIOR
-			// ============================================
-			
-			// Re-inject the travel package to update destination
 			int attackState = 0;
 			InjectFollowPackage(actor, target, &attackState);
 			
-			// Update attack position tracking
+			// Update attack position tracking (removed verbose per-frame logging)
 			bool wasInAttackPosition = g_followingNPCs[i].inAttackPosition;
 			g_followingNPCs[i].inMeleeRange = (attackState >= 1);
 			g_followingNPCs[i].inAttackPosition = (attackState == 2);
 			
-			// Only log when state changes
+			// Only log once whenFIRST entering attack position
 			if (attackState == 2 && !wasInAttackPosition)
 			{
-				_MESSAGE("CombatStyles: NPC %08X IN ATTACK POSITION", actor->formID);
+				_MESSAGE("CombatStyles: NPC %08X entered ATTACK POSITION", actor->formID);
 			}
 			
-			// Ensure they stay aggressive
 			actor->flags2 |= Actor::kFlag_kAttackOnSight;
 		}
 	}
@@ -1047,15 +786,78 @@ namespace MountedNPCCombatVR
 			{
 				if ((currentTime - npcData->combatStartTime) >= WEAPON_DRAW_DELAY)
 				{
-					if (HasWeaponAvailable(actor))
+					// ============================================
+					// CHECK IF THIS IS A CAPTAIN - SKIP MELEE WEAPON LOGIC
+					// Captains are forced to RANGED role in MultiMountedCombat
+					// ============================================
+					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+					bool isCaptain = false;
+					if (actorName && strstr(actorName, "Captain") != nullptr)
+					{
+						isCaptain = true;
+						_MESSAGE("CombatStyles: '%s' is a CAPTAIN - skipping melee weapon setup (will use bow)", actorName);
+					}
+					
+					bool hasWeapon = HasWeaponAvailable(actor);
+					bool hasMeleeInInventory = HasMeleeWeaponInInventory(actor);
+					
+					// If no weapon equipped but has melee in inventory, equip it (unless Captain)
+					if (!isCaptain && !hasWeapon && hasMeleeInInventory)
+					{
+						_MESSAGE("CombatStyles: NPC '%s' (%08X) has melee in inventory - equipping it", 
+							actorName ? actorName : "Unknown", actor->formID);
+						EquipBestMeleeWeapon(actor);
+						hasWeapon = HasWeaponAvailable(actor);
+					}
+					
+					// If still no weapon, give them an Iron Mace (unless Captain)
+					if (!isCaptain && !hasWeapon && !hasMeleeInInventory)
+					{
+						_MESSAGE("CombatStyles: NPC '%s' (%08X) has NO suitable weapons - giving Iron Mace", 
+							actorName ? actorName : "Unknown", actor->formID);
+						
+						if (GiveDefaultMountedWeapon(actor))
+						{
+							hasWeapon = HasWeaponAvailable(actor);
+						}
+					}
+					
+					// For Captains, let MultiMountedCombat handle weapon setup
+					if (isCaptain)
+					{
+						hasWeapon = true;  // Skip weapon check - bow will be equipped by multi-combat
+					}
+					
+					if (hasWeapon || isCaptain)
 					{
 						SetWeaponDrawn(actor, true);
 						npcData->weaponDrawn = true;
 						npcData->weaponInfo = GetWeaponInfo(actor);
-						_MESSAGE("CombatStyles: NPC %08X drew weapon - INJECTING FOLLOW PACKAGE", actor->formID);
 						
-						// Start the follow behavior
-						SetNPCFollowPlayer(actor);
+						// Start the follow behavior - USE THE ACTUAL TARGET, not player!
+						if (target)
+						{
+							_MESSAGE("CombatStyles: NPC %08X drew weapon - following target %08X", 
+								actor->formID, target->formID);
+							SetNPCFollowTarget(actor, target);
+						}
+						else
+						{
+							// No target? Log this problem
+							_MESSAGE("CombatStyles: NPC %08X drew weapon but has NO TARGET!", actor->formID);
+						}
+					}
+					else
+					{
+						// Still no weapon even after trying to give one - set up follow anyway
+						_MESSAGE("CombatStyles: NPC '%s' (%08X) UNARMED (couldn't give weapon) - setting up follow anyway", 
+							actorName ? actorName : "Unknown", actor->formID);
+						npcData->weaponDrawn = true;  // Mark as done so we don't keep trying
+						
+						if (target)
+						{
+							SetNPCFollowTarget(actor, target);
+						}
 					}
 				}
 				return;
@@ -1140,14 +942,25 @@ namespace MountedNPCCombatVR
 			GuardCombat::ExecuteBehavior(npcData, actor, mount, target);
 		}
 	}
-	
 	// ============================================
-	// Mounted Attack Hit Detection Functions
-	// (Uses early-declared g_hitData and MountedAttackHitData)
+	// Mounted Attack Hit Detection
+	// Called during attack animation to check if weapon hits target
 	// ============================================
 	
 	// Actor Value IDs
 	static const UInt32 AV_Health = 24;
+	
+	struct MountedAttackHitData
+	{
+		UInt32 riderFormID;
+		bool hitRegistered;// Already dealt damage this attack
+		bool isPowerAttack;      // Was this a power attack?
+		float attackStartTime;
+		bool isValid;
+	};
+	
+	static MountedAttackHitData g_hitData[5];
+	static int g_hitDataCount = 0;
 	
 	MountedAttackHitData* GetOrCreateHitData(UInt32 riderFormID)
 	{
@@ -1201,9 +1014,9 @@ namespace MountedNPCCombatVR
 	// Get the base damage of the rider's equipped weapon
 	float GetRiderWeaponDamage(Actor* rider)
 	{
-		if (!rider) return 10.0f;
+		if (!rider) return 10.0f;  // Default unarmed damage
 		
-		TESForm* equippedWeapon = rider->GetEquippedObject(false);
+		TESForm* equippedWeapon = rider->GetEquippedObject(false);  // Right hand
 		if (!equippedWeapon) return 10.0f;
 		
 		TESObjectWEAP* weapon = DYNAMIC_CAST(equippedWeapon, TESForm, TESObjectWEAP);
@@ -1230,14 +1043,14 @@ namespace MountedNPCCombatVR
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
 		
-		_MESSAGE("CombatStyles: %s dealt %.1f damage to %s%s", 
+		// Keep damage log but make it concise
+		_MESSAGE("CombatStyles: %s hit %s for %.0f dmg%s", 
 			riderName ? riderName : "Rider",
-			baseDamage,
 			targetName ? targetName : "Target",
-			isPowerAttack ? " (POWER ATTACK!)" : "");
+			baseDamage,
+			isPowerAttack ? " (POWER)" : "");
 	}
 	
-	// Called during attack animation to check for hits
 	bool UpdateMountedAttackHitDetection(Actor* rider, Actor* target)
 	{
 		if (!rider || !target) return false;
@@ -1254,10 +1067,7 @@ namespace MountedNPCCombatVR
 		{
 			hitData->hitRegistered = true;
 			ApplyMountedAttackDamage(rider, target, hitData->isPowerAttack);
-			
-			_MESSAGE("CombatStyles: MOUNTED HIT! Rider %08X hit target at distance %.1f units",
-				rider->formID, distance);
-			
+			// Removed verbose "MOUNTED HIT!" log - damage log is sufficient
 			return true;
 		}
 		

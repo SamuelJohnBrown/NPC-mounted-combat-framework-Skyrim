@@ -28,6 +28,14 @@ namespace MountedNPCCombatVR {
 	// NPC Dismount Prevention setting
 	// When enabled, NPCs will not be forced to dismount when attacked
 	extern bool PreventNPCDismountOnAttack;
+	
+	// Weapon switch distance - distance at which rider switches between melee and bow
+	// Default: 230.0f
+	extern float WeaponSwitchDistance;
+	
+	// Horse Stabilization - prevents horses from falling through ground on cell load
+	// Default: true (enabled)
+	extern bool EnableHorseStabilization;
 
 	void loadConfig();
 	

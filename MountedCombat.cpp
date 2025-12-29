@@ -5,7 +5,9 @@
 #include "WeaponDetection.h"
 #include "NPCProtection.h"
 #include "AILogging.h"
-#include "TargetSelection.h"
+#include "ArrowSystem.h"
+#include "MultiMountedCombat.h"
+#include "DynamicPackages.h"
 
 namespace MountedNPCCombatVR
 {
@@ -15,7 +17,8 @@ namespace MountedNPCCombatVR
 	
 	float g_updateInterval = 0.5f;  // Update every 500ms
 	const int MAX_TRACKED_NPCS = 5;  // Maximum 5 NPCs tracked at once
-	const float FLEE_SAFE_DISTANCE = 8192.0f;  // Distance at which fleeing NPCs feel safe (2 cells)
+	const float FLEE_SAFE_DISTANCE = 4500.0f;  // Distance at which fleeing NPCs feel safe (just over 1 cell)
+	const float ALLY_ALERT_RANGE = 2000.0f;    // Range to alert allies when attacked
 	
 	// ============================================
 	// Player Mounted Combat State
@@ -227,13 +230,112 @@ namespace MountedNPCCombatVR
 			_MESSAGE("MountedCombat: NPC %08X combat class: %s", actor->formID, GetCombatClassName(data->combatClass));
 		}
 		
+		// ============================================
+		// PRE-ASSIGN CAPTAIN TO RANGED ROLE
+		// This happens BEFORE combat starts, so they're ready
+		// ============================================
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		if (actorName && strstr(actorName, "Captain") != nullptr)
+		{
+			_MESSAGE("MountedCombat: *** PRE-ASSIGNING CAPTAIN '%s' TO RANGED ***", actorName);
+			
+			// Give bow if they don't have one
+			if (!HasBowInInventory(actor))
+			{
+				_MESSAGE("MountedCombat: Giving Hunting Bow to Captain");
+				GiveDefaultBow(actor);
+			}
+			
+			// Give arrows
+			_MESSAGE("MountedCombat: Giving arrows to Captain");
+			EquipArrows(actor);
+			
+			// Equip the bow
+			_MESSAGE("MountedCombat: Equipping bow on Captain");
+			EquipBestBow(actor);
+			
+			// Draw weapon
+			_MESSAGE("MountedCombat: Drawing weapon on Captain");
+			actor->DrawSheatheWeapon(true);
+			
+			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED with bow equipped", actorName);
+			
+			// ============================================
+			// CRITICAL: Pre-register the Captain as RANGED rider NOW
+			// This ensures the ranged state machine is active from the start
+			// ============================================
+			Actor* target = nullptr;
+			if (g_thePlayer && (*g_thePlayer))
+			{
+				target = *g_thePlayer;
+			}
+			
+			if (target)
+			{
+				_MESSAGE("MountedCombat: Pre-registering Captain as RANGED rider with MultiMountedCombat");
+				RegisterMultiRider(actor, mount, target);
+				
+				// Also clear any keep-offset to prevent AI interference
+				Actor_ClearKeepOffsetFromActor(mount);
+			}
+		}
+		
 		// Track player's mount status when combat with mounted NPC starts
 		OnPlayerTriggeredMountedCombat(actor);
 		
+		// Get combat target - this may be null if NPC wasn't directly attacked
 		Actor* target = GetCombatTarget(actor);
+		
+		// Log target status for debugging
 		if (target)
 		{
+			const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
+			_MESSAGE("MountedCombat: NPC %08X has combat target: '%s' (%08X)", 
+				actor->formID, targetName ? targetName : "Unknown", target->formID);
 			data->targetFormID = target->formID;
+		}
+		else
+		{
+			_MESSAGE("MountedCombat: NPC %08X has NO combat target - will acquire one", actor->formID);
+			
+			// For guards/soldiers without a target, default to player if player is in combat nearby
+			// This handles the case where a guard wasn't directly attacked but their ally was
+			if (data->combatClass == MountedCombatClass::GuardMelee ||
+				data->combatClass == MountedCombatClass::SoldierMelee)
+			{
+				if (g_thePlayer && (*g_thePlayer))
+				{
+					Actor* player = *g_thePlayer;
+					if (player->IsInCombat())
+					{
+						float distance = GetDistanceBetween(actor, player);
+						if (distance < ALLY_ALERT_RANGE)
+						{
+							_MESSAGE("MountedCombat: NPC %08X - Player in combat nearby (%.0f units), setting as target", 
+								actor->formID, distance);
+							data->targetFormID = player->formID;
+							target = player;
+							
+							// Set combat target handle on the NPC
+							UInt32 playerHandle = player->CreateRefHandle();
+							if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+							{
+								actor->currentCombatTarget = playerHandle;
+							}
+							
+							// Make hostile to player
+							actor->flags2 |= Actor::kFlag_kAttackOnSight;
+						}
+					}
+				}
+			}
+		}
+		
+		// Alert nearby allies if we have a target and are a guard/soldier
+		if (target && (data->combatClass == MountedCombatClass::GuardMelee ||
+			    data->combatClass == MountedCombatClass::SoldierMelee))
+		{
+			AlertNearbyMountedAllies(actor, target);
 		}
 		
 		// Set initial state based on combat class
@@ -276,11 +378,17 @@ namespace MountedNPCCombatVR
 		// Update the combat styles system (reinforcement of follow packages)
 		UpdateCombatStylesSystem();
 		
+		// Update multi-mounted combat (ranged role behaviors, etc.)
+		UpdateMultiMountedCombat();
+		
 		// Update player mounted combat state
 		UpdatePlayerMountedCombatState();
 		
 		// Update combat class bools
 		UpdateCombatClassBools();
+		
+		// Scan for hostile targets (guards/soldiers will engage hostiles within range)
+		ScanForHostileTargets();
 		
 		float currentTime = GetCurrentGameTime();
 		
@@ -320,7 +428,7 @@ namespace MountedNPCCombatVR
 			{
 				_MESSAGE("MountedCombat: NPC %08X DIED - removing protection immediately", data->actorFormID);
 				RemoveMountedProtection(actor);
-				ClearNPCFollowPlayer(actor);
+				ClearNPCFollowTarget(actor);
 				data->Reset();
 				continue;
 			}
@@ -331,7 +439,7 @@ namespace MountedNPCCombatVR
 			if (!stillMounted || !mountPtr)
 			{
 				RemoveMountedProtection(actor);
-				ClearNPCFollowPlayer(actor);
+				ClearNPCFollowTarget(actor);
 				data->Reset();
 				continue;
 			}
@@ -352,8 +460,23 @@ namespace MountedNPCCombatVR
 				{
 					_MESSAGE("MountedCombat: Dialogue package cleared - re-applying follow package");
 					
-					// Re-apply the follow package to override the dialogue
-					SetNPCFollowPlayer(actor);
+					// Re-apply the follow package using the stored target
+					if (data->targetFormID != 0 && data->targetFormID != 0x14)  // Has target and not player
+					{
+						TESForm* targetForm = LookupFormByID(data->targetFormID);
+						if (targetForm && targetForm->formType == kFormType_Character)
+						{
+							Actor* storedTarget = static_cast<Actor*>(targetForm);
+							if (!storedTarget->IsDead(1))
+							{
+								SetNPCFollowTarget(actor, storedTarget);
+							}
+						}
+					}
+					else
+					{
+						_MESSAGE("MountedCombat: No valid target stored - skipping follow package re-apply");
+					}
 				}
 				
 				// Log the full AI state for debugging
@@ -370,7 +493,7 @@ namespace MountedNPCCombatVR
 				}
 				
 				RemoveMountedProtection(actor);
-				ClearNPCFollowPlayer(actor);
+				ClearNPCFollowTarget(actor);
 				data->Reset();
 				continue;
 			}
@@ -414,7 +537,8 @@ namespace MountedNPCCombatVR
 					break;
 					
 				case MountedCombatClass::CivilianFlee:
-					CivilianFlee::ExecuteBehavior(data, actor, mountPtr, target);
+					// TODO: CivilianFlee behavior not yet implemented
+					// CivilianFlee::ExecuteBehavior(data, actor, mountPtr, target);
 					break;
 					
 				default:
@@ -491,7 +615,7 @@ namespace MountedNPCCombatVR
 						RemoveMountedProtection(actor);
 						
 						// Clear follow mode if set
-						ClearNPCFollowPlayer(actor);
+						ClearNPCFollowTarget(actor);
 					}
 				}
 				
@@ -731,25 +855,140 @@ namespace MountedNPCCombatVR
 			return nullptr;
 		}
 		
-		if (!actor->IsInCombat())
+		// ============================================
+		// FIRST: Check if we have a stored target in tracking data
+		// This is set by EngageHostileTarget() or OnDismountBlocked()
+		// ============================================
+		MountedNPCData* data = GetNPCData(actor->formID);
+		if (data && data->targetFormID != 0)
 		{
+			// Guards/Soldiers should only target the player if player is genuinely hostile
+			if (data->targetFormID == 0x14 && 
+				(data->combatClass == MountedCombatClass::GuardMelee || 
+				 data->combatClass == MountedCombatClass::SoldierMelee))
+			{
+				// Check if player is actually hostile to this guard (attacked them, has bounty, etc.)
+				if (g_thePlayer && (*g_thePlayer))
+				{
+					Actor* player = *g_thePlayer;
+					
+					// Check if the guard's actual game combat target is the player
+					// This means the game itself decided the player is hostile
+					UInt32 combatTargetHandle = actor->currentCombatTarget;
+					if (combatTargetHandle != 0)
+					{
+						NiPointer<TESObjectREFR> targetRef;
+						LookupREFRByHandle(combatTargetHandle, targetRef);
+						if (targetRef && targetRef->formID == 0x14)
+						{
+							// Game says player is the target - player must have attacked
+							return player;
+						}
+					}
+					
+					// Also check if player is in combat - if so, they probably attacked someone
+					if (player->IsInCombat())
+					{
+						// Player is in combat - they're a valid target for guards
+						return player;
+					}
+				}
+				
+				// Player not genuinely hostile - clear and look for real hostiles
+				data->targetFormID = 0;
+			}
+			else
+			{
+				TESForm* targetForm = LookupFormByID(data->targetFormID);
+				if (targetForm && targetForm->formType == kFormType_Character)
+				{
+					Actor* storedTarget = static_cast<Actor*>(targetForm);
+					
+					// Verify target is still valid (alive)
+					if (!storedTarget->IsDead(1))
+					{
+						return storedTarget;
+					}
+					else
+					{
+						// Target died - clear it so we can find a new one
+						data->targetFormID = 0;
+					}
+				}
+			}
+		}
+		
+		// ============================================
+		// SECOND: Check the actor's actual combat target from the game
+		// ============================================
+		UInt32 combatTargetHandle = actor->currentCombatTarget;
+		if (combatTargetHandle != 0)
+		{
+			NiPointer<TESObjectREFR> targetRef;
+			LookupREFRByHandle(combatTargetHandle, targetRef);
+			if (targetRef)
+			{
+				Actor* combatTarget = DYNAMIC_CAST(targetRef.get(), TESObjectREFR, Actor);
+				if (combatTarget && !combatTarget->IsDead(1))
+				{
+					return combatTarget;
+				}
+			}
+		}
+		
+		// ============================================
+		// THIRD: For Guards/Soldiers, scan for nearest hostile from our list
+		// This ensures they target bandits/etc, not random NPCs
+		// ============================================
+		const float HOSTILE_SCAN_RANGE = 1400.0f;
+		
+		if (data && (data->combatClass == MountedCombatClass::GuardMelee || 
+		      data->combatClass == MountedCombatClass::SoldierMelee))
+		{
+			Actor* hostile = FindNearestHostileTarget(actor, HOSTILE_SCAN_RANGE);
+			if (hostile)
+			{
+				// Store this as the new target
+				data->targetFormID = hostile->formID;
+				_MESSAGE("GetCombatTarget: Guard %08X acquired new hostile target %08X", actor->formID, hostile->formID);
+				return hostile;
+			}
+			
+			// ============================================
+			// FOURTH: For guards with NO hostiles found, check if player is in combat
+			// If player is attacking allies, guards should join in
+			// ============================================
+			if (g_thePlayer && (*g_thePlayer))
+			{
+				Actor* player = *g_thePlayer;
+				if (player->IsInCombat())
+				{
+					float distance = GetDistanceBetween(actor, player);
+					if (distance < ALLY_ALERT_RANGE)
+					{
+						// Player is in combat nearby - they're a valid target
+						data->targetFormID = player->formID;
+						_MESSAGE("GetCombatTarget: Guard %08X targeting player (in combat nearby, %.0f units)", 
+							actor->formID, distance);
+						return player;
+					}
+				}
+			}
+			
+			// No valid target found
 			return nullptr;
 		}
 		
-		// Use the new TargetSelection system to get the actual combat target
-		Actor* target = GetRiderCombatTarget(actor);
-		
-		if (target)
-		{
-			return target;
-		}
-		
-		// Fallback: If no valid target found but in combat, 
-		// check if player is nearby and hostile
+		// ============================================
+		// LAST: For bandits and other hostile classes, player is a valid target
+		// ============================================
 		if (g_thePlayer && (*g_thePlayer))
 		{
 			Actor* player = *g_thePlayer;
-			if (IsValidCombatTarget(actor, player))
+			float distance = GetDistanceBetween(actor, player);
+			
+			// If player is close, they may be the target
+			if (distance < 4096.0f)
 			{
 				return player;
 			}
@@ -1067,6 +1306,443 @@ namespace MountedNPCCombatVR
 			{
 				_MESSAGE("MountedCombat: Player (ON FOOT) triggered combat with mounted NPC '%s' (FormID: %08X)",
 					npcName ? npcName : "Unknown", mountedNPC->formID);
+			}
+		}
+	}
+	
+	// ============================================
+	// HOSTILE TARGET DETECTION & ENGAGEMENT
+	// ============================================
+	// Scans for hostile NPCs from the FactionData list
+	// within range and initiates combat if found.
+	// Called periodically to check for nearby threats.
+	// ============================================
+	
+	const float HOSTILE_DETECTION_RANGE = 1400.0f;  // Units to scan for hostiles
+	const float HOSTILE_SCAN_INTERVAL = 3.0f;       // Scan every 3 seconds
+	static float g_lastHostileScanTime = 0;
+	
+	// ============================================
+	// ALERT NEARBY ALLIES WHEN ATTACKED
+	// When a mounted guard is attacked, alert other nearby
+	// mounted guards/soldiers to join combat against the attacker
+	// ============================================
+	void AlertNearbyMountedAllies(Actor* attackedNPC, Actor* attacker)
+	{
+		if (!attackedNPC || !attacker) return;
+		
+		// Don't alert if attacker is dead
+		if (attacker->IsDead(1)) return;
+		
+		// Get the attacked NPC's combat class
+		MountedCombatClass attackedClass = DetermineCombatClass(attackedNPC);
+		
+		// Only guards and soldiers alert allies
+		if (attackedClass != MountedCombatClass::GuardMelee &&
+			attackedClass != MountedCombatClass::SoldierMelee)
+		{
+			return;
+		}
+		
+		const char* attackedName = CALL_MEMBER_FN(attackedNPC, GetReferenceName)();
+		const char* attackerName = CALL_MEMBER_FN(attacker, GetReferenceName)();
+		_MESSAGE("MountedCombat: ========================================");
+		_MESSAGE("MountedCombat: ALERTING NEARBY ALLIES");
+		_MESSAGE("MountedCombat: Attacked: '%s' (%08X)", attackedName ? attackedName : "Unknown", attackedNPC->formID);
+		_MESSAGE("MountedCombat: Attacker: '%s' (%08X)", attackerName ? attackerName : "Unknown", attacker->formID);
+		_MESSAGE("MountedCombat: ========================================");
+		
+		TESObjectCELL* cell = attackedNPC->parentCell;
+		if (!cell)
+		{
+			_MESSAGE("MountedCombat: ERROR - attackedNPC has no parentCell");
+			return;
+		}
+		
+		_MESSAGE("MountedCombat: Scanning cell with %d objects for mounted allies within %.0f units...", 
+			cell->objectList.count, ALLY_ALERT_RANGE);
+		
+		int alliesAlerted = 0;
+		int mountedNPCsFound = 0;
+		
+		// Scan for nearby mounted NPCs
+		for (UInt32 i = 0; i < cell->objectList.count; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			
+			Actor* potentialAlly = DYNAMIC_CAST(ref, TESObjectREFR, Actor);
+			if (!potentialAlly) continue;
+			
+			// Skip self
+			if (potentialAlly->formID == attackedNPC->formID) continue;
+			
+			// Skip the attacker
+			if (potentialAlly->formID == attacker->formID) continue;
+			
+			// Skip player
+			if (g_thePlayer && (*g_thePlayer) && potentialAlly == (*g_thePlayer)) continue;
+			
+			// Skip dead actors
+			if (potentialAlly->IsDead(1)) continue;
+			
+			// Check if mounted
+			NiPointer<Actor> mount;
+			bool isMounted = CALL_MEMBER_FN(potentialAlly, GetMount)(mount);
+			if (!isMounted || !mount) continue;
+			
+			mountedNPCsFound++;
+			
+			// Check distance
+			float distance = GetDistanceBetween(attackedNPC, potentialAlly);
+			if (distance > ALLY_ALERT_RANGE)
+			{
+				const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
+				_MESSAGE("MountedCombat: Mounted NPC '%s' (%08X) too far: %.0f units",
+					allyName ? allyName : "Unknown", potentialAlly->formID, distance);
+				continue;
+			}
+			
+			// Check if this is an ally (same type: guard or soldier)
+			MountedCombatClass allyClass = DetermineCombatClass(potentialAlly);
+			if (allyClass != MountedCombatClass::GuardMelee &&
+				allyClass != MountedCombatClass::SoldierMelee)
+			{
+				const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
+				_MESSAGE("MountedCombat: Mounted NPC '%s' (%08X) is not guard/soldier: %s",
+					allyName ? allyName : "Unknown", potentialAlly->formID, GetCombatClassName(allyClass));
+				continue;
+			}
+			
+			// Check if already tracked
+			MountedNPCData* existingData = GetNPCData(potentialAlly->formID);
+			if (existingData && existingData->isValid)
+			{
+				// Already being tracked - check if they have the attacker as target
+				if (existingData->targetFormID == attacker->formID)
+				{
+					const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
+					_MESSAGE("MountedCombat: Ally '%s' (%08X) already targeting attacker",
+						allyName ? allyName : "Unknown", potentialAlly->formID);
+					continue;
+				}
+				
+				// They're tracked but NOT targeting the attacker - update their target!
+				const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
+				_MESSAGE("MountedCombat: Ally '%s' (%08X) already tracked but needs target update (was: %08X, now: %08X)",
+					allyName ? allyName : "Unknown", potentialAlly->formID, 
+					existingData->targetFormID, attacker->formID);
+				
+				existingData->targetFormID = attacker->formID;
+				
+				// Make sure they have follow behavior set up
+				SetNPCFollowTarget(potentialAlly, attacker);
+				
+				alliesAlerted++;
+				continue;
+			}
+			
+			// This ally should join combat!
+			const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
+			_MESSAGE("MountedCombat: Alerting ally '%s' (%08X) to attack %08X (distance: %.0f)",
+				allyName ? allyName : "Unknown", potentialAlly->formID, attacker->formID, distance);
+			
+			// Get or create tracking data for this ally
+			MountedNPCData* data = GetOrCreateNPCData(potentialAlly);
+			if (!data)
+			{
+				_MESSAGE("MountedCombat: ERROR - Could not create tracking data for ally (MAX_TRACKED_NPCS reached?)");
+				continue;
+			}
+			
+			// Set up the ally's combat data
+			data->mountFormID = mount->formID;
+			data->targetFormID = attacker->formID;
+			data->combatClass = allyClass;
+			data->behavior = MountedBehaviorType::Aggressive;
+			data->state = MountedCombatState::Engaging;
+			data->stateStartTime = GetCurrentGameTime();
+			data->combatStartTime = GetCurrentGameTime();
+			data->weaponDrawn = false;  // Will draw after delay
+			
+			// Apply mounted protection
+			ApplyMountedProtection(potentialAlly);
+			
+			_MESSAGE("MountedCombat: Applied mounted protection to '%s' (FormID: %08X) - alerted ally", 
+				allyName ? allyName : "Unknown", potentialAlly->formID);
+			
+			// Force into combat with the attacker
+			// Set the ally's combat alarm - this makes them hostile to the attacker
+			potentialAlly->flags2 |= Actor::kFlag_kAttackOnSight;
+			
+			// Set combat target handle
+			UInt32 attackerHandle = attacker->CreateRefHandle();
+			if (attackerHandle != 0 && attackerHandle != *g_invalidRefHandle)
+			{
+				potentialAlly->currentCombatTarget = attackerHandle;
+			}
+			
+			// Set up follow behavior (this injects the follow package)
+			SetNPCFollowTarget(potentialAlly, attacker);
+			
+			alliesAlerted++;
+		}
+		
+		_MESSAGE("MountedCombat: Scan complete - found %d mounted NPCs, alerted %d allies", 
+			mountedNPCsFound, alliesAlerted);
+	}
+	
+	// Find the nearest hostile NPC within range of a mounted guard/soldier
+	Actor* FindNearestHostileTarget(Actor* rider, float maxRange)
+	{
+		if (!rider) return nullptr;
+		
+		TESObjectCELL* cell = rider->parentCell;
+		if (!cell) return nullptr;
+		
+		Actor* nearestHostile = nullptr;
+		float nearestDistance = maxRange + 1.0f;
+		
+		// Iterate through references in the cell
+		for (UInt32 i = 0; i < cell->objectList.count; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			
+			Actor* potentialTarget = DYNAMIC_CAST(ref, TESObjectREFR, Actor);
+			if (!potentialTarget) continue;
+			
+			// Skip self
+			if (potentialTarget->formID == rider->formID) continue;
+			
+			// Skip dead actors
+			if (potentialTarget->IsDead(1)) continue;
+			
+			// Check if this actor is hostile (from our FactionData lists)
+			if (!IsHostileNPC(potentialTarget)) continue;
+			
+			// Calculate distance
+			float distance = GetDistanceBetween(rider, potentialTarget);
+			
+			// Check if within range and closer than current nearest
+			if (distance <= maxRange && distance < nearestDistance)
+			{
+				nearestHostile = potentialTarget;
+				nearestDistance = distance;
+			}
+		}
+		
+		return nearestHostile;
+	}
+	
+	// Force a mounted NPC into combat with a target
+	// - Sets combat target
+	// - Draws weapon
+	// - Injects follow package
+	bool EngageHostileTarget(Actor* rider, Actor* target)
+	{
+		if (!rider || !target) return false;
+		
+		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
+		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
+		const char* hostileType = GetHostileTypeName(target);
+		
+		_MESSAGE("MountedCombat: ========================================");
+		_MESSAGE("MountedCombat: ENGAGING HOSTILE TARGET");
+		_MESSAGE("MountedCombat: Rider: '%s' (%08X)", riderName ? riderName : "Unknown", rider->formID);
+		_MESSAGE("MountedCombat: Target: '%s' (%08X) - %s", targetName ? targetName : "Unknown", target->formID, hostileType);
+		_MESSAGE("MountedCombat: ========================================");
+		
+		// Get or create tracking data
+		MountedNPCData* data = GetOrCreateNPCData(rider);
+		if (!data)
+		{
+			_MESSAGE("MountedCombat: ERROR - Could not create tracking data for rider");
+			return false;
+		}
+		
+		// Set target
+		data->targetFormID = target->formID;
+		
+		// Determine combat class if not set
+		if (data->combatClass == MountedCombatClass::None)
+		{
+			data->combatClass = DetermineCombatClass(rider);
+			_MESSAGE("MountedCombat: Rider combat class: %s", GetCombatClassName(data->combatClass));
+		}
+		
+		// Set behavior to aggressive
+		data->behavior = MountedBehaviorType::Aggressive;
+		
+		// Apply mounted protection
+		ApplyMountedProtection(rider);
+		
+		// Set rider to be attack-on-sight
+		rider->flags2 |= Actor::kFlag_kAttackOnSight;
+		
+		// Set combat target handle on rider
+		UInt32 targetHandle = target->CreateRefHandle();
+		if (targetHandle != 0 && targetHandle != *g_invalidRefHandle)
+		{
+			// Set the rider's combat target
+			rider->currentCombatTarget = targetHandle;
+		}
+		
+		// Force rider into combat state
+		// The AI will handle the actual combat once we inject the follow package
+		
+		// Draw weapon (with slight delay for realism)
+		data->combatStartTime = GetCurrentGameTime();
+		data->weaponDrawn = false;  // Will be drawn in ExecuteBehavior after delay
+		
+		// Set initial state
+		data->state = MountedCombatState::Engaging;
+		data->stateStartTime = GetCurrentGameTime();
+		
+		// INJECT THE FOLLOW PACKAGE - This is what makes the rider pursue the target!
+		// Now passes the actual hostile target, not just the player!
+		SetNPCFollowTarget(rider, target);
+		
+		_MESSAGE("MountedCombat: Rider %08X now engaging hostile target %08X", rider->formID, target->formID);
+		
+		// Update combat class bools
+		UpdateCombatClassBools();
+		
+		return true;
+	}
+	
+	// Scan all tracked mounted NPCs (guards/soldiers) for nearby hostile targets
+	// This is the main entry point called from UpdateMountedCombat
+	void ScanForHostileTargets()
+	{
+		float currentTime = GetCurrentGameTime();
+		
+		// Only scan periodically
+		if ((currentTime - g_lastHostileScanTime) < HOSTILE_SCAN_INTERVAL)
+		{
+			return;
+		}
+		g_lastHostileScanTime = currentTime;
+		
+		// Skip if player is dead or in interior
+		if (g_playerIsDead || !g_playerInExterior)
+		{
+			return;
+		}
+		
+		// Scan all tracked mounted NPCs
+		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		{
+			MountedNPCData* data = &g_trackedNPCs[i];
+			
+			if (!data->isValid) continue;
+			
+			// Only guards and soldiers scan for hostiles
+			if (data->combatClass != MountedCombatClass::GuardMelee &&
+				data->combatClass != MountedCombatClass::SoldierMelee)
+			{
+				continue;
+			}
+			
+			TESForm* riderForm = LookupFormByID(data->actorFormID);
+			if (!riderForm) continue;
+			
+			Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
+			if (!rider) continue;
+			
+			// ============================================
+			// CHECK IF CURRENT TARGET IS VALID
+			// ============================================
+			bool needsNewTarget = false;
+			bool playerIsGenuinelyHostile = false;
+			
+			// Check if player is genuinely hostile to this guard (game's combat system says so)
+			UInt32 combatTargetHandle = rider->currentCombatTarget;
+			if (combatTargetHandle != 0)
+			{
+				NiPointer<TESObjectREFR> targetRef;
+				LookupREFRByHandle(combatTargetHandle, targetRef);
+				if (targetRef && targetRef->formID == 0x14)
+				{
+					playerIsGenuinelyHostile = true;
+				}
+			}
+			
+			if (data->targetFormID == 0)
+			{
+				// No target yet
+				needsNewTarget = true;
+			}
+			else if (data->targetFormID == 0x14)  // Player FormID
+			{
+				// Currently targeting player
+				if (playerIsGenuinelyHostile)
+				{
+					// Player attacked the guard - this is a valid target, don't change it
+					continue;
+				}
+				else
+				{
+					// Player didn't attack - guard shouldn't target them
+					// Try to find a real hostile instead
+					needsNewTarget = true;
+					_MESSAGE("MountedCombat: Guard %08X is targeting PLAYER but player not hostile - scanning for real target...", 
+						rider->formID);
+				}
+			}
+			else
+			{
+				// Has a non-player target - verify it's still valid
+				TESForm* targetForm = LookupFormByID(data->targetFormID);
+				if (targetForm && targetForm->formType == kFormType_Character)
+				{
+					Actor* currentTarget = static_cast<Actor*>(targetForm);
+					if (currentTarget->IsDead(1))
+					{
+						// Target died - need new target
+						needsNewTarget = true;
+						data->targetFormID = 0;
+					}
+				}
+				else
+				{
+					// Target invalid
+					needsNewTarget = true;
+					data->targetFormID = 0;
+				}
+			}
+			
+			if (!needsNewTarget) continue;
+			
+			// Find nearest hostile from our faction list
+			Actor* hostile = FindNearestHostileTarget(rider, HOSTILE_DETECTION_RANGE);
+			if (hostile)
+			{
+				_MESSAGE("MountedCombat: Guard %08X found hostile target %08X - engaging!", 
+					rider->formID, hostile->formID);
+				
+				// Clear any existing follow behavior first if switching targets
+				if (rider->IsInCombat())
+				{
+					ClearNPCFollowTarget(rider);
+				}
+				
+				EngageHostileTarget(rider, hostile);
+			}
+			else if (data->targetFormID == 0x14 && !playerIsGenuinelyHostile)
+			{
+				// No hostiles found and targeting player who isn't hostile - stop combat
+				_MESSAGE("MountedCombat: Guard %08X no hostiles found, player not hostile - stopping combat", 
+					rider->formID);
+				data->targetFormID = 0;
+				
+				// Stop combat with player
+				StopActorCombatAlarm(rider);
+				ClearNPCFollowTarget(rider);
 			}
 		}
 	}

@@ -2,6 +2,7 @@
 #include "CombatStyles.h"
 #include "WeaponDetection.h"
 #include "SingleMountedCombat.h"
+#include "ArrowSystem.h"
 #include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "AILogging.h"
@@ -67,6 +68,7 @@ namespace MountedNPCCombatVR
 		NiPoint3 lastPosition;
 		float lastMoveTime;     // Last time horse moved significantly
 		float stuckCheckTime;     // When we last checked for stuck
+		float lastResetTime;      // When we last reset this horse (to prevent rapid resets)
 		bool isValid;
 	};
 	
@@ -76,6 +78,7 @@ namespace MountedNPCCombatVR
 	const float STUCK_THRESHOLD_DISTANCE = 10.0f;   // Must move at least 10 units
 	const float STUCK_TIMEOUT = 5.0f;      // If no movement for 5 seconds, reset
 	const float STUCK_CHECK_INTERVAL = 0.5f;        // Check every 500ms
+	const float RESET_COOLDOWN = 10.0f;    // Don't reset same horse more than once per 10 seconds
 	
 	HorseMovementData* GetOrCreateMovementData(UInt32 horseFormID)
 	{
@@ -94,6 +97,7 @@ namespace MountedNPCCombatVR
 			data->lastPosition = NiPoint3();
 			data->lastMoveTime = 0;
 			data->stuckCheckTime = 0;
+			data->lastResetTime = -RESET_COOLDOWN;  // Allow immediate first reset
 			data->isValid = true;
 			g_horseMovementCount++;
 			return data;
@@ -109,9 +113,15 @@ namespace MountedNPCCombatVR
 	}
 	
 	// Returns true if horse is stuck and needs reset
-	bool CheckHorseStuck(Actor* horse, float distanceToPlayer, float meleeRange)
+	bool CheckHorseStuck(Actor* horse, float distanceToTarget, float meleeRange)
 	{
 		if (!horse) return false;
+		
+		// Safety check - verify horse has valid process manager
+		if (!horse->processManager || !horse->processManager->middleProcess)
+		{
+			return false;
+		}
 		
 		HorseMovementData* data = GetOrCreateMovementData(horse->formID);
 		if (!data) return false;
@@ -125,6 +135,12 @@ namespace MountedNPCCombatVR
 		}
 		data->stuckCheckTime = currentTime;
 		
+		// Check reset cooldown - don't reset same horse too frequently
+		if ((currentTime - data->lastResetTime) < RESET_COOLDOWN)
+		{
+			return false;
+		}
+	
 		// Calculate distance moved since last check
 		float dx = horse->pos.x - data->lastPosition.x;
 		float dy = horse->pos.y - data->lastPosition.y;
@@ -139,7 +155,7 @@ namespace MountedNPCCombatVR
 		}
 		
 		// If in melee range, being stationary is expected - don't trigger stuck
-		if (distanceToPlayer < meleeRange + 50.0f)
+		if (distanceToTarget < meleeRange + 50.0f)
 		{
 			data->lastMoveTime = currentTime;  // Reset timer when in attack position
 			return false;
@@ -151,9 +167,10 @@ namespace MountedNPCCombatVR
 			_MESSAGE("DynamicPackages: Horse %08X STUCK for %.1f seconds - forcing reset!", 
 				horse->formID, currentTime - data->lastMoveTime);
 			
-			// Reset the timer to avoid spam
+			// Reset the timer and mark reset time
 			data->lastMoveTime = currentTime;
 			data->lastPosition = horse->pos;
+			data->lastResetTime = currentTime;
 			
 			return true;
 		}
@@ -172,19 +189,56 @@ namespace MountedNPCCombatVR
 	{
 		if (!horse || !target) return;
 		
-		_MESSAGE("DynamicPackages: Resetting horse %08X to default follow behavior", horse->formID);
+		// Safety checks - verify actors are valid and have required components
+	  if (!horse->processManager)
+		{
+			_MESSAGE("DynamicPackages: Cannot reset horse %08X - no process manager", horse->formID);
+			return;
+		}
 		
-		// Clear turn direction so it picks fresh on next melee approach
-		ClearHorseTurnDirection(horse->formID);
+		if (!horse->processManager->middleProcess)
+		{
+			_MESSAGE("DynamicPackages: Cannot reset horse %08X - no middle process", horse->formID);
+			return;
+		}
+
+		// Check if horse is dead or disabled
+		if (horse->IsDead(1))
+		{
+			_MESSAGE("DynamicPackages: Cannot reset horse %08X - horse is dead", horse->formID);
+			return;
+		}
 		
-		// Clear any keep offset
+		// Check if target is valid
+		if (target->IsDead(1))
+		{
+			_MESSAGE("DynamicPackages: Cannot reset horse %08X - target is dead", horse->formID);
+			return;
+		}
+		
+		_MESSAGE("DynamicPackages: Resetting horse %08X to default follow behavior toward target %08X", 
+			horse->formID, target->formID);
+		
+		// Clear all special moveset data (turn direction, charge, etc.)
+		ClearAllMovesetData(horse->formID);
+
+		// Only clear keep offset if we have a valid state
+		// This is safer than blindly clearing
 		Actor_ClearKeepOffsetFromActor(horse);
+		
+		// Small delay before re-evaluation (let the clear take effect)
+		// Note: We can't actually delay here, but we can skip the immediate re-apply
+		// and let the next update cycle handle it
 		
 		// Force AI re-evaluation
 		Actor_EvaluatePackage(horse, false, false);
 		
-		// Re-apply follow behavior
-		ForceHorseCombatWithPlayer(horse);
+		// Re-apply follow behavior to the ACTUAL target (not player!)
+		// Only if target is still valid
+		if (!target->IsDead(1))
+		{
+			ForceHorseCombatWithTarget(horse, target);
+		}
 	}
 
 	// ============================================
@@ -217,7 +271,9 @@ namespace MountedNPCCombatVR
 	// FORWARD DECLARATIONS
 	// ============================================
 
-	bool ForceHorseCombatWithPlayer(Actor* horse);
+	// NOTE: Single-argument overloads removed - they defaulted to player, causing targeting bugs
+	// Always use ForceHorseCombatWithTarget(horse, target) with explicit target
+	bool ForceHorseCombatWithTarget(Actor* horse, Actor* target);
 
 	// ============================================
 	// INJECT FOLLOW PACKAGE
@@ -247,6 +303,18 @@ namespace MountedNPCCombatVR
 		if (!middleProcess)
 		{
 			return false;
+		}
+		
+		// ============================================
+		// CHECK IF THIS RIDER IS IN RANGED ROLE
+		// Ranged riders are handled ENTIRELY by ExecuteRangedRoleBehavior
+		// Do NOT inject any follow package for them!
+		// ============================================
+		if (IsRiderInRangedRole(actor->formID))
+		{
+			// Ranged riders don't get follow packages - return success without doing anything
+			if (outAttackState) *outAttackState = 6;  // Ranged role
+			return true;
 		}
 
 		// Pause any current dialogue
@@ -282,13 +350,21 @@ namespace MountedNPCCombatVR
 
 		get_vfunc<_Actor_PutCreatedPackage>(actor, 0xE1)(actor, package, true, 1);
 
-		// Force the HORSE TO FOLLOW PLAYER
+		// Force the HORSE TO FOLLOW TARGET (use actual target, not player!)
 		NiPointer<Actor> mount;
 		if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
 		{
-			ForceHorseCombatWithPlayer(mount.get());
-			int attackState = InjectTravelPackageToHorse(mount.get(), target);
-			if (outAttackState) *outAttackState = attackState;
+			// Double-check: Don't apply follow to ranged role horses
+			if (!IsHorseRiderInRangedRole(mount->formID))
+			{
+				ForceHorseCombatWithTarget(mount.get(), target);
+				int attackState = InjectTravelPackageToHorse(mount.get(), target);
+				if (outAttackState) *outAttackState = attackState;
+			}
+			else
+			{
+				if (outAttackState) *outAttackState = 6;  // Ranged role
+			}
 		}
 
 		return true;
@@ -396,27 +472,26 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
-	// SET NPC KEEP OFFSET FROM PLAYER
+	// SET NPC KEEP OFFSET FROM TARGET
 	// ============================================
 
-	bool SetNPCKeepOffsetFromPlayer(Actor* actor, float catchUpRadius, float followRadius)
+	bool SetNPCKeepOffsetFromTarget(Actor* actor, Actor* target, float catchUpRadius, float followRadius)
 	{
-		if (!actor || !g_thePlayer || !(*g_thePlayer))
+		if (!actor || !target)
 		{
 			return false;
 		}
 
-		Actor* player = *g_thePlayer;
-		UInt32 playerHandle = player->CreateRefHandle();
+		UInt32 targetHandle = target->CreateRefHandle();
 
-		if (playerHandle == 0 || playerHandle == *g_invalidRefHandle)
+		if (targetHandle == 0 || targetHandle == *g_invalidRefHandle)
 		{
 			return false;
 		}
 
 		NiPoint3 offset;
-		offset.x = 100.0f;
-		offset.y = -150.0f;
+		offset.x = 0;
+		offset.y = 0;
 		offset.z = 0;
 
 		NiPoint3 offsetAngle;
@@ -424,10 +499,51 @@ namespace MountedNPCCombatVR
 		offsetAngle.y = 0;
 		offsetAngle.z = 0;
 
-		Actor_KeepOffsetFromActor(actor, playerHandle, offset, offsetAngle, catchUpRadius, followRadius);
+		Actor_KeepOffsetFromActor(actor, targetHandle, offset, offsetAngle, catchUpRadius, followRadius);
 		return true;
 	}
+	
+	// ============================================
+	// SET NPC RANGED FOLLOW (500 units from target)
+	// ============================================
+	// Similar to regular follow but maintains greater distance
+	// Used for ranged combat positioning
+	// - Faces target when stationary
+	// - Faces target when traveling toward them
+	// - Faces travel direction when moving away (no backwards walking)
+	
+	bool SetNPCRangedFollowFromTarget(Actor* actor, Actor* target)
+	{
+		if (!actor || !target)
+		{
+			return false;
+		}
 
+		UInt32 targetHandle = target->CreateRefHandle();
+
+		if (targetHandle == 0 || targetHandle == *g_invalidRefHandle)
+		{
+			return false;
+		}
+
+		// Offset 500 units away from target
+		NiPoint3 offset;
+		offset.x = 0;
+		offset.y = -500.0f;// 500 units behind/away from target
+		offset.z = 0;
+
+		NiPoint3 offsetAngle;
+		offsetAngle.x = 0;
+		offsetAngle.y = 0;
+		offsetAngle.z = 0;
+
+		// catchUpRadius = 800, followRadius = 500 (maintain ~500 unit distance)
+		Actor_KeepOffsetFromActor(actor, targetHandle, offset, offsetAngle, 800.0f, 500.0f);
+		
+		_MESSAGE("DynamicPackages: Set ranged follow for actor %08X (500 units from target %08X)", actor->formID, target->formID);
+		return true;
+	}
+	
 	// ============================================
 	// CLEAR NPC KEEP OFFSET
 	// ============================================
@@ -445,26 +561,49 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
-	// FORCE HORSE INTO COMBAT WITH PLAYER
+	// FORCE HORSE INTO COMBAT WITH TARGET
 	// ============================================
 
-	bool ForceHorseCombatWithPlayer(Actor* horse)
+	bool ForceHorseCombatWithTarget(Actor* horse, Actor* target)
 	{
-		if (!horse || !g_thePlayer || !(*g_thePlayer))
+		if (!horse || !target)
+		{
+			return false;
+		}
+		
+		// Safety checks - verify actors are in valid state
+		if (horse->IsDead(1) || target->IsDead(1))
+		{
+			return false;
+		}
+		
+		// Verify horse has required components for movement
+		if (!horse->processManager || !horse->processManager->middleProcess)
 		{
 			return false;
 		}
 
-		Actor* player = *g_thePlayer;
-
-		UInt32 playerHandle = player->CreateRefHandle();
-		if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+		UInt32 targetHandle = target->CreateRefHandle();
+		if (targetHandle == 0 || targetHandle == *g_invalidRefHandle)
 		{
-			horse->currentCombatTarget = playerHandle;
+			return false;
 		}
 
+		horse->currentCombatTarget = targetHandle;
 		horse->flags2 |= Actor::kFlag_kAttackOnSight;
 
+		// ============================================
+		// CHECK IF THIS HORSE'S RIDER IS IN RANGED ROLE
+		// If so, don't apply standard follow - ranged behavior handles movement
+		// ============================================
+		if (IsHorseRiderInRangedRole(horse->formID))
+		{
+			// Ranged horses are handled by ExecuteRangedRoleBehavior
+			// Don't apply any follow package here - just return
+			return true;
+		}
+
+		// Standard melee follow - close in on target
 		NiPoint3 offset;
 		offset.x = 200.0f;
 		offset.y = -300.0f;
@@ -475,21 +614,27 @@ namespace MountedNPCCombatVR
 		offsetAngle.y = 0;
 		offsetAngle.z = 0;
 
-		Actor_KeepOffsetFromActor(horse, playerHandle, offset, offsetAngle, 1000.0f, 300.0f);
+		Actor_KeepOffsetFromActor(horse, targetHandle, offset, offsetAngle, 1000.0f, 300.0f);
 		Actor_EvaluatePackage(horse, false, false);
 
 		return true;
 	}
-
+	
 	// ============================================
 	// INJECT TRAVEL PACKAGE TO HORSE
 	// Main movement logic - delegates to Single/Multi combat as needed
-	// Returns: 0 = traveling, 1 = melee range, 2 = attack position, 3 = special maneuver
+	// Returns: 0 = traveling, 1 = melee range, 2 = attack position, 3 = special maneuver, 4 = charging, 5 = rapid fire, 6 = ranged role
 	// ============================================
 
 	int InjectTravelPackageToHorse(Actor* horse, Actor* target)
 	{
 		if (!horse || !target)
+		{
+			return 0;
+		}
+		
+		// Safety checks - verify actors are in valid state
+		if (horse->IsDead(1) || target->IsDead(1))
 		{
 			return 0;
 		}
@@ -500,219 +645,162 @@ namespace MountedNPCCombatVR
 			return 0;
 		}
 		
-		// ============================================
-		// CHECK IF RIDER IS IN RAPID FIRE MODE
-		// If so, horse ROTATES to face target but does NOT move
-		// Faster/smoother rotation while drawing bow
-		// ============================================
-		
-		NiPointer<Actor> riderCheck;
-		if (CALL_MEMBER_FN(horse, GetMountedBy)(riderCheck) && riderCheck)
-		{
-			if (IsInStationaryRapidFire(riderCheck->formID))
-			{
-				// Horse ROTATES to face target
-				float dx = target->pos.x - horse->pos.x;
-				float dy = target->pos.y - horse->pos.y;
-				float angleToTarget = atan2(dx, dy);
-				
-				float currentAngle = horse->rot.z;
-				float angleDiff = angleToTarget - currentAngle;
-				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
-				
-				if (fabs(angleDiff) > 0.03f)  // Tighter threshold for smoother stop
-				{
-					// Faster rotation while drawing (0.25), normal speed otherwise (0.15)
-					bool isDrawing = IsRapidFireDrawing(riderCheck->formID);
-					float rotationSpeed = isDrawing ? 0.25f : 0.15f;
-					
-					float newAngle = currentAngle + (angleDiff * rotationSpeed);
-					while (newAngle > 3.14159f) newAngle -= 6.28318f;
-					while (newAngle < -3.14159f) newAngle += 6.28318f;
-					horse->rot.z = newAngle;
-				}
-				
-				// Return - no travel package, horse stays stationary but rotates
-				return 4;
-			}
-		}
-		
-		// Calculate distance to player
+		// Calculate distance to target
 		float dx = target->pos.x - horse->pos.x;
 		float dy = target->pos.y - horse->pos.y;
-		float distanceToPlayer = sqrt(dx * dx + dy * dy);
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
 		
-		float angleToPlayer = atan2(dx, dy);
-		float targetAngle = angleToPlayer;  // Default: face player
+		float angleToTarget = atan2(dx, dy);
+		float targetAngle = angleToTarget;
 		
-		// Check if player is mounted - adjust melee range
 		float meleeRange = 150.0f;
 		
-		if (g_thePlayer && (*g_thePlayer))
+		NiPointer<Actor> targetMount;
+		if (CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount)
 		{
-			Actor* player = *g_thePlayer;
-			NiPointer<Actor> playerMount;
-			if (CALL_MEMBER_FN(player, GetMount)(playerMount) && playerMount)
+			meleeRange = 300.0f;
+		}
+		
+		// ============================================
+		// GET RIDER AND REGISTER WITH MULTI-COMBAT SYSTEM
+		// ============================================
+		NiPointer<Actor> rider;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
+		{
+			// Register rider with multi-combat system (assigns role)
+			MultiCombatRole role = RegisterMultiRider(rider.get(), horse, target);
+			
+			// ============================================
+			// CHECK IF THIS RIDER IS IN RANGED ROLE
+			// Ranged riders are handled ENTIRELY by ExecuteRangedRoleBehavior
+			// We just update distance and return - no rotation here!
+			// ============================================
+			if (IsHorseRiderInRangedRole(horse->formID))
 			{
-				meleeRange = 300.0f;
+				// Update distance for the multi-rider data
+				MultiRiderData* data = GetMultiRiderDataByHorse(horse->formID);
+				if (data)
+				{
+					data->distanceToTarget = distanceToTarget;
+					
+					// Execute ranged behavior (handles rotation, bow equip, firing)
+					ExecuteRangedRoleBehavior(data, rider.get(), horse, target);
+				}
+				
+				// Return 6 to skip all other behavior
+				return 6;
 			}
 		}
 		
 		// ============================================
-		// FAILSAFE: If horse is very close and facing player, ensure sprint is stopped
-		// This catches any edge cases where sprint might bleed through
+		// FAILSAFE: Sprint stop at close range
 		// ============================================
 		const float BREATHING_DISTANCE = 200.0f;
-		if (distanceToPlayer < BREATHING_DISTANCE)
+		if (distanceToTarget < BREATHING_DISTANCE)
 		{
-			// Check if horse is roughly facing the player
 			float currentAngle = horse->rot.z;
-			float angleDiff = angleToPlayer - currentAngle;
+			float angleDiff = angleToTarget - currentAngle;
 			while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 			while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 			
-			// If within ~45 degrees of facing player and very close, force sprint stop
-			if (fabs(angleDiff) < 0.785f)  // ~45 degrees
+			if (fabs(angleDiff) < 0.785f)
 			{
-				// Call sprint stop as failsafe - this is safe to call even if not sprinting
 				StopHorseSprint(horse);
 			}
 		}
 		
 		// ============================================
-		// FAILSAFE: CHECK IF HORSE IS STUCK
+		// FAILSAFE: Check if horse is stuck (skip during rapid fire)
 		// ============================================
 		
-		// Check for obstruction and log details
-		ObstructionType obstruction = CheckAndLogHorseObstruction(horse, target, distanceToPlayer);
-		
-		// If obstructed, try horse jump to escape (has4 second cooldown)
-		if (obstruction == ObstructionType::Stationary ||
-			obstruction == ObstructionType::RunningInPlace || 
-			obstruction == ObstructionType::CollisionBlocked)
+		if (!IsInRapidFire(horse->formID) && !IsHorseRiderInRangedRole(horse->formID))
 		{
-			// Check for sheer drop first - if near sheer, log and avoid jump/turn maneuvers
-			if (CheckAndLogSheerDrop(horse))
+			ObstructionType obstruction = CheckAndLogHorseObstruction(horse, target, distanceToTarget);
+			
+			if (obstruction == ObstructionType::Stationary ||
+				obstruction == ObstructionType::RunningInPlace || 
+				obstruction == ObstructionType::CollisionBlocked)
 			{
-				_MESSAGE("DynamicPackages: Horse %08X near SHEER DROP - avoiding jump/turn maneuvers", horse->formID);
-				// don't attempt jump or trot here
-			}
-			else
-			{
-				// First try to jump over the obstruction
-				if (TryHorseJumpToEscape(horse))
+				if (CheckAndLogSheerDrop(horse))
 				{
-					_MESSAGE("DynamicPackages: Horse %08X attempting jump to escape obstruction", horse->formID);
+					// Near sheer drop - avoid maneuvers (log only once via AILogging)
 				}
 				else
 				{
-					// Jump on cooldown or failed - try trot turn to avoid obstruction
-					// This uses the detected side to turn AWAY from the blocked direction
-					if (TryHorseTrotTurnFromObstruction(horse))
+					if (TryHorseJumpToEscape(horse))
 					{
-						_MESSAGE("DynamicPackages: Horse %08X attempting trot turn to avoid obstruction", horse->formID);
+						// Jump triggered - log in SpecialMovesets
+					}
+					else
+					{
+						if (TryHorseTrotTurnFromObstruction(horse))
+						{
+							// Trot turn triggered - log in SpecialMovesets
+						}
 					}
 				}
 			}
-		}
-		
-		// Legacy stuck check (backup)
-		if (CheckHorseStuck(horse, distanceToPlayer, meleeRange))
-		{
-			ResetHorseToDefaultBehavior(horse, target);
-			// Continue with normal behavior after reset
+			
+			if (CheckHorseStuck(horse, distanceToTarget, meleeRange))
+			{
+				ResetHorseToDefaultBehavior(horse, target);
+			}
 		}
 		
 		// ============================================
 		// CHECK FOR MULTI MOUNTED COMBAT MANEUVERS
-		// Multi mounted combat (2+) - coordinated movement
 		// ============================================
 		
 		int mountedRiderCount = GetFollowingNPCCount();
 		
-		if (mountedRiderCount >= 2)
-		{
-			// Multi mounted combat - coordinated movement
-			if (UpdateMultiMountedCombat(horse, target, distanceToPlayer, meleeRange))
-			{
-				return 3;  // Multi-combat handling movement
-			}
-		}
-		
 		// ============================================
-		// WEAPON SWITCHING
-		// Close range (< 230): Use melee weapon (if available, no daggers)
-		// Far range (> 230): Use bow if available
-		// If no valid melee weapon, use bow at all ranges
+		// WEAPON SWITCHING (for melee role riders only)
 		// ============================================
 		
-		const float WEAPON_SWITCH_DISTANCE = 230.0f;
-		
-		NiPointer<Actor> rider;
+		// Re-get rider reference (already declared above, just reuse)
 		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
 		{
-			bool hasMelee = HasMeleeWeaponInInventory(rider.get());
-			bool hasBow = HasBowInInventory(rider.get());
-			
-			if (distanceToPlayer <= WEAPON_SWITCH_DISTANCE)
+			// Skip weapon switching for ranged role riders - they keep bow
+			if (!IsHorseRiderInRangedRole(horse->formID))
 			{
-				// Close range - prefer melee if available
-				if (hasMelee)
+				if (!IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID))
 				{
-					if (IsBowEquipped(rider.get()))
-					{
-						// Reset bow attack state when switching to melee
-						ResetBowAttackState(rider->formID);
-						EquipBestMeleeWeapon(rider.get());
-						rider->DrawSheatheWeapon(true);
-					}
-				}
-				else if (hasBow && !IsBowEquipped(rider.get()))
-				{
-					// No melee available, use bow even at close range
-					EquipBestBow(rider.get());
-					rider->DrawSheatheWeapon(true);
-				}
-			}
-			else
-			{
-				// Far range - prefer bow if available
-				if (hasBow)
-				{
-					if (IsMeleeEquipped(rider.get()))
-					{
-						EquipBestBow(rider.get());
-						rider->DrawSheatheWeapon(true);
-					}
-				}
-			}
-			
-			// ============================================
-			// BOW ATTACK HANDLING (includes rapid fire check)
-			// ============================================
-			if (IsBowEquipped(rider.get()) && distanceToPlayer > WEAPON_SWITCH_DISTANCE)
-			{
-				// Check for rapid fire first - it takes priority over normal bow attacks
-				if (TryStationaryRapidFire(rider.get(), horse, target, distanceToPlayer))
-				{
-					// Rapid fire just triggered!
-					// COMPLETELY STOP THE HORSE - clear ALL movement
-					Actor_ClearKeepOffsetFromActor(horse);
-					ClearInjectedPackages(horse);
-					Actor_EvaluatePackage(horse, false, false);
+					bool hasMelee = HasMeleeWeaponInInventory(rider.get());
+					bool hasBow = HasBowInInventory(rider.get());
 					
-					_MESSAGE("DynamicPackages: RAPID FIRE - Horse %08X COMPLETELY STOPPED", horse->formID);
+					if (distanceToTarget <= WeaponSwitchDistance)
+					{
+						if (hasMelee)
+						{
+							if (IsBowEquipped(rider.get()))
+							{
+								ResetBowAttackState(rider->formID);
+								EquipBestMeleeWeapon(rider.get());
+								rider->DrawSheatheWeapon(true);
+							}
+						}
+						else if (hasBow && !IsBowEquipped(rider.get()))
+						{
+							EquipBestBow(rider.get());
+							rider->DrawSheatheWeapon(true);
+						}
+					}
+					else
+					{
+						if (hasBow)
+						{
+							if (IsMeleeEquipped(rider.get()))
+							{
+								EquipBestBow(rider.get());
+								rider->DrawSheatheWeapon(true);
+							}
+						}
+					}
 					
-					// Return immediately - don't create any travel packages
-					return 4;
-				}
-				
-				// Normal bow attack (only if not in rapid fire)
-				// Pass target so arrows actually fire at something
-				if (!IsInStationaryRapidFire(rider->formID))
-				{
-					UpdateBowAttack(rider.get(), true, target);
+					if (IsBowEquipped(rider.get()) && distanceToTarget > WeaponSwitchDistance)
+					{
+						UpdateBowAttack(rider.get(), true, target);
+					}
 				}
 			}
 		}
@@ -720,104 +808,199 @@ namespace MountedNPCCombatVR
 		int attackState = 0;
 		
 		// ============================================
-		// DEFAULT BEHAVIOR: Horse faces and follows player
+		// CHECK IF TARGET IS MOUNTED
+		// ============================================
+		bool targetIsMounted = IsTargetMounted(target);
+		
+		// ============================================
+		// CHARGE MANEUVER CHECK (700-1500 units away)
+		// ============================================
+		NiPointer<Actor> riderForCharge;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForCharge) && riderForCharge)
+		{
+			if (IsHorseCharging(horse->formID))
+			{
+				if (UpdateChargeManeuver(horse, riderForCharge.get(), target, distanceToTarget, meleeRange))
+				{
+					targetAngle = angleToTarget;
+					
+					float currentAngle = horse->rot.z;
+					float angleDiff = targetAngle - currentAngle;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					
+					const float ROTATION_SPEED = 0.15f;
+					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					horse->rot.z = newAngle;
+					
+					return 4;
+				}
+			}
+			else if (distanceToTarget >= 700.0f && distanceToTarget <= 1500.0f)
+			{
+				if (TryChargeManeuver(horse, riderForCharge.get(), target, distanceToTarget))
+				{
+					targetAngle = angleToTarget;
+					
+					float currentAngle = horse->rot.z;
+					float angleDiff = targetAngle - currentAngle;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					
+					const float ROTATION_SPEED = 0.15f;
+					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					horse->rot.z = newAngle;
+					
+					return 4;
+				}
+			}
+			
+			// ============================================
+			// RAPID FIRE MANEUVER CHECK
+			// ============================================
+			if (IsInRapidFire(horse->formID))
+			{
+				if (UpdateRapidFireManeuver(horse, riderForCharge.get(), target))
+				{
+					targetAngle = angleToTarget;
+					
+					float currentAngle = horse->rot.z;
+					float angleDiff = targetAngle - currentAngle;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					
+					const float ROTATION_SPEED = 0.15f;
+					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					horse->rot.z = newAngle;
+					
+					return 5;
+				}
+			}
+			else if (distanceToTarget > meleeRange && GetCombatElapsedTime() >= 20.0f)
+			{
+				if (TryRapidFireManeuver(horse, riderForCharge.get(), target, distanceToTarget, meleeRange))
+				{
+					targetAngle = angleToTarget;
+					
+					float currentAngle = horse->rot.z;
+					float angleDiff = targetAngle - currentAngle;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					
+					const float ROTATION_SPEED = 0.15f;
+					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					horse->rot.z = newAngle;
+					
+					return 5;
+				}
+			}
+		}
+		
+		// ============================================
+		// DEFAULT BEHAVIOR: Horse faces and follows target
 		// ============================================
 		
-		if (distanceToPlayer < meleeRange)
+		if (distanceToTarget < meleeRange)
 		{
-			// ============================================
-			// HORSE REAR UP CHECK (7% chance when horse facing player head-on)
-			// This happens just before the 90-degree turn
-			// ============================================
-			TryRearUpOnApproach(horse, target, distanceToPlayer);
+			TryRearUpOnApproach(horse, target, distanceToTarget);
 			
-			// In melee range - turn 90 degrees to present rider's weapon side
-			bool turnClockwise = GetHorseTurnDirectionClockwise(horse->formID);
-			
-			if (turnClockwise)
+			if (targetIsMounted)
 			{
-				targetAngle = angleToPlayer + 1.5708f;  // +90 degrees
-			}
-			else
-			{
-				targetAngle = angleToPlayer - 1.5708f;  // -90 degrees
-			}
-			
-			attackState = 1;
-			
-			float currentAngle = horse->rot.z;
-			float angleDiff = targetAngle - currentAngle;
-			while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-			while (angleDiff < -3.14159f) angleDiff += 6.28318f;
-			
-			if (fabs(angleDiff) < 0.26f)
-			{
-				attackState = 2;
+				// MOUNTED VS MOUNTED: Adjacent Riding
+				targetAngle = GetAdjacentRidingAngle(horse->formID, target->pos, horse->pos, target->rot.z);
 				
-				// ============================================
-				// ATTACK POSITION - DETERMINE PLAYER SIDE
-				// ============================================
+				attackState = 1;
 				
-				float horseForwardX = sin(horse->rot.z);
-				float horseForwardY = cos(horse->rot.z);
-				float horseRightX = cos(horse->rot.z);
-				float horseRightY = -sin(horse->rot.z);
+				float currentAngle = horse->rot.z;
+				float angleDiff = targetAngle - currentAngle;
+				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 				
-				float toPlayerX = target->pos.x - horse->pos.x;
-				float toPlayerY = target->pos.y - horse->pos.y;
-				
-				float dotRight = (toPlayerX * horseRightX) + (toPlayerY * horseRightY);
-				const char* playerSide = (dotRight > 0) ? "RIGHT" : "LEFT";
-				
-				// Get the rider and try to play attack animation
-				NiPointer<Actor> riderForAttack;
-				if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
+				if (fabs(angleDiff) < 0.35f)
 				{
-					if (PlayMountedAttackAnimation(riderForAttack.get(), playerSide))
+					attackState = 2;
+					
+					float horseRightX = cos(horse->rot.z);
+					float horseRightY = -sin(horse->rot.z);
+					
+					float toTargetX = target->pos.x - horse->pos.x;
+					float toTargetY = target->pos.y - horse->pos.y;
+					
+					float dotRight = (toTargetX * horseRightX) + (toTargetY * horseRightY);
+					const char* targetSide = (dotRight > 0) ? "RIGHT" : "LEFT";
+					
+					NiPointer<Actor> riderForAttack;
+					if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
 					{
-						static float lastAttackLogTime = 0;
-						float currentTime = (float)clock() / CLOCKS_PER_SEC;
-						if ((currentTime - lastAttackLogTime) > 2.0f)
+						PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						
+						if (IsRiderAttacking(riderForAttack.get()))
 						{
-							_MESSAGE("DynamicPackages: Rider %08X attacking player on %s side",
-								riderForAttack->formID, playerSide);
-							lastAttackLogTime = currentTime;
+							if (UpdateMountedAttackHitDetection(riderForAttack.get(), target))
+							{
+								_MESSAGE("DynamicPackages: Rider %08X hit confirmed!", riderForAttack->formID);
+							}
 						}
 					}
 					
-					if (IsRiderAttacking(riderForAttack.get()))
+					// Removed verbose position logs - only log on state change in CombatStyles
+				}
+			}
+			else
+			{
+				// MOUNTED VS ON-FOOT: 90-Degree Turn
+				targetAngle = Get90DegreeTurnAngle(horse->formID, angleToTarget);
+				
+				attackState = 1;
+				
+				float currentAngle = horse->rot.z;
+				float angleDiff = targetAngle - currentAngle;
+				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+				
+				if (fabs(angleDiff) < 0.26f)
+				{
+					attackState = 2;
+					
+					float horseRightX = cos(horse->rot.z);
+					float horseRightY = -sin(horse->rot.z);
+					
+					float toTargetX = target->pos.x - horse->pos.x;
+					float toTargetY = target->pos.y - horse->pos.y;
+					
+					float dotRight = (toTargetX * horseRightX) + (toTargetY * horseRightY);
+					const char* targetSide = (dotRight > 0) ? "RIGHT" : "LEFT";
+					
+					NiPointer<Actor> riderForAttack;
+					if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
 					{
-						if (UpdateMountedAttackHitDetection(riderForAttack.get(), target))
+						PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						
+						if (IsRiderAttacking(riderForAttack.get()))
 						{
-							_MESSAGE("DynamicPackages: Rider %08X melee hit confirmed on player!", 
-								riderForAttack->formID);
+							if (UpdateMountedAttackHitDetection(riderForAttack.get(), target))
+							{
+								_MESSAGE("DynamicPackages: Rider %08X hit confirmed!", riderForAttack->formID);
+							}
 						}
 					}
-				}
-				
-				// Log position (rate limited)
-				static UInt32 lastLoggedHorse = 0;
-				static float lastLogTime = 0;
-				float currentTime = (float)clock() / CLOCKS_PER_SEC;
-				
-				if (horse->formID != lastLoggedHorse || (currentTime - lastLogTime) > 1.0f)
-				{
-					_MESSAGE("DynamicPackages: Horse %08X in ATTACK POSITION - Player on %s side (dot: %.2f, turnDir: %s)",
-						horse->formID, playerSide, dotRight, turnClockwise ? "clockwise" : "counter-clockwise");
-					lastLoggedHorse = horse->formID;
-					lastLogTime = currentTime;
+					
+					// Removed verbose attack position logs
 				}
 			}
 		}
 		else
 		{
-			// Not in melee range - face player directly and follow
 			NotifyHorseLeftMeleeRange(horse->formID);
-			targetAngle = angleToPlayer;
+			if (targetIsMounted)
+			{
+				NotifyHorseLeftAdjacentRange(horse->formID);
+			}
+			targetAngle = angleToTarget;
 		}
 		
 		// ============================================
-		// APPLY ROTATION - Always face target direction
+		// APPLY ROTATION
 		// ============================================
 		
 		float currentAngle = horse->rot.z;
@@ -835,10 +1018,19 @@ namespace MountedNPCCombatVR
 		horse->rot.z = newAngle;
 		
 		// ============================================
-		// CREATE TRAVEL PACKAGE - Move toward player when not in melee
+		// MELEE RIDER COLLISION AVOIDANCE
+		// Check if another melee rider is too close and steer away
+		// ============================================
+		if (distanceToTarget < meleeRange * 2.0f)  // Only check when in combat range
+		{
+			UpdateMeleeRiderCollisionAvoidance(horse, target);
+		}
+		
+		// ============================================
+		// CREATE TRAVEL PACKAGE
 		// ============================================
 		
-		if (distanceToPlayer >= meleeRange)
+		if (distanceToTarget >= meleeRange)
 		{
 			TESPackage* package = CreatePackageByType(6);
 			if (package)

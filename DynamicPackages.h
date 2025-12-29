@@ -66,7 +66,7 @@ namespace MountedNPCCombatVR
 	typedef void (*_ActorProcess_PlayIdle)(ActorProcessManager* _this, Actor* actor, int a3, int a4, int a5, int a6, TESIdleForm* idle);
 	typedef void (*_ActorProcess_SetPlayerActionReaction)(ActorProcessManager* _this, int a2);
 	
-	// Keep Offset System (NPC Follow Player)
+	// Keep Offset System (NPC Follow Target)
 	typedef void (*_Actor_KeepOffsetFromActor)(Actor* _this, UInt32& targetHandle, NiPoint3& offset, NiPoint3& offsetAngleEulerRadians, float catchUpRadius, float followRadius);
 	typedef void (*_Actor_ClearKeepOffsetFromActor)(Actor* _this);
 	
@@ -117,7 +117,9 @@ namespace MountedNPCCombatVR
 	// Override blockers preventing mounted horses from combat
 	// ============================================
 	
-	bool ForceHorseCombatWithPlayer(Actor* horse);
+	// Force horse to follow and attack a specific target
+	// ALWAYS use this with explicit target - never default to player!
+	bool ForceHorseCombatWithTarget(Actor* horse, Actor* target);
 	
 	// ============================================
 	// HELPER TEMPLATE FOR VTABLE ACCESS
@@ -168,17 +170,24 @@ namespace MountedNPCCombatVR
 	// Initialize the dynamic package system (call once at plugin load)
 	bool InitDynamicPackageSystem();
 	
-	// Create and inject a follow package to make NPC follow the player
+	// Create and inject a follow package to make NPC follow the target
 	bool InjectFollowPackage(Actor* actor, Actor* target, int* outAttackState = nullptr);
 	
 	// Create and inject a bump/reaction package
 	bool InjectBumpPackage(Actor* actor, Actor* bumper, bool isLargeBump = false, bool pauseDialogue = true);
 	
-	// Clear any injected packages and restore normal AI
+	// Clear any injected packages from NPC
 	bool ClearInjectedPackages(Actor* actor);
 	
-	// Make NPC keep offset from player (movement-level, not package-level)
-	bool SetNPCKeepOffsetFromPlayer(Actor* actor, float catchUpRadius = 300.0f, float followRadius = 150.0f);
+	// Make NPC keep offset from target (movement-level, not package-level)
+	// ALWAYS use this with explicit target - never default to player!
+	bool SetNPCKeepOffsetFromTarget(Actor* actor, Actor* target, float catchUpRadius = 300.0f, float followRadius = 150.0f);
+	
+	// Make NPC keep ranged offset from target (500 units distance for ranged combat)
+	// - Faces target when stationary or traveling toward them
+	// - Faces travel direction when moving away (no backwards walking)
+	// ALWAYS use this with explicit target - never default to player!
+	bool SetNPCRangedFollowFromTarget(Actor* actor, Actor* target);
 	
 	// Clear the keep-offset and force package re-evaluation
 	bool ClearNPCKeepOffset(Actor* actor);

@@ -3,7 +3,11 @@
 #include "CombatStyles.h"
 #include "DynamicPackages.h"
 #include "SpecialDismount.h"
+#include "SingleMountedCombat.h"
+#include "HorseStabilization.h"
+#include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
+#include "ArrowSystem.h"
 
 namespace MountedNPCCombatVR
 {
@@ -19,17 +23,12 @@ namespace MountedNPCCombatVR
 	std::chrono::steady_clock::time_point g_activationTime;
 	
 	// Delay in seconds before mod activates after game load
-	// 2 seconds to ensure all actors are fully loaded (especially on existing saves)
-	const int ACTIVATION_DELAY_SECONDS = 2;
+	// 1 second to ensure all actors are fully loaded
+	const int ACTIVATION_DELAY_SECONDS = 1;
 	
 	// Maximum distance from player to check NPCs (in game units)
-	// 4096 units = roughly 1 cell distance
+	// 4000 units = roughly 1 cell distance
 	const float MAX_DISTANCE_FROM_PLAYER = 4000.0f;
-	
-	// Failsafe distance - if player is beyond this distance, allow dismount
-	// This prevents NPCs from being stuck forever if player runs away
-	// 12288 units = roughly 3 cell distance
-	const float FAILSAFE_DISTANCE = 4500.0f;
 
 	// ============================================
 	// Player World Position Tracking
@@ -207,34 +206,6 @@ namespace MountedNPCCombatVR
 	}
 	
 	// ============================================
-	// Check if actor is beyond failsafe distance
-	// If true, NPC should be allowed to dismount
-	// ============================================
-	bool IsBeyondFailsafeDistance(Actor* actor)
-	{
-		if (!actor) return true; // If invalid, allow dismount
-		
-		// Get player
-		if (!g_thePlayer || !(*g_thePlayer)) return true;
-		Actor* player = *g_thePlayer;
-		
-		// Get positions
-		NiPoint3 actorPos = actor->pos;
-		NiPoint3 playerPos = player->pos;
-		
-		// Calculate distance squared (faster than sqrt)
-		float dx = actorPos.x - playerPos.x;
-		float dy = actorPos.y - playerPos.y;
-		float dz = actorPos.z - playerPos.z;
-		float distSq = dx*dx + dy*dy + dz*dz;
-		
-		// Compare with failsafe distance squared
-		float failsafeDistSq = FAILSAFE_DISTANCE * FAILSAFE_DISTANCE;
-		
-		return distSq > failsafeDistSq;
-	}
-	
-	// ============================================
 	// Safe actor validation - VERY IMPORTANT
 	// ============================================
 	bool IsActorValid(Actor* actor)
@@ -291,6 +262,10 @@ namespace MountedNPCCombatVR
 		// Update mounted combat system
 		UpdateMountedCombat();
 		
+		// Check for cell changes and process any pending horse stabilizations
+		CheckCellChangeForStabilization();
+		ProcessPendingStabilizations();
+		
 		// Validate actor with SEH protection
 		if (!IsActorValid(actor))
 		{
@@ -338,12 +313,8 @@ namespace MountedNPCCombatVR
 					actorName ? actorName : "Unknown", actor->formID);
 				
 				// Clean up tracking since they're dismounting
-				if (IsNPCTracked(actor->formID))
-				{
-					ClearNPCFollowPlayer(actor);
-					RemoveMountedProtection(actor);
-					RemoveNPCFromTracking(actor->formID);
-				}
+				// RemoveNPCFromTracking handles all cleanup internally
+				RemoveNPCFromTracking(actor->formID);
 				return OriginalDismount(actor);
 			}
 		}
@@ -357,8 +328,7 @@ namespace MountedNPCCombatVR
 				_MESSAGE("DismountHook: NPC '%s' (FormID: %08X) DIED - allowing dismount", 
 					actorName ? actorName : "Unknown", actor->formID);
 				
-				ClearNPCFollowPlayer(actor);
-				RemoveMountedProtection(actor);
+				// RemoveNPCFromTracking handles all cleanup internally
 				RemoveNPCFromTracking(actor->formID);
 			}
 			return OriginalDismount(actor);
@@ -387,19 +357,8 @@ namespace MountedNPCCombatVR
 					OnDismountBlocked(actor, mount);
 				}
 				
-				// If player is too far, revert to default package but STILL block dismount while in combat
-				if (IsBeyondFailsafeDistance(actor))
-				{
-					if (IsNPCFollowingPlayer(actor))
-					{
-						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-						_MESSAGE("DismountHook: Player far from '%s' - reverting package but still blocking dismount (in combat)", 
-							actorName ? actorName : "Unknown", actor->formID);
-						ClearNPCFollowPlayer(actor);
-					}
-				}
-				
 				// BLOCK DISMOUNT - NPC is in combat
+				// Disengage is handled by CombatStyles when player gets too far (MAX_COMBAT_DISTANCE)
 				return 0;
 			}
 			else
@@ -413,8 +372,8 @@ namespace MountedNPCCombatVR
 					_MESSAGE("DismountHook: '%s' (FormID: %08X) left combat - allowing dismount", 
 						actorName ? actorName : "Unknown", actor->formID);
 					
-					ClearNPCFollowPlayer(actor);
-					RemoveMountedProtection(actor);
+					// RemoveNPCFromTracking handles all cleanup internally
+					// (ClearNPCFollowTarget, RemoveMountedProtection, and Reset)
 					RemoveNPCFromTracking(actor->formID);
 				}
 				
@@ -445,11 +404,17 @@ namespace MountedNPCCombatVR
 		// Reset mounted combat tracking to clear any stored FormIDs
 		ResetAllMountedNPCs();
 		
-		// Reset combat styles system (clears cached forms, attack data, etc.)
-		ResetCombatStylesSystem();
+		// Reset SingleMountedCombat cached forms (arrow spell, bow idles, etc.)
+		ResetSingleMountedCombatCache();
 		
-		// Shutdown special movesets (clears rapid fire, turn data, etc.)
-		ShutdownSpecialMovesets();
+		// Reset MultiMountedCombat system (ranged riders, Captain tracking, etc.)
+		ClearAllMultiRiders();
+		
+		// Reset SpecialMovesets system (charge, rapid fire, turn tracking, etc.)
+		ResetAllSpecialMovesets();
+		
+		// Reset Arrow system
+		ResetArrowSystem();
 		
 		_MESSAGE("MountedNPCCombatVR: Mod DEACTIVATED - all state reset");
 	}
@@ -464,18 +429,8 @@ namespace MountedNPCCombatVR
 		// Release any controlled mounts from previous session
 		ReleaseAllMountControl();
 		
-		// Clear all follow tracking
-		ClearAllFollowingNPCs();
-		
 		// Reset all mounted NPC tracking
 		ResetAllMountedNPCs();
-		
-		// Reset combat styles system
-		ResetCombatStylesSystem();
-		
-		// Shutdown and reinitialize special movesets
-		ShutdownSpecialMovesets();
-		InitSpecialMovesets();
 		
 		// Re-initialize the mounted combat system
 		InitMountedCombatSystem();
@@ -484,7 +439,6 @@ namespace MountedNPCCombatVR
 		InitDynamicPackageSystem();
 		
 		// Set activation time to now + delay
-		// Use 2 seconds for existing saves to ensure all actors are fully loaded
 		g_activationTime = std::chrono::steady_clock::now() + std::chrono::seconds(ACTIVATION_DELAY_SECONDS);
 		g_modActive = true;
 		
@@ -761,6 +715,13 @@ namespace MountedNPCCombatVR
 	{
 		_MESSAGE("MountedNPCCombatVR: PostLoadGame - Save game loaded");
 		
+		// Hot-reload config on every game load
+		loadConfig();
+		
+		// Initialize and run horse stabilization to prevent falling through ground
+		InitHorseStabilization();
+		StabilizeAllHorses();
+		
 		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->loadedState)
 		{
 			_MESSAGE("MountedNPCCombatVR: Player loaded successfully - activating mod with delay");
@@ -771,6 +732,14 @@ namespace MountedNPCCombatVR
 	void OnNewGame()
 	{
 		_MESSAGE("MountedNPCCombatVR: OnNewGame - New game started, activating mod with delay");
+		
+		// Hot-reload config on new game
+		loadConfig();
+		
+		// Initialize and run horse stabilization
+		InitHorseStabilization();
+		StabilizeAllHorses();
+		
 		ActivateModWithDelay();
 	}
 	

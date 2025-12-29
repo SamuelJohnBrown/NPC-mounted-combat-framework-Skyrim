@@ -61,17 +61,18 @@ namespace MountedNPCCombatVR
 	
 	// Add Iron Arrows to an actor's inventory
 	// Returns true if successful
-	bool AddArrowsToInventory(Actor* actor, UInt32 count = 100);
-	
-	// Remove Iron Arrows from an actor's inventory
-	// Returns the number of arrows actually removed
-	UInt32 RemoveArrowsFromInventory(Actor* actor, UInt32 count = 100);
+	bool AddArrowsToInventory(Actor* actor, UInt32 count = 5);
 	
 	// Add any ammo type to an actor's inventory by FormID
 	// Returns true if successful
 	bool AddAmmoToInventory(Actor* actor, UInt32 ammoFormID, UInt32 count);
 	
-	// Equip Iron Arrows on an actor (must already be in inventory)
+	// Count total arrows (any ammo type) in actor's inventory
+	// Returns total count of all ammo items
+	UInt32 CountArrowsInInventory(Actor* actor);
+	
+	// Equip arrows on an actor (for bow combat)
+	// Only adds 5 arrows if actor has less than 5 arrows of any type
 	// Returns true if successful
 	bool EquipArrows(Actor* actor);
 	
@@ -86,6 +87,16 @@ namespace MountedNPCCombatVR
 	bool IsBowEquipped(Actor* actor);
 	bool IsMeleeEquipped(Actor* actor);
 	
+	// Give an Iron Mace to NPCs without suitable melee weapons for mounted combat
+	// Only adds if they don't already have a 1H melee weapon in inventory
+	// Returns true if weapon was added and equipped
+	bool GiveDefaultMountedWeapon(Actor* actor);
+	
+	// Give a Hunting Bow to NPCs for ranged mounted combat
+	// Only adds if they don't already have a bow in inventory
+	// Returns true if weapon was added
+	bool GiveDefaultBow(Actor* actor);
+	
 	// ============================================
 	// Weapon Node / Hitbox Detection
 	// ============================================
@@ -97,14 +108,14 @@ namespace MountedNPCCombatVR
 	// Returns true if weapon node was found, false if using fallback position
 	bool GetWeaponWorldPosition(Actor* actor, NiPoint3* outPosition);
 	
-	// Get distance from a point to the player
+	// Get distance from a point to the player (utility function)
 	float GetDistanceToPlayer(NiPoint3* position);
 	
-	// Check if weapon is within hit range of target
-	// hitRadius: base radius for hit detection (typically 80-120 units)
-	bool IsWeaponInHitRange(Actor* attacker, Actor* target, float hitRadius);
+	// ============================================
+	// MELEE HIT DETECTION
+	// ============================================
 	
-	// Check if a mounted attack should hit the player
+	// Check if a mounted attack should hit the target
 	// Returns true if weapon is close enough to deal damage
 	// outDistance: optional output for the actual distance
 	bool CheckMountedAttackHit(Actor* rider, Actor* target, float* outDistance = nullptr);

@@ -7,6 +7,12 @@ namespace MountedNPCCombatVR
 	// Iron Arrow FormID from Skyrim.esm
 	const UInt32 IRON_ARROW_FORMID = 0x0001397D;
 	
+	// Iron Mace FormID from Skyrim.esm - default weapon for unarmed mounted NPCs
+	const UInt32 IRON_MACE_FORMID = 0x00013982;
+	
+	// Hunting Bow FormID from Skyrim.esm
+	const UInt32 HUNTING_BOW_FORMID = 0x00013985;
+	
 	// ============================================
 	// Inventory Add Functions
 	// ============================================
@@ -57,30 +63,18 @@ namespace MountedNPCCombatVR
 		return true;
 	}
 	
-	UInt32 RemoveArrowsFromInventory(Actor* actor, UInt32 count)
+	// Find the best/first ammo in actor's inventory
+	// Returns the TESAmmo pointer or nullptr if none found
+	TESAmmo* FindAmmoInInventory(Actor* actor)
 	{
-		if (!actor) return 0;
+		if (!actor) return nullptr;
 		
-		// Look up Iron Arrow form
-		TESForm* arrowForm = LookupFormByID(IRON_ARROW_FORMID);
-		if (!arrowForm)
-		{
-			_MESSAGE("WeaponDetection: Failed to find Iron Arrow (FormID: %08X) for removal", IRON_ARROW_FORMID);
-			return 0;
-		}
-		
-		// Get the actor's inventory
 		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
 			actor->extraData.GetByType(kExtraData_ContainerChanges));
 		
 		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
-		{
-			_MESSAGE("WeaponDetection: Could not access inventory for Actor %08X", actor->formID);
-			return 0;
-		}
+			return nullptr;
 		
-		// Find the arrow entry and count how many they have
-		UInt32 arrowsInInventory = 0;
 		tList<InventoryEntryData>* objList = containerChanges->data->objList;
 		
 		for (tList<InventoryEntryData>::Iterator it = objList->Begin(); !it.End(); ++it)
@@ -88,47 +82,89 @@ namespace MountedNPCCombatVR
 			InventoryEntryData* entry = it.Get();
 			if (!entry || !entry->type) continue;
 			
-			if (entry->type->formID == IRON_ARROW_FORMID)
+			// Check if this is ammo (TESAmmo)
+			TESAmmo* ammo = DYNAMIC_CAST(entry->type, TESForm, TESAmmo);
+			if (ammo && entry->countDelta > 0)
 			{
-				arrowsInInventory = (entry->countDelta > 0) ? entry->countDelta : 1;
-				break;
+				return ammo;  // Return the first ammo found
 			}
 		}
 		
-		if (arrowsInInventory == 0)
-		{
-			_MESSAGE("WeaponDetection: Actor %08X has no Iron Arrows to remove", actor->formID);
+		return nullptr;
+	}
+	
+	// Count total arrows (any ammo type) in actor's inventory
+	UInt32 CountArrowsInInventory(Actor* actor)
+	{
+		if (!actor) return 0;
+		
+		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
+			actor->extraData.GetByType(kExtraData_ContainerChanges));
+		
+		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
 			return 0;
+		
+		UInt32 totalArrows = 0;
+		tList<InventoryEntryData>* objList = containerChanges->data->objList;
+		
+		for (tList<InventoryEntryData>::Iterator it = objList->Begin(); !it.End(); ++it)
+		{
+			InventoryEntryData* entry = it.Get();
+			if (!entry || !entry->type) continue;
+			
+			// Check if this is ammo (TESAmmo)
+			TESAmmo* ammo = DYNAMIC_CAST(entry->type, TESForm, TESAmmo);
+			if (ammo)
+			{
+				// Add the count (countDelta can be negative for removed items, but we only care about positive)
+				SInt32 count = entry->countDelta;
+				if (count > 0)
+				{
+					totalArrows += count;
+				}
+			}
 		}
 		
-		// Remove the arrows (up to the count requested or what they have)
-		UInt32 toRemove = (count < arrowsInInventory) ? count : arrowsInInventory;
-		
-		// Use AddItem_Native with negative count to remove
-		// Note: Some SKSE implementations require RemoveItem, but AddItem with negative works in most cases
-		AddItem_Native(nullptr, 0, actor, arrowForm, -(SInt32)toRemove, true);
-		
-		_MESSAGE("WeaponDetection: Removed %d arrows from Actor %08X (had %d)", 
-			toRemove, actor->formID, arrowsInInventory);
-		return toRemove;
+		return totalArrows;
 	}
 	
 	bool EquipArrows(Actor* actor)
 	{
 		if (!actor) return false;
 		
-		// Look up Iron Arrow form
-		TESForm* arrowForm = LookupFormByID(IRON_ARROW_FORMID);
-		if (!arrowForm)
+		// Count existing arrows in inventory
+		UInt32 existingArrows = CountArrowsInInventory(actor);
+		
+		// Only add arrows if they have less than 5
+		if (existingArrows < 5)
 		{
-			_MESSAGE("WeaponDetection: Failed to find Iron Arrow (FormID: %08X) for equip", IRON_ARROW_FORMID);
-			return false;
+			UInt32 arrowsToAdd = 5 - existingArrows;
+			AddArrowsToInventory(actor, arrowsToAdd);
+			_MESSAGE("WeaponDetection: Actor %08X had %d arrows, added %d Iron Arrows", 
+				actor->formID, existingArrows, arrowsToAdd);
+		}
+		else
+		{
+			_MESSAGE("WeaponDetection: Actor %08X already has %d arrows, skipping add", 
+				actor->formID, existingArrows);
 		}
 		
-		TESAmmo* ammo = DYNAMIC_CAST(arrowForm, TESForm, TESAmmo);
-		if (!ammo)
+		// Try to find ammo already in inventory first (use their existing arrows)
+		TESAmmo* ammoToEquip = FindAmmoInInventory(actor);
+		
+		// If no ammo found, fall back to Iron Arrows
+		if (!ammoToEquip)
 		{
-			_MESSAGE("WeaponDetection: Iron Arrow FormID %08X is not TESAmmo", IRON_ARROW_FORMID);
+			TESForm* arrowForm = LookupFormByID(IRON_ARROW_FORMID);
+			if (arrowForm)
+			{
+				ammoToEquip = DYNAMIC_CAST(arrowForm, TESForm, TESAmmo);
+			}
+		}
+		
+		if (!ammoToEquip)
+		{
+			_MESSAGE("WeaponDetection: No ammo found for Actor %08X", actor->formID);
 			return false;
 		}
 		
@@ -137,8 +173,11 @@ namespace MountedNPCCombatVR
 		if (equipManager)
 		{
 			// For ammo, we don't use a specific slot - pass nullptr
-			CALL_MEMBER_FN(equipManager, EquipItem)(actor, ammo, nullptr, 1, nullptr, true, false, false, nullptr);
-			_MESSAGE("WeaponDetection: Equipped Iron Arrows on Actor %08X", actor->formID);
+			CALL_MEMBER_FN(equipManager, EquipItem)(actor, ammoToEquip, nullptr, 1, nullptr, true, false, false, nullptr);
+			
+			const char* ammoName = ammoToEquip->fullName.name.data;
+			_MESSAGE("WeaponDetection: Equipped '%s' on Actor %08X", 
+				ammoName ? ammoName : "Unknown Ammo", actor->formID);
 			return true;
 		}
 		
@@ -497,6 +536,102 @@ namespace MountedNPCCombatVR
 		}
 		return false;
 	}
+	
+	// ============================================
+	// Give Default Weapon for Mounted Combat
+	// Adds an Iron Mace to NPCs that have no suitable weapons
+	// Only adds if they don't already have a 1H melee weapon
+	// ============================================
+	
+	bool GiveDefaultMountedWeapon(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		// Check if they already have a suitable 1H melee weapon in inventory
+		if (HasMeleeWeaponInInventory(actor))
+		{
+			_MESSAGE("WeaponDetection: Actor %08X already has melee weapon - not adding default", actor->formID);
+			return false;
+		}
+		
+		// Look up Iron Mace form
+		TESForm* maceForm = LookupFormByID(IRON_MACE_FORMID);
+		if (!maceForm)
+		{
+			_MESSAGE("WeaponDetection: Failed to find Iron Mace (FormID: %08X)", IRON_MACE_FORMID);
+			return false;
+		}
+		
+		TESObjectWEAP* mace = DYNAMIC_CAST(maceForm, TESForm, TESObjectWEAP);
+		if (!mace)
+		{
+			_MESSAGE("WeaponDetection: FormID %08X is not a weapon", IRON_MACE_FORMID);
+			return false;
+		}
+		
+		// Add the mace to their inventory
+		AddItem_Native(nullptr, 0, actor, maceForm, 1, true);
+		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		_MESSAGE("WeaponDetection: Gave Iron Mace to '%s' (%08X) for mounted combat", 
+			actorName ? actorName : "Unknown", actor->formID);
+		
+		// Now equip it
+		EquipManager* equipManager = EquipManager::GetSingleton();
+		if (equipManager)
+		{
+			BGSEquipSlot* rightSlot = GetRightHandSlot();
+			CALL_MEMBER_FN(equipManager, EquipItem)(actor, mace, nullptr, 1, rightSlot, true, false, false, nullptr);
+			_MESSAGE("WeaponDetection: Equipped Iron Mace on '%s' (%08X)", 
+				actorName ? actorName : "Unknown", actor->formID);
+			return true;
+		}
+		
+		return false;
+	}
+	
+	// ============================================
+	// Give Default Bow for Ranged Mounted Combat
+	// Adds a Hunting Bow to NPCs for ranged role
+	// Only adds if they don't already have a bow in inventory
+	// FormID: 0x00013985 (Hunting Bow from Skyrim.esm)
+	// ============================================
+	
+	bool GiveDefaultBow(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		// Check if they already have a bow in inventory
+		if (HasBowInInventory(actor))
+		{
+			_MESSAGE("WeaponDetection: Actor %08X already has bow - not adding default", actor->formID);
+			return false;
+		}
+		
+		// Look up Hunting Bow form
+		TESForm* bowForm = LookupFormByID(HUNTING_BOW_FORMID);
+		if (!bowForm)
+		{
+			_MESSAGE("WeaponDetection: Failed to find Hunting Bow (FormID: %08X)", HUNTING_BOW_FORMID);
+			return false;
+		}
+		
+		TESObjectWEAP* bow = DYNAMIC_CAST(bowForm, TESForm, TESObjectWEAP);
+		if (!bow)
+		{
+			_MESSAGE("WeaponDetection: FormID %08X is not a weapon", HUNTING_BOW_FORMID);
+			return false;
+		}
+		
+		// Add the bow to their inventory
+		AddItem_Native(nullptr, 0, actor, bowForm, 1, true);
+		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		_MESSAGE("WeaponDetection: Gave Hunting Bow to '%s' (%08X) for ranged mounted combat", 
+			actorName ? actorName : "Unknown", actor->formID);
+		
+		return true;
+	}
 
 	// ============================================
 	// Weapon Logging
@@ -806,17 +941,18 @@ namespace MountedNPCCombatVR
 		return distance <= effectiveHitRadius;
 	}
 	
-	// Check if weapon swing should hit the player during mounted attack animation
+	// Check if weapon swing should hit the target during mounted attack animation
 	// Returns true if weapon is close enough to deal damage
 	bool CheckMountedAttackHit(Actor* rider, Actor* target, float* outDistance)
 	{
 		if (!rider || !target) return false;
 		
+		// Get weapon position from rider's hand
 		NiPoint3 weaponPos;
 		GetWeaponWorldPosition(rider, &weaponPos);
 		
 		// Calculate distance from weapon to target
-		// For player, we check against their position + height offset
+		// For target, we check against their position + height offset
 		float targetHeight = 80.0f;  // Approximate chest height
 		
 		float dx = weaponPos.x - target->pos.x;

@@ -177,7 +177,29 @@ namespace MountedNPCCombatVR
 	void ExecuteFleeing(Actor* actor, Actor* mount, Actor* threat);
 
 	// ============================================
-	// Utility Functions
+	// HOSTILE TARGET DETECTION & ENGAGEMENT
+	// ============================================
+	// Guards and soldiers will automatically engage
+	// hostile NPCs within detection range (1400 units)
+	// ============================================
+	
+	// Find the nearest hostile NPC within range of a mounted guard/soldier
+	Actor* FindNearestHostileTarget(Actor* rider, float maxRange);
+	
+	// Force a mounted NPC into combat with a target
+	// Sets combat target, draws weapon, injects follow package
+	bool EngageHostileTarget(Actor* rider, Actor* target);
+	
+	// Scan all tracked mounted NPCs for nearby hostile targets
+	// Called periodically from UpdateMountedCombat
+	void ScanForHostileTargets();
+	
+	// Alert nearby mounted allies when a guard/soldier is attacked
+	// This makes nearby guards join the fight against the attacker
+	void AlertNearbyMountedAllies(Actor* attackedNPC, Actor* attacker);
+
+	// ============================================
+	// External System Connections
 	// ============================================
 	
 	Actor* GetCombatTarget(Actor* actor);

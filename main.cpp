@@ -147,9 +147,10 @@ namespace MountedNPCCombatVR
 					// Initialize spells for SpecialDismount (ESP data is now available)
 					InitSpecialDismountSpells();
 					
-					// NOTE: Do NOT activate mod here - wait for actual game load events
-					// This prevents stale state when user returns to main menu
-					_MESSAGE("=== DATA LOADED: Hooks installed, waiting for game load event ===");
+					// IMPORTANT: For Skyrim VR, kMessage_NewGame may not fire reliably
+					// Activate the mod here with a delay - it will be reset on actual game loads
+					_MESSAGE("=== DATA LOADED: Activating mod with delay (will be reset on game load events) ===");
+					MountedNPCCombatVR::ActivateModWithDelay();
 				}
 				else if (msg->type == SKSEMessagingInterface::kMessage_PostPostLoad)
 				{
@@ -214,17 +215,6 @@ namespace MountedNPCCombatVR
 						if (g_thePlayer && (*g_thePlayer))
 						{
 							_MESSAGE("Player pointer: 0x%p, FormID: %08X", *g_thePlayer, (*g_thePlayer)->formID);
-							
-							// Check if player is in a valid state
-							Actor* player = *g_thePlayer;
-							if (player->loadedState)
-							{
-								_MESSAGE("Player loadedState: VALID");
-							}
-							else
-							{
-								_MESSAGE("Player loadedState: NULL (waiting for load)");
-							}
 						}
 						else
 						{

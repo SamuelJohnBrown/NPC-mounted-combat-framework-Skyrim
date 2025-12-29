@@ -5,24 +5,21 @@
 namespace MountedNPCCombatVR
 {
 	// ============================================
-	// System Reset (call on game load/new game)
-	// ============================================
-	
-	void ResetCombatStylesSystem();
-	
-	// ============================================
 	// Mount Tracking (cleanup only)
 	// ============================================
 	
 	void ReleaseAllMountControl();
 	
 	// ============================================
-	// Follow Player Behavior (Dynamic Package Injection)
+	// Follow Target Behavior (Dynamic Package Injection)
+	// ============================================
+	// Note: Supports any Actor as target for NPC vs NPC combat
 	// ============================================
 	
-	void SetNPCFollowPlayer(Actor* actor);
-	void ClearNPCFollowPlayer(Actor* actor);
-	bool IsNPCFollowingPlayer(Actor* actor);
+	void UpdateFollowBehavior();
+	void SetNPCFollowTarget(Actor* actor, Actor* target);  // Follow specific target - ALWAYS USE THIS
+	void ClearNPCFollowTarget(Actor* actor);
+	bool IsNPCFollowingTarget(Actor* actor);
 	void ClearAllFollowingNPCs();
 	
 	// ============================================
@@ -44,9 +41,9 @@ namespace MountedNPCCombatVR
 	// Initialize attack animation forms from ESP
 	bool InitAttackAnimations();
 	
-	// Play attack animation based on player side
-	// playerSide: "LEFT" or "RIGHT"
-	bool PlayMountedAttackAnimation(Actor* rider, const char* playerSide);
+	// Play mounted attack animation on rider
+	// targetSide: "LEFT" or "RIGHT"
+	bool PlayMountedAttackAnimation(Actor* rider, const char* targetSide);
 	
 	// Attack state tracking
 	enum class RiderAttackState
