@@ -1,4 +1,0 @@
-LIBRARY	"Mounted_NPC_Combat_VR"
-EXPORTS
-SKSEPlugin_Query
-SKSEPlugin_Load
