@@ -21,6 +21,26 @@ namespace MountedNPCCombatVR
 	bool HasMountedProtection(Actor* actor);
 	void ClearAllMountedProtection();
 	
+	// Set actor mass directly (used for ragdoll recovery)
+	void SetActorMass(Actor* actor, float mass);
+	
+	// ============================================
+	// Temporary Stagger Allow System
+	// ============================================
+	// Temporarily removes stagger protection to allow
+	// block stagger animations to play on mounted NPCs.
+	// Protection is automatically restored after duration.
+	
+	// Temporarily allow stagger for an actor (removes mass protection)
+	// Duration is in seconds (default 2.5s for stagger animation)
+	void AllowTemporaryStagger(Actor* actor, float duration = 2.5f);
+	
+	// Check if actor currently has stagger allowed
+	bool HasTemporaryStaggerAllowed(Actor* actor);
+	
+	// Update temporary stagger timers - call from main update loop
+	void UpdateTemporaryStaggerTimers();
+	
 	// ============================================
 	// NPC Dismount Prevention Hook
 	// ============================================

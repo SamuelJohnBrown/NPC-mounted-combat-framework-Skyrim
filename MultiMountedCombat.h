@@ -20,10 +20,9 @@ namespace MountedNPCCombatVR
 	
 	enum class MultiCombatRole
 	{
-		None = 0,
-		Melee,        // Uses melee weapon, follows target closely
-		Ranged,       // Uses bow, maintains distance (Captain only)
-		FullCombat    // Has both weapons, dynamic switching based on distance (promoted melee)
+		None,
+		Melee, // Close-range fighter - uses follow package, melee weapons
+		Ranged // Distance fighter - maintains 500+ units, uses bow, always faces target
 	};
 	
 	// ============================================
@@ -40,13 +39,14 @@ namespace MountedNPCCombatVR
 		float lastRoleCheckTime;
 		float lastRangedSetupTime;  // Rate limit ranged follow setup
 		bool hasBow;
+		bool isCompanion;  // True if this is a player's companion (not counted in hostile limit)
 		bool isValid;
 		
 		MultiRiderData() :
 			riderFormID(0), horseFormID(0), targetFormID(0),
 			role(MultiCombatRole::None), distanceToTarget(0.0f),
 			lastRoleCheckTime(0.0f), lastRangedSetupTime(0.0f),
-			hasBow(false), isValid(false)
+			hasBow(false), isCompanion(false), isValid(false)
 		{}
 		
 		void Reset()
@@ -59,6 +59,7 @@ namespace MountedNPCCombatVR
 			lastRoleCheckTime = 0.0f;
 			lastRangedSetupTime = 0.0f;
 			hasBow = false;
+			isCompanion = false;
 			isValid = false;
 		}
 	};
@@ -134,17 +135,6 @@ namespace MountedNPCCombatVR
 	// - Use standard melee follow package
 	void ExecuteMeleeRoleBehavior(MultiRiderData* data, Actor* rider, Actor* horse, Actor* target);
 	
-	// Execute full combat role behavior:
-	// - Dynamic weapon switching based on distance
-	// - Melee when close, ranged when far
-	// - Uses charge maneuvers, rapid fire, etc.
-	void ExecuteFullCombatRoleBehavior(MultiRiderData* data, Actor* rider, Actor* horse, Actor* target);
-	
-	// Promote a melee rider to full combat capability
-	// - Gives them a bow
-	// - Enables dynamic weapon switching
-	void PromoteMeleeRiderToFullCombat(MultiRiderData* data, Actor* rider, Actor* horse);
-	
 	// ============================================
 	// Update Functions
 	// ============================================
@@ -161,8 +151,14 @@ namespace MountedNPCCombatVR
 	// Query Functions
 	// ============================================
 	
-	// Get count of active multi-riders
+	// Get count of active multi-riders (all types)
 	int GetActiveMultiRiderCount();
+	
+	// Get count of hostile riders (excludes companions)
+	int GetHostileRiderCount();
+	
+	// Get count of companion riders
+	int GetCompanionRiderCount();
 	
 	// Get count of riders in melee role
 	int GetMeleeRiderCount();

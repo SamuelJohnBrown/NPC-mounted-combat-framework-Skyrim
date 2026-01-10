@@ -8,6 +8,8 @@
 #include "ArrowSystem.h"
 #include "MultiMountedCombat.h"
 #include "DynamicPackages.h"
+#include "HorseMountScanner.h"
+#include "CompanionCombat.h"
 
 namespace MountedNPCCombatVR
 {
@@ -16,7 +18,8 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	float g_updateInterval = 0.5f;  // Update every 500ms
-	const int MAX_TRACKED_NPCS = 5;  // Maximum 5 NPCs tracked at once
+	const int MAX_TRACKED_NPCS_ARRAY = 10;  // Maximum array size (hardcoded for memory safety)
+	// Actual runtime limit is MaxTrackedMountedNPCs from config (1-10)
 	const float FLEE_SAFE_DISTANCE = 4500.0f;  // Distance at which fleeing NPCs feel safe (just over 1 cell)
 	const float ALLY_ALERT_RANGE = 2000.0f;    // Range to alert allies when attacked
 	
@@ -28,7 +31,7 @@ namespace MountedNPCCombatVR
 	bool g_playerTriggeredMountedCombat = false;
 	bool g_playerWasMountedWhenCombatStarted = false;
 	bool g_playerInExterior = true;  // Assume exterior until checked
-	bool g_playerIsDead = false;     // Track player death state
+	bool g_playerIsDead = false;   // Track player death state
 	static bool g_lastPlayerMountedCombatState = false;  // For detecting state changes
 	static bool g_lastExteriorState = true;  // For detecting cell changes
 	static bool g_lastPlayerDeadState = false;  // For detecting death state changes
@@ -40,7 +43,6 @@ namespace MountedNPCCombatVR
 	bool g_guardInMountedCombat = false;
 	bool g_soldierInMountedCombat = false;
 	bool g_banditInMountedCombat = false;
-	bool g_hunterInMountedCombat = false;
 	bool g_mageInMountedCombat = false;
 	bool g_civilianFleeing = false;
 	
@@ -48,7 +50,7 @@ namespace MountedNPCCombatVR
 	// Internal State
 	// ============================================
 	
-	static MountedNPCData g_trackedNPCs[MAX_TRACKED_NPCS];
+	static MountedNPCData g_trackedNPCs[MAX_TRACKED_NPCS_ARRAY];
 	static bool g_systemInitialized = false;
 
 	// ============================================
@@ -66,8 +68,12 @@ namespace MountedNPCCombatVR
 		// Clear all tracking data
 		ResetAllMountedNPCs();
 		
+		// Initialize companion combat system
+		InitCompanionCombat();
+		
 		g_systemInitialized = true;
-		_MESSAGE("MountedCombat: System initialized (max %d NPCs tracked)", MAX_TRACKED_NPCS);
+		_MESSAGE("MountedCombat: System initialized (max %d NPCs tracked, config limit: %d)", 
+			MAX_TRACKED_NPCS_ARRAY, MaxTrackedMountedNPCs);
 		_MESSAGE("MountedCombat: === INITIALIZATION COMPLETE ===");
 	}
 	
@@ -82,6 +88,10 @@ namespace MountedNPCCombatVR
 		}
 		
 		ResetAllMountedNPCs();
+		
+		// Shutdown companion combat system
+		ShutdownCompanionCombat();
+		
 		g_systemInitialized = false;
 		
 		_MESSAGE("MountedCombat: === SHUTDOWN COMPLETE ===");
@@ -95,11 +105,14 @@ namespace MountedNPCCombatVR
 		int clearedCount = 0;
 		
 		// Remove protection from all tracked NPCs before reset
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		// AND clear horse movement packages
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid)
 			{
 				clearedCount++;
+				
+				// Clear rider protection and follow target
 				TESForm* form = LookupFormByID(g_trackedNPCs[i].actorFormID);
 				if (form)
 				{
@@ -107,6 +120,22 @@ namespace MountedNPCCombatVR
 					if (actor)
 					{
 						RemoveMountedProtection(actor);
+						ClearNPCFollowTarget(actor);
+					}
+				}
+				
+				// Clear horse movement packages
+				if (g_trackedNPCs[i].mountFormID != 0)
+				{
+					TESForm* mountForm = LookupFormByID(g_trackedNPCs[i].mountFormID);
+					if (mountForm)
+					{
+						Actor* mount = DYNAMIC_CAST(mountForm, TESForm, Actor);
+						if (mount)
+						{
+							Actor_ClearKeepOffsetFromActor(mount);
+							Actor_EvaluatePackage(mount, false, false);
+						}
 					}
 				}
 			}
@@ -115,11 +144,14 @@ namespace MountedNPCCombatVR
 		
 		if (clearedCount > 0)
 		{
-			_MESSAGE("MountedCombat: Cleared %d tracked NPCs", clearedCount);
+			_MESSAGE("MountedCombat: Cleared %d tracked NPCs (including horse packages)", clearedCount);
 		}
 		
 		// Clear any remaining protection tracking
 		ClearAllMountedProtection();
+		
+		// Reset companion combat tracking
+		ResetCompanionCombat();
 		
 		// Reset player mounted combat state
 		g_playerInMountedCombat = false;
@@ -135,7 +167,6 @@ namespace MountedNPCCombatVR
 		g_guardInMountedCombat = false;
 		g_soldierInMountedCombat = false;
 		g_banditInMountedCombat = false;
-		g_hunterInMountedCombat = false;
 		g_mageInMountedCombat = false;
 		g_civilianFleeing = false;
 		
@@ -151,12 +182,11 @@ namespace MountedNPCCombatVR
 		g_guardInMountedCombat = false;
 		g_soldierInMountedCombat = false;
 		g_banditInMountedCombat = false;
-		g_hunterInMountedCombat = false;
 		g_mageInMountedCombat = false;
 		g_civilianFleeing = false;
 		
 		// Check each tracked NPC
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (!g_trackedNPCs[i].isValid)
 			{
@@ -173,9 +203,6 @@ namespace MountedNPCCombatVR
 					break;
 				case MountedCombatClass::BanditRanged:
 					g_banditInMountedCombat = true;
-					break;
-				case MountedCombatClass::HunterRanged:
-					g_hunterInMountedCombat = true;
 					break;
 				case MountedCombatClass::MageCaster:
 					g_mageInMountedCombat = true;
@@ -201,10 +228,13 @@ namespace MountedNPCCombatVR
 			return;
 		}
 		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		
 		// Get or create tracking data for this NPC
 		MountedNPCData* data = GetOrCreateNPCData(actor);
 		if (!data)
 		{
+			_MESSAGE("MountedCombat: ERROR - Could not create tracking data for %08X (max NPCs reached?)", actor->formID);
 			return;
 		}
 		
@@ -218,52 +248,34 @@ namespace MountedNPCCombatVR
 		if (data->behavior == MountedBehaviorType::Unknown)
 		{
 			data->behavior = DetermineBehaviorType(actor);
-			
-			const char* behaviorStr = (data->behavior == MountedBehaviorType::Aggressive) ? "AGGRESSIVE" : "PASSIVE";
-			_MESSAGE("MountedCombat: NPC %08X behavior determined: %s", actor->formID, behaviorStr);
 		}
 		
 		// Determine combat class based on faction
 		if (data->combatClass == MountedCombatClass::None)
 		{
 			data->combatClass = DetermineCombatClass(actor);
-			_MESSAGE("MountedCombat: NPC %08X combat class: %s", actor->formID, GetCombatClassName(data->combatClass));
 		}
+		
+		// Log compact summary
+		_MESSAGE("MountedCombat: Detected '%s' (%08X) on horse %08X - Class: %s", 
+			actorName ? actorName : "Unknown", actor->formID, mount->formID,
+			GetCombatClassName(data->combatClass));
 		
 		// ============================================
 		// PRE-ASSIGN CAPTAIN TO RANGED ROLE
-		// This happens BEFORE combat starts, so they're ready
 		// ============================================
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		if (actorName && strstr(actorName, "Captain") != nullptr)
 		{
-			_MESSAGE("MountedCombat: *** PRE-ASSIGNING CAPTAIN '%s' TO RANGED ***", actorName);
-			
-			// Give bow if they don't have one
 			if (!HasBowInInventory(actor))
 			{
-				_MESSAGE("MountedCombat: Giving Hunting Bow to Captain");
 				GiveDefaultBow(actor);
 			}
-			
-			// Give arrows
-			_MESSAGE("MountedCombat: Giving arrows to Captain");
 			EquipArrows(actor);
-			
-			// Equip the bow
-			_MESSAGE("MountedCombat: Equipping bow on Captain");
 			EquipBestBow(actor);
-			
-			// Draw weapon
-			_MESSAGE("MountedCombat: Drawing weapon on Captain");
 			actor->DrawSheatheWeapon(true);
 			
-			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED with bow equipped", actorName);
+			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED", actorName);
 			
-			// ============================================
-			// CRITICAL: Pre-register the Captain as RANGED rider NOW
-			// This ensures the ranged state machine is active from the start
-			// ============================================
 			Actor* target = nullptr;
 			if (g_thePlayer && (*g_thePlayer))
 			{
@@ -272,10 +284,7 @@ namespace MountedNPCCombatVR
 			
 			if (target)
 			{
-				_MESSAGE("MountedCombat: Pre-registering Captain as RANGED rider with MultiMountedCombat");
 				RegisterMultiRider(actor, mount, target);
-				
-				// Also clear any keep-offset to prevent AI interference
 				Actor_ClearKeepOffsetFromActor(mount);
 			}
 		}
@@ -283,23 +292,16 @@ namespace MountedNPCCombatVR
 		// Track player's mount status when combat with mounted NPC starts
 		OnPlayerTriggeredMountedCombat(actor);
 		
-		// Get combat target - this may be null if NPC wasn't directly attacked
+		// Get combat target
 		Actor* target = GetCombatTarget(actor);
 		
-		// Log target status for debugging
 		if (target)
 		{
-			const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-			_MESSAGE("MountedCombat: NPC %08X has combat target: '%s' (%08X)", 
-				actor->formID, targetName ? targetName : "Unknown", target->formID);
 			data->targetFormID = target->formID;
 		}
 		else
 		{
-			_MESSAGE("MountedCombat: NPC %08X has NO combat target - will acquire one", actor->formID);
-			
 			// For guards/soldiers without a target, default to player if player is in combat nearby
-			// This handles the case where a guard wasn't directly attacked but their ally was
 			if (data->combatClass == MountedCombatClass::GuardMelee ||
 				data->combatClass == MountedCombatClass::SoldierMelee)
 			{
@@ -311,19 +313,14 @@ namespace MountedNPCCombatVR
 						float distance = GetDistanceBetween(actor, player);
 						if (distance < ALLY_ALERT_RANGE)
 						{
-							_MESSAGE("MountedCombat: NPC %08X - Player in combat nearby (%.0f units), setting as target", 
-								actor->formID, distance);
 							data->targetFormID = player->formID;
 							target = player;
 							
-							// Set combat target handle on the NPC
 							UInt32 playerHandle = player->CreateRefHandle();
 							if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
 							{
 								actor->currentCombatTarget = playerHandle;
 							}
-							
-							// Make hostile to player
 							actor->flags2 |= Actor::kFlag_kAttackOnSight;
 						}
 					}
@@ -341,7 +338,6 @@ namespace MountedNPCCombatVR
 		// Set initial state based on combat class
 		if (data->state == MountedCombatState::None)
 		{
-			// Record combat start time for weapon draw delay
 			data->combatStartTime = GetCurrentGameTime();
 			data->weaponDrawn = false;
 			
@@ -350,7 +346,6 @@ namespace MountedNPCCombatVR
 				case MountedCombatClass::CivilianFlee:
 					data->state = MountedCombatState::Fleeing;
 					break;
-				case MountedCombatClass::HunterRanged:
 				case MountedCombatClass::BanditRanged:
 				case MountedCombatClass::MageCaster:
 					data->state = MountedCombatState::RangedAttack;
@@ -363,8 +358,6 @@ namespace MountedNPCCombatVR
 		}
 		
 		data->lastUpdateTime = GetCurrentGameTime();
-		
-		// Update combat class bools
 		UpdateCombatClassBools();
 	}
 	
@@ -375,11 +368,17 @@ namespace MountedNPCCombatVR
 			return;
 		}
 		
+		// Update delayed arrow fires (200ms delay between animation and arrow spawn)
+		UpdateDelayedArrowFires();
+		
 		// Update the combat styles system (reinforcement of follow packages)
 		UpdateCombatStylesSystem();
 		
 		// Update multi-mounted combat (ranged role behaviors, etc.)
 		UpdateMultiMountedCombat();
+		
+		// Update temporary stagger timers (restore protection after block stagger)
+		UpdateTemporaryStaggerTimers();
 		
 		// Update player mounted combat state
 		UpdatePlayerMountedCombatState();
@@ -390,9 +389,15 @@ namespace MountedNPCCombatVR
 		// Scan for hostile targets (guards/soldiers will engage hostiles within range)
 		ScanForHostileTargets();
 		
+		// Update horse mount scanner (independent system for tracking horses near combat NPCs)
+		UpdateHorseMountScanner();
+		
+		// Update mounted companion combat (player teammates on horseback)
+		UpdateMountedCompanionCombat();
+		
 		float currentTime = GetCurrentGameTime();
 		
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			MountedNPCData* data = &g_trackedNPCs[i];
 			
@@ -438,6 +443,9 @@ namespace MountedNPCCombatVR
 			bool stillMounted = CALL_MEMBER_FN(actor, GetMount)(mountPtr);
 			if (!stillMounted || !mountPtr)
 			{
+				// NPC dismounted - notify scanner before clearing tracking
+				OnNPCDismounted(data->actorFormID, data->mountFormID);
+				
 				RemoveMountedProtection(actor);
 				ClearNPCFollowTarget(actor);
 				data->Reset();
@@ -502,7 +510,7 @@ namespace MountedNPCCombatVR
 			Actor* target = GetCombatTarget(actor);
 			if (target)
 			{
-				data->targetFormID = target->formID;
+			data->targetFormID = target->formID;
 			}
 			
 			// Update weapon info periodically
@@ -528,10 +536,6 @@ namespace MountedNPCCombatVR
 					BanditCombat::ExecuteBehavior(data, actor, mountPtr, target);
 					break;
 					
-				case MountedCombatClass::HunterRanged:
-					HunterCombat::ExecuteBehavior(data, actor, mountPtr, target);
-					break;
-					
 				case MountedCombatClass::MageCaster:
 					MageCombat::ExecuteBehavior(data, actor, mountPtr, target);
 					break;
@@ -540,9 +544,14 @@ namespace MountedNPCCombatVR
 					// TODO: CivilianFlee behavior not yet implemented
 					// CivilianFlee::ExecuteBehavior(data, actor, mountPtr, target);
 					break;
+				
+				case MountedCombatClass::Other:
+					// Unknown faction - use Guard melee behavior (aggressive)
+					GuardCombat::ExecuteBehavior(data, actor, mountPtr, target);
+					break;
 					
 				default:
-					// Unknown class - do nothing, rely on vanilla AI
+					// None class - do nothing, rely on vanilla AI
 					break;
 			}
 			
@@ -564,7 +573,7 @@ namespace MountedNPCCombatVR
 		UInt32 formID = actor->formID;
 		
 		// First, check if already tracked
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid && g_trackedNPCs[i].actorFormID == formID)
 			{
@@ -572,8 +581,8 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		// Find empty slot
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		// Find empty slot (limited by MaxTrackedMountedNPCs config)
+		for (int i = 0; i < MaxTrackedMountedNPCs && i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (!g_trackedNPCs[i].isValid)
 			{
@@ -589,7 +598,7 @@ namespace MountedNPCCombatVR
 	
 	MountedNPCData* GetNPCData(UInt32 formID)
 	{
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid && g_trackedNPCs[i].actorFormID == formID)
 			{
@@ -599,13 +608,25 @@ namespace MountedNPCCombatVR
 		return nullptr;
 	}
 	
+	MountedNPCData* GetNPCDataByIndex(int index)
+	{
+		if (index < 0 || index >= MAX_TRACKED_NPCS_ARRAY)
+		{
+			return nullptr;
+		}
+		return &g_trackedNPCs[index];
+	}
+	
 	void RemoveNPCFromTracking(UInt32 formID)
 	{
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid && g_trackedNPCs[i].actorFormID == formID)
 			{
-				// Remove mounted protection before resetting
+				// Get the mount FormID BEFORE resetting (we need it to clear the horse)
+				UInt32 mountFormID = g_trackedNPCs[i].mountFormID;
+				
+				// Remove mounted protection and clear rider's follow target
 				TESForm* form = LookupFormByID(formID);
 				if (form)
 				{
@@ -614,12 +635,40 @@ namespace MountedNPCCombatVR
 					{
 						RemoveMountedProtection(actor);
 						
-						// Clear follow mode if set
+						// Clear follow mode on the rider
 						ClearNPCFollowTarget(actor);
 					}
 				}
 				
+				// ============================================
+				// CRITICAL: Clear the HORSE's movement packages too!
+				// The horse may have KeepOffsetFromActor set which
+				// makes it follow the player even after rider dismounts.
+				// ============================================
+				if (mountFormID != 0)
+				{
+					TESForm* mountForm = LookupFormByID(mountFormID);
+					if (mountForm)
+					{
+						Actor* mount = DYNAMIC_CAST(mountForm, TESForm, Actor);
+						if (mount)
+						{
+							const char* mountName = CALL_MEMBER_FN(mount, GetReferenceName)();
+							_MESSAGE("MountedCombat: Clearing movement packages from horse '%s' (%08X)",
+								mountName ? mountName : "Horse", mountFormID);
+							
+							// Clear KeepOffsetFromActor on the horse
+							Actor_ClearKeepOffsetFromActor(mount);
+							
+							// Re-evaluate the horse's AI packages so it returns to normal behavior
+							Actor_EvaluatePackage(mount, false, false);
+						}
+					}
+				}
+				
 				g_trackedNPCs[i].Reset();
+				
+				_MESSAGE("MountedCombat: Removed NPC %08X from tracking (mount %08X also cleared)", formID, mountFormID);
 				return;
 			}
 		}
@@ -633,7 +682,7 @@ namespace MountedNPCCombatVR
 	int GetTrackedNPCCount()
 	{
 		int count = 0;
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid)
 			{
@@ -646,7 +695,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Faction / Behavior Determination
 	// ============================================
-	
+
 	MountedBehaviorType DetermineBehaviorType(Actor* actor)
 	{
 		if (!actor)
@@ -655,9 +704,9 @@ namespace MountedNPCCombatVR
 		}
 		
 		// Use the faction checks from FactionData.cpp
-		// Aggressive factions: Guards, Soldiers, Bandits, Hunters, Mages
+		// Aggressive factions: Guards, Soldiers, Bandits, Mages
 		if (IsGuardFaction(actor) || IsSoldierFaction(actor) || 
-			IsBanditFaction(actor) || IsHunterFaction(actor) || IsMageFaction(actor))
+			IsBanditFaction(actor) || IsMageFaction(actor))
 		{
 			return MountedBehaviorType::Aggressive;
 		}
@@ -683,7 +732,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Combat Behavior (Aggressive NPCs)
 	// ============================================
-	
+
 	MountedCombatState DetermineAggressiveState(Actor* actor, Actor* mount, Actor* target, MountedWeaponInfo* weaponInfo)
 	{
 		if (!actor || !mount || !target || !weaponInfo)
@@ -776,7 +825,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Flee Behavior (Passive NPCs)
 	// ============================================
-	
+
 	MountedCombatState DeterminePassiveState(Actor* actor, Actor* mount, Actor* threat)
 	{
 		if (!actor || !mount)
@@ -847,7 +896,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Utility Functions
 	// ============================================
-	
+
 	Actor* GetCombatTarget(Actor* actor)
 	{
 		if (!actor)
@@ -1073,7 +1122,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Player Mounted Combat State
 	// ============================================
-	
+
 	bool IsPlayerMounted()
 	{
 		if (!g_thePlayer || !(*g_thePlayer))
@@ -1150,7 +1199,7 @@ namespace MountedNPCCombatVR
 				_MESSAGE("MountedCombat: Player DIED - disabling ALL mounted combat logic");
 				
 				// Immediately reset everything
-				for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+				for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 				{
 					if (g_trackedNPCs[i].isValid)
 					{
@@ -1209,7 +1258,7 @@ namespace MountedNPCCombatVR
 				_MESSAGE("MountedCombat: Player entered INTERIOR cell - mounted combat DISABLED");
 				
 				// Clear all tracked NPCs when entering interior
-				for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+				for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 				{
 					if (g_trackedNPCs[i].isValid)
 					{
@@ -1239,7 +1288,7 @@ namespace MountedNPCCombatVR
 		bool hasAggressiveMountedNPCs = false;
 		
 		// Check if any tracked NPCs are aggressive (fighting the player)
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid && 
 				g_trackedNPCs[i].behavior == MountedBehaviorType::Aggressive)
@@ -1318,10 +1367,13 @@ namespace MountedNPCCombatVR
 	// Called periodically to check for nearby threats.
 	// ============================================
 	
-	const float HOSTILE_DETECTION_RANGE = 1400.0f;  // Units to scan for hostiles
-	const float HOSTILE_SCAN_INTERVAL = 3.0f;       // Scan every 3 seconds
-	static float g_lastHostileScanTime = 0;
+	// ============================================
+	// HOSTILE DETECTION CONFIGURATION
+	// Now loaded from config - see HostileDetectionRange and HostileScanInterval
+	// ============================================
 	
+	static float g_lastHostileScanTime = 0;
+
 	// ============================================
 	// ALERT NEARBY ALLIES WHEN ATTACKED
 	// When a mounted guard is attacked, alert other nearby
@@ -1330,11 +1382,8 @@ namespace MountedNPCCombatVR
 	void AlertNearbyMountedAllies(Actor* attackedNPC, Actor* attacker)
 	{
 		if (!attackedNPC || !attacker) return;
-		
-		// Don't alert if attacker is dead
 		if (attacker->IsDead(1)) return;
 		
-		// Get the attacked NPC's combat class
 		MountedCombatClass attackedClass = DetermineCombatClass(attackedNPC);
 		
 		// Only guards and soldiers alert allies
@@ -1344,26 +1393,10 @@ namespace MountedNPCCombatVR
 			return;
 		}
 		
-		const char* attackedName = CALL_MEMBER_FN(attackedNPC, GetReferenceName)();
-		const char* attackerName = CALL_MEMBER_FN(attacker, GetReferenceName)();
-		_MESSAGE("MountedCombat: ========================================");
-		_MESSAGE("MountedCombat: ALERTING NEARBY ALLIES");
-		_MESSAGE("MountedCombat: Attacked: '%s' (%08X)", attackedName ? attackedName : "Unknown", attackedNPC->formID);
-		_MESSAGE("MountedCombat: Attacker: '%s' (%08X)", attackerName ? attackerName : "Unknown", attacker->formID);
-		_MESSAGE("MountedCombat: ========================================");
-		
 		TESObjectCELL* cell = attackedNPC->parentCell;
-		if (!cell)
-		{
-			_MESSAGE("MountedCombat: ERROR - attackedNPC has no parentCell");
-			return;
-		}
-		
-		_MESSAGE("MountedCombat: Scanning cell with %d objects for mounted allies within %.0f units...", 
-			cell->objectList.count, ALLY_ALERT_RANGE);
+		if (!cell) return;
 		
 		int alliesAlerted = 0;
-		int mountedNPCsFound = 0;
 		
 		// Scan for nearby mounted NPCs
 		for (UInt32 i = 0; i < cell->objectList.count; i++)
@@ -1376,16 +1409,10 @@ namespace MountedNPCCombatVR
 			Actor* potentialAlly = DYNAMIC_CAST(ref, TESObjectREFR, Actor);
 			if (!potentialAlly) continue;
 			
-			// Skip self
+			// Skip self, attacker, player, dead
 			if (potentialAlly->formID == attackedNPC->formID) continue;
-			
-			// Skip the attacker
 			if (potentialAlly->formID == attacker->formID) continue;
-			
-			// Skip player
 			if (g_thePlayer && (*g_thePlayer) && potentialAlly == (*g_thePlayer)) continue;
-			
-			// Skip dead actors
 			if (potentialAlly->IsDead(1)) continue;
 			
 			// Check if mounted
@@ -1393,71 +1420,35 @@ namespace MountedNPCCombatVR
 			bool isMounted = CALL_MEMBER_FN(potentialAlly, GetMount)(mount);
 			if (!isMounted || !mount) continue;
 			
-			mountedNPCsFound++;
-			
 			// Check distance
 			float distance = GetDistanceBetween(attackedNPC, potentialAlly);
-			if (distance > ALLY_ALERT_RANGE)
-			{
-				const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
-				_MESSAGE("MountedCombat: Mounted NPC '%s' (%08X) too far: %.0f units",
-					allyName ? allyName : "Unknown", potentialAlly->formID, distance);
-				continue;
-			}
+			if (distance > ALLY_ALERT_RANGE) continue;
 			
-			// Check if this is an ally (same type: guard or soldier)
+			// Check if ally (same type: guard or soldier)
 			MountedCombatClass allyClass = DetermineCombatClass(potentialAlly);
 			if (allyClass != MountedCombatClass::GuardMelee &&
 				allyClass != MountedCombatClass::SoldierMelee)
 			{
-				const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
-				_MESSAGE("MountedCombat: Mounted NPC '%s' (%08X) is not guard/soldier: %s",
-					allyName ? allyName : "Unknown", potentialAlly->formID, GetCombatClassName(allyClass));
 				continue;
 			}
 			
-			// Check if already tracked
+			// Check if already tracked with this target
 			MountedNPCData* existingData = GetNPCData(potentialAlly->formID);
 			if (existingData && existingData->isValid)
 			{
-				// Already being tracked - check if they have the attacker as target
-				if (existingData->targetFormID == attacker->formID)
-				{
-					const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
-					_MESSAGE("MountedCombat: Ally '%s' (%08X) already targeting attacker",
-						allyName ? allyName : "Unknown", potentialAlly->formID);
-					continue;
-				}
+				if (existingData->targetFormID == attacker->formID) continue;
 				
-				// They're tracked but NOT targeting the attacker - update their target!
-				const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
-				_MESSAGE("MountedCombat: Ally '%s' (%08X) already tracked but needs target update (was: %08X, now: %08X)",
-					allyName ? allyName : "Unknown", potentialAlly->formID, 
-					existingData->targetFormID, attacker->formID);
-				
+				// Update target
 				existingData->targetFormID = attacker->formID;
-				
-				// Make sure they have follow behavior set up
 				SetNPCFollowTarget(potentialAlly, attacker);
-				
 				alliesAlerted++;
 				continue;
 			}
 			
-			// This ally should join combat!
-			const char* allyName = CALL_MEMBER_FN(potentialAlly, GetReferenceName)();
-			_MESSAGE("MountedCombat: Alerting ally '%s' (%08X) to attack %08X (distance: %.0f)",
-				allyName ? allyName : "Unknown", potentialAlly->formID, attacker->formID, distance);
-			
-			// Get or create tracking data for this ally
+			// New ally - set up tracking
 			MountedNPCData* data = GetOrCreateNPCData(potentialAlly);
-			if (!data)
-			{
-				_MESSAGE("MountedCombat: ERROR - Could not create tracking data for ally (MAX_TRACKED_NPCS reached?)");
-				continue;
-			}
+			if (!data) continue;
 			
-			// Set up the ally's combat data
 			data->mountFormID = mount->formID;
 			data->targetFormID = attacker->formID;
 			data->combatClass = allyClass;
@@ -1465,33 +1456,26 @@ namespace MountedNPCCombatVR
 			data->state = MountedCombatState::Engaging;
 			data->stateStartTime = GetCurrentGameTime();
 			data->combatStartTime = GetCurrentGameTime();
-			data->weaponDrawn = false;  // Will draw after delay
+			data->weaponDrawn = false;
 			
-			// Apply mounted protection
 			ApplyMountedProtection(potentialAlly);
 			
-			_MESSAGE("MountedCombat: Applied mounted protection to '%s' (FormID: %08X) - alerted ally", 
-				allyName ? allyName : "Unknown", potentialAlly->formID);
-			
-			// Force into combat with the attacker
-			// Set the ally's combat alarm - this makes them hostile to the attacker
 			potentialAlly->flags2 |= Actor::kFlag_kAttackOnSight;
 			
-			// Set combat target handle
 			UInt32 attackerHandle = attacker->CreateRefHandle();
 			if (attackerHandle != 0 && attackerHandle != *g_invalidRefHandle)
 			{
 				potentialAlly->currentCombatTarget = attackerHandle;
 			}
 			
-			// Set up follow behavior (this injects the follow package)
 			SetNPCFollowTarget(potentialAlly, attacker);
-			
 			alliesAlerted++;
 		}
 		
-		_MESSAGE("MountedCombat: Scan complete - found %d mounted NPCs, alerted %d allies", 
-			mountedNPCsFound, alliesAlerted);
+		if (alliesAlerted > 0)
+		{
+			_MESSAGE("MountedCombat: Alerted %d nearby allies to attack %08X", alliesAlerted, attacker->formID);
+		}
 	}
 	
 	// Find the nearest hostile NPC within range of a mounted guard/soldier
@@ -1522,8 +1506,34 @@ namespace MountedNPCCombatVR
 			// Skip dead actors
 			if (potentialTarget->IsDead(1)) continue;
 			
+			// Skip player (handled separately)
+			if (g_thePlayer && (*g_thePlayer) && potentialTarget->formID == (*g_thePlayer)->formID) continue;
+			
+			// ============================================
+			// COMPANION HANDLING
+			// Only skip companions who are NOT hostile to this guard
+			// If a companion attacks a guard, the guard CAN target them
+			// ============================================
+			if (IsCompanion(potentialTarget))
+			{
+				// Check if companion is hostile to this guard (attacked them, etc.)
+				// Use the game's IsHostileToActor check
+				bool companionIsHostile = IsActorHostileToActor(potentialTarget, rider);
+				
+				if (!companionIsHostile)
+				{
+					// Companion is friendly - skip them
+					continue;
+				}
+				// else: Companion IS hostile - allow targeting
+			}
+			
 			// Check if this actor is hostile (from our FactionData lists)
-			if (!IsHostileNPC(potentialTarget)) continue;
+			// OR if it's a hostile companion (already passed the check above)
+			bool isKnownHostile = IsHostileNPC(potentialTarget);
+			bool isHostileCompanion = IsCompanion(potentialTarget) && IsActorHostileToActor(potentialTarget, rider);
+			
+			if (!isKnownHostile && !isHostileCompanion) continue;
 			
 			// Calculate distance
 			float distance = GetDistanceBetween(rider, potentialTarget);
@@ -1540,28 +1550,14 @@ namespace MountedNPCCombatVR
 	}
 	
 	// Force a mounted NPC into combat with a target
-	// - Sets combat target
-	// - Draws weapon
-	// - Injects follow package
 	bool EngageHostileTarget(Actor* rider, Actor* target)
 	{
 		if (!rider || !target) return false;
-		
-		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-		const char* hostileType = GetHostileTypeName(target);
-		
-		_MESSAGE("MountedCombat: ========================================");
-		_MESSAGE("MountedCombat: ENGAGING HOSTILE TARGET");
-		_MESSAGE("MountedCombat: Rider: '%s' (%08X)", riderName ? riderName : "Unknown", rider->formID);
-		_MESSAGE("MountedCombat: Target: '%s' (%08X) - %s", targetName ? targetName : "Unknown", target->formID, hostileType);
-		_MESSAGE("MountedCombat: ========================================");
 		
 		// Get or create tracking data
 		MountedNPCData* data = GetOrCreateNPCData(rider);
 		if (!data)
 		{
-			_MESSAGE("MountedCombat: ERROR - Could not create tracking data for rider");
 			return false;
 		}
 		
@@ -1572,7 +1568,6 @@ namespace MountedNPCCombatVR
 		if (data->combatClass == MountedCombatClass::None)
 		{
 			data->combatClass = DetermineCombatClass(rider);
-			_MESSAGE("MountedCombat: Rider combat class: %s", GetCombatClassName(data->combatClass));
 		}
 		
 		// Set behavior to aggressive
@@ -1588,41 +1583,37 @@ namespace MountedNPCCombatVR
 		UInt32 targetHandle = target->CreateRefHandle();
 		if (targetHandle != 0 && targetHandle != *g_invalidRefHandle)
 		{
-			// Set the rider's combat target
 			rider->currentCombatTarget = targetHandle;
 		}
 		
-		// Force rider into combat state
-		// The AI will handle the actual combat once we inject the follow package
-		
 		// Draw weapon (with slight delay for realism)
 		data->combatStartTime = GetCurrentGameTime();
-		data->weaponDrawn = false;  // Will be drawn in ExecuteBehavior after delay
+		data->weaponDrawn = false;
 		
 		// Set initial state
 		data->state = MountedCombatState::Engaging;
 		data->stateStartTime = GetCurrentGameTime();
 		
-		// INJECT THE FOLLOW PACKAGE - This is what makes the rider pursue the target!
-		// Now passes the actual hostile target, not just the player!
+		// Inject follow package
 		SetNPCFollowTarget(rider, target);
 		
-		_MESSAGE("MountedCombat: Rider %08X now engaging hostile target %08X", rider->formID, target->formID);
+		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
+		const char* hostileType = GetHostileTypeName(target);
+		_MESSAGE("MountedCombat: %08X '%s' engaging %08X (%s)", 
+			rider->formID, riderName ? riderName : "Unknown", target->formID, hostileType);
 		
-		// Update combat class bools
 		UpdateCombatClassBools();
 		
 		return true;
 	}
 	
 	// Scan all tracked mounted NPCs (guards/soldiers) for nearby hostile targets
-	// This is the main entry point called from UpdateMountedCombat
 	void ScanForHostileTargets()
 	{
 		float currentTime = GetCurrentGameTime();
 		
-		// Only scan periodically
-		if ((currentTime - g_lastHostileScanTime) < HOSTILE_SCAN_INTERVAL)
+		// Only scan periodically (using config value)
+		if ((currentTime - g_lastHostileScanTime) < HostileScanInterval)
 		{
 			return;
 		}
@@ -1635,7 +1626,7 @@ namespace MountedNPCCombatVR
 		}
 		
 		// Scan all tracked mounted NPCs
-		for (int i = 0; i < MAX_TRACKED_NPCS; i++)
+		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			MountedNPCData* data = &g_trackedNPCs[i];
 			
@@ -1655,62 +1646,79 @@ namespace MountedNPCCombatVR
 			if (!rider) continue;
 			
 			// ============================================
-			// CHECK IF CURRENT TARGET IS VALID
+			// CHECK RIDER'S ACTUAL COMBAT TARGET FROM GAME
+			// If the game has set a combat target, RESPECT IT
+			// Don't override game AI target selection
 			// ============================================
-			bool needsNewTarget = false;
-			bool playerIsGenuinelyHostile = false;
-			
-			// Check if player is genuinely hostile to this guard (game's combat system says so)
 			UInt32 combatTargetHandle = rider->currentCombatTarget;
 			if (combatTargetHandle != 0)
 			{
 				NiPointer<TESObjectREFR> targetRef;
 				LookupREFRByHandle(combatTargetHandle, targetRef);
-				if (targetRef && targetRef->formID == 0x14)
+				if (targetRef && targetRef->formType == kFormType_Character)
 				{
-					playerIsGenuinelyHostile = true;
+					Actor* actualTarget = static_cast<Actor*>(targetRef.get());
+					if (actualTarget && !actualTarget->IsDead(1))
+					{
+						// Rider has a valid combat target from the game - update our tracking
+						if (data->targetFormID != actualTarget->formID)
+						{
+							data->targetFormID = actualTarget->formID;
+						}
+						// Rider already has a target - skip scanning for new ones
+						continue;
+					}
 				}
 			}
 			
+			// ============================================
+			// CHECK IF STORED TARGET IS STILL VALID
+			// ============================================
+			bool needsNewTarget = false;
+			
 			if (data->targetFormID == 0)
 			{
-				// No target yet
 				needsNewTarget = true;
 			}
-			else if (data->targetFormID == 0x14)  // Player FormID
+			else if (data->targetFormID == 0x14)
 			{
-				// Currently targeting player
-				if (playerIsGenuinelyHostile)
+				// Targeting player - check if player is genuinely hostile
+				bool playerIsGenuinelyHostile = false;
+				if (combatTargetHandle != 0)
 				{
-					// Player attacked the guard - this is a valid target, don't change it
-					continue;
+					NiPointer<TESObjectREFR> targetRef;
+					LookupREFRByHandle(combatTargetHandle, targetRef);
+					if (targetRef && targetRef->formID == 0x14)
+					{
+						playerIsGenuinelyHostile = true;
+					}
+				}
+				
+				if (!playerIsGenuinelyHostile)
+				{
+					needsNewTarget = true;
 				}
 				else
 				{
-					// Player didn't attack - guard shouldn't target them
-					// Try to find a real hostile instead
-					needsNewTarget = true;
-					_MESSAGE("MountedCombat: Guard %08X is targeting PLAYER but player not hostile - scanning for real target...", 
-						rider->formID);
+					continue;  // Player is hostile, keep targeting them
 				}
 			}
 			else
 			{
-				// Has a non-player target - verify it's still valid
+				// Verify non-player target is still valid and alive
 				TESForm* targetForm = LookupFormByID(data->targetFormID);
 				if (targetForm && targetForm->formType == kFormType_Character)
 				{
 					Actor* currentTarget = static_cast<Actor*>(targetForm);
 					if (currentTarget->IsDead(1))
 					{
-						// Target died - need new target
 						needsNewTarget = true;
 						data->targetFormID = 0;
 					}
+					// else: target is alive - continue with current target, no need for new one
 				}
 				else
 				{
-					// Target invalid
 					needsNewTarget = true;
 					data->targetFormID = 0;
 				}
@@ -1718,13 +1726,10 @@ namespace MountedNPCCombatVR
 			
 			if (!needsNewTarget) continue;
 			
-			// Find nearest hostile from our faction list
-			Actor* hostile = FindNearestHostileTarget(rider, HOSTILE_DETECTION_RANGE);
+			// Find nearest hostile (using config value)
+			Actor* hostile = FindNearestHostileTarget(rider, HostileDetectionRange);
 			if (hostile)
 			{
-				_MESSAGE("MountedCombat: Guard %08X found hostile target %08X - engaging!", 
-					rider->formID, hostile->formID);
-				
 				// Clear any existing follow behavior first if switching targets
 				if (rider->IsInCombat())
 				{
@@ -1733,17 +1738,9 @@ namespace MountedNPCCombatVR
 				
 				EngageHostileTarget(rider, hostile);
 			}
-			else if (data->targetFormID == 0x14 && !playerIsGenuinelyHostile)
-			{
-				// No hostiles found and targeting player who isn't hostile - stop combat
-				_MESSAGE("MountedCombat: Guard %08X no hostiles found, player not hostile - stopping combat", 
-					rider->formID);
-				data->targetFormID = 0;
-				
-				// Stop combat with player
-				StopActorCombatAlarm(rider);
-				ClearNPCFollowTarget(rider);
-			}
+			// NOTE: Removed the "stop combat" logic here
+			// If rider has no hostile target but is still in combat (e.g., vs companion),
+			// let the game handle it naturally - don't force stop combat
 		}
 	}
 }

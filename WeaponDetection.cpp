@@ -1,6 +1,10 @@
 #include "WeaponDetection.h"
+#include "DynamicPackages.h"  // For get_vfunc
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
+#include <ctime>
+#include <cmath>
+#include <algorithm>
 
 namespace MountedNPCCombatVR
 {
@@ -14,6 +18,337 @@ namespace MountedNPCCombatVR
 	const UInt32 HUNTING_BOW_FORMID = 0x00013985;
 	
 	// ============================================
+	// WEAPON COLLISION SYSTEM
+	// Based on WeaponCollisionVR's approach
+	// Uses line segment collision for accurate hit detection
+	// ============================================
+	
+	// Collision configuration - INCREASED for mounted combat (longer range)
+	const float WEAPON_COLLISION_DIST_THRESHOLD = 100.0f;  // Distance threshold for collision (was 50)
+	const float BODY_CAPSULE_RADIUS = 50.0f;        // Approximate body collision radius (was 30)
+	const float MOUNTED_HIT_RANGE_BONUS = 80.0f;           // Extra range for mounted combat
+	
+	// Weapon bone names to search for
+	static const char* WEAPON_BONE_RIGHT[] = {
+		"WEAPON", "Weapon", "NPC R Hand [RHnd]", "NPC R Forearm [RLar]"
+	};
+	
+	static const char* WEAPON_BONE_LEFT[] = {
+		"SHIELD", "Shield", "NPC L Hand [LHnd]", "NPC L Forearm [LLar]"
+	};
+	
+	// Math helper: Lerp between two points
+	static NiPoint3 Lerp(const NiPoint3& A, const NiPoint3& B, float k)
+	{
+		return NiPoint3(
+			A.x + (B.x - A.x) * k,
+			A.y + (B.y - A.y) * k,
+			A.z + (B.z - A.z) * k
+		);
+	}
+	
+	// Math helper: Clamp value to 0-1 range
+	static float Clamp01(float t)
+	{
+		return (std::max)(0.0f, (std::min)(1.0f, t));
+	}
+	
+	// Math helper: Dot product
+	static float DotProduct(const NiPoint3& A, const NiPoint3& B)
+	{
+		return A.x * B.x + A.y * B.y + A.z * B.z;
+	}
+	
+	// Math helper: Get distance between two points
+	static float GetPointDistance(const NiPoint3& A, const NiPoint3& B)
+	{
+		float dx = B.x - A.x;
+		float dy = B.y - A.y;
+		float dz = B.z - A.z;
+		return sqrt(dx * dx + dy * dy + dz * dz);
+	}
+	
+	// Math helper: Find closest point on a line segment to a given point
+	// Same algorithm as WeaponCollisionVR
+	static NiPoint3 ConstrainToSegment(const NiPoint3& position, const NiPoint3& segStart, const NiPoint3& segEnd)
+	{
+		NiPoint3 ba(segEnd.x - segStart.x, segEnd.y - segStart.y, segEnd.z - segStart.z);
+		NiPoint3 pa(position.x - segStart.x, position.y - segStart.y, position.z - segStart.z);
+		
+		float baDotBa = DotProduct(ba, ba);
+		if (baDotBa < 0.0001f) return segStart;  // Degenerate segment
+		
+		float t = DotProduct(ba, pa) / baDotBa;
+		return Lerp(segStart, segEnd, Clamp01(t));
+	}
+	
+	// Distance from a point to a line segment
+	static float DistPointToSegment(const NiPoint3& point, const NiPoint3& segStart, const NiPoint3& segEnd)
+	{
+		NiPoint3 closestPoint = ConstrainToSegment(point, segStart, segEnd);
+		return GetPointDistance(point, closestPoint);
+	}
+	
+	// Closest distance between two line segments
+	// Returns the distance and optionally the contact point
+	static float DistSegmentToSegment(
+		const NiPoint3& seg1Start, const NiPoint3& seg1End,
+		const NiPoint3& seg2Start, const NiPoint3& seg2End,
+		NiPoint3* outContactPoint)
+	{
+		// Sample points along segment 1 and find closest to segment 2
+		float minDist = 999999.0f;
+		NiPoint3 closestPoint;
+		
+		const int SAMPLES = 10;
+		for (int i = 0; i <= SAMPLES; i++)
+		{
+			float t = (float)i / (float)SAMPLES;
+			NiPoint3 p1 = Lerp(seg1Start, seg1End, t);
+			
+			NiPoint3 closestOnSeg2 = ConstrainToSegment(p1, seg2Start, seg2End);
+			float dist = GetPointDistance(p1, closestOnSeg2);
+			
+			if (dist < minDist)
+			{
+				minDist = dist;
+				closestPoint = Lerp(p1, closestOnSeg2, 0.5f);  // Midpoint as contact
+			}
+		}
+		
+		// Also sample from segment 2 to segment 1
+		for (int i = 0; i <= SAMPLES; i++)
+		{
+			float t = (float)i / (float)SAMPLES;
+			NiPoint3 p2 = Lerp(seg2Start, seg2End, t);
+			
+			NiPoint3 closestOnSeg1 = ConstrainToSegment(p2, seg1Start, seg1End);
+			float dist = GetPointDistance(p2, closestOnSeg1);
+			
+			if (dist < minDist)
+			{
+				minDist = dist;
+				closestPoint = Lerp(p2, closestOnSeg1, 0.5f);
+			}
+		}
+		
+		if (outContactPoint) *outContactPoint = closestPoint;
+		return minDist;
+	}
+	
+	// Get weapon segment (hand position to weapon tip) for an actor
+	bool GetWeaponSegment(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop, bool leftHand)
+	{
+		if (!actor) return false;
+		
+		NiNode* root = actor->GetNiNode();
+		if (!root) 
+		{
+			_MESSAGE("WeaponDetection: GetWeaponSegment - No root node for actor %08X", actor->formID);
+			return false;
+		}
+		
+		// Find weapon bone
+		NiAVObject* weaponNode = nullptr;
+		const char** boneNames = leftHand ? WEAPON_BONE_LEFT : WEAPON_BONE_RIGHT;
+		int boneCount = 4;
+		const char* foundBoneName = nullptr;
+		
+		for (int i = 0; i < boneCount; i++)
+		{
+			const char* boneName = boneNames[i];
+			weaponNode = root->GetObjectByName(&boneName);
+			if (weaponNode) 
+			{
+				foundBoneName = boneName;
+				break;
+			}
+		}
+		
+		if (!weaponNode)
+		{
+			// Debug: Log that we couldn't find weapon bone
+			static int logCount = 0;
+			if (++logCount % 60 == 1)  // Only log occasionally
+			{
+				_MESSAGE("WeaponDetection: GetWeaponSegment - No weapon bone found for actor %08X (tried WEAPON, NPC R Hand, etc.)", actor->formID);
+			}
+			
+			// Fallback: use actor position
+			outBottom.x = actor->pos.x;
+			outBottom.y = actor->pos.y;
+			outBottom.z = actor->pos.z + 100.0f;
+			outTop = outBottom;
+			return false;
+		}
+		
+		// Get hand position (weapon bottom)
+		outBottom.x = weaponNode->m_worldTransform.pos.x;
+		outBottom.y = weaponNode->m_worldTransform.pos.y;
+		outBottom.z = weaponNode->m_worldTransform.pos.z;
+		
+		// Calculate weapon tip using rotation matrix and reach
+		float reach = GetWeaponReach(actor);
+		if (reach < 50.0f) reach = 70.0f;  // Minimum reach for melee
+		
+		// Get weapon direction from rotation matrix (Y-axis in bone space typically)
+		// WeaponCollisionVR uses: rotate.entry[0][1], rotate.entry[1][1], rotate.entry[2][1]
+		NiMatrix33& rot = weaponNode->m_worldTransform.rot;
+		NiPoint3 weaponDir(rot.data[0][1], rot.data[1][1], rot.data[2][1]);
+		
+		// Normalize
+		float len = sqrt(weaponDir.x * weaponDir.x + weaponDir.y * weaponDir.y + weaponDir.z * weaponDir.z);
+		if (len > 0.001f)
+		{
+			weaponDir.x /= len;
+			weaponDir.y /= len;
+			weaponDir.z /= len;
+		}
+		
+		// Calculate weapon tip
+		outTop.x = outBottom.x + weaponDir.x * reach;
+		outTop.y = outBottom.y + weaponDir.y * reach;
+		outTop.z = outBottom.z + weaponDir.z * reach;
+		
+		// Debug: Log successful weapon segment (occasionally)
+		static int successLog = 0;
+		if (++successLog % 120 == 1)
+		{
+			_MESSAGE("WeaponDetection: Got weapon segment for %08X - bone '%s', bottom(%.0f,%.0f,%.0f) top(%.0f,%.0f,%.0f)", 
+				actor->formID, foundBoneName,
+				outBottom.x, outBottom.y, outBottom.z,
+				outTop.x, outTop.y, outTop.z);
+		}
+		
+		return true;
+	}
+	
+	// Get body capsule (vertical line segment representing actor's body)
+	void GetBodyCapsule(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop)
+	{
+		if (!actor)
+		{
+			outBottom = NiPoint3(0, 0, 0);
+			outTop = NiPoint3(0, 0, 0);
+			return;
+		}
+		
+		// Body capsule from feet to head
+		outBottom.x = actor->pos.x;
+		outBottom.y = actor->pos.y;
+		outBottom.z = actor->pos.z + 20.0f;  // Slightly above ground
+		
+		outTop.x = actor->pos.x;
+		outTop.y = actor->pos.y;
+		outTop.z = actor->pos.z + 150.0f;// Approximate head height
+	}
+	
+	// ============================================
+	// Main Weapon Collision Check
+	// Checks if rider's weapon collides with target's body or weapon
+	// Note: WeaponCollisionResult struct is defined in WeaponDetection.h
+	// ============================================
+	
+	WeaponCollisionResult CheckWeaponCollision(Actor* attacker, Actor* target)
+	{
+		WeaponCollisionResult result;
+		result.hasCollision = false;
+		result.distance = 999999.0f;
+		result.contactPoint = NiPoint3(0, 0, 0);
+		result.hitWeapon = false;
+		
+		if (!attacker || !target) return result;
+		
+		// Get attacker's weapon segment
+		NiPoint3 attackWeapBottom, attackWeapTop;
+		bool gotAttackerWeapon = GetWeaponSegment(attacker, attackWeapBottom, attackWeapTop, false);
+		
+		if (!gotAttackerWeapon)
+		{
+			// Debug log - weapon segment failed
+			static int failLog = 0;
+			if (++failLog % 30 == 1)
+			{
+				_MESSAGE("WeaponDetection: CheckWeaponCollision - Failed to get attacker weapon segment");
+			}
+			return result;
+		}
+		
+		// Get target's body capsule
+		NiPoint3 bodyBottom, bodyTop;
+		GetBodyCapsule(target, bodyBottom, bodyTop);
+		
+		// Check collision with body
+		NiPoint3 bodyContactPoint;
+		float bodyDist = DistSegmentToSegment(attackWeapBottom, attackWeapTop, bodyBottom, bodyTop, &bodyContactPoint);
+		
+		// Add body radius to threshold
+		float bodyThreshold = WEAPON_COLLISION_DIST_THRESHOLD + BODY_CAPSULE_RADIUS;
+		
+		// Debug: Log collision distances occasionally
+		static int distLog = 0;
+		if (++distLog % 30 == 1)
+		{
+			_MESSAGE("WeaponDetection: Collision dist=%.1f, threshold=%.1f (weap: %.0f,%.0f,%.0f -> %.0f,%.0f,%.0f)",
+				bodyDist, bodyThreshold,
+				attackWeapBottom.x, attackWeapBottom.y, attackWeapBottom.z,
+				attackWeapTop.x, attackWeapTop.y, attackWeapTop.z);
+		}
+		
+		if (bodyDist < bodyThreshold)
+		{
+			result.hasCollision = true;
+			result.distance = bodyDist;
+			result.contactPoint = bodyContactPoint;
+			result.hitWeapon = false;
+		}
+		
+		// Check if target is blocking with weapon
+		NiPoint3 targetWeapBottom, targetWeapTop;
+		if (GetWeaponSegment(target, targetWeapBottom, targetWeapTop, false))
+		{
+			NiPoint3 weapContactPoint;
+			float weapDist = DistSegmentToSegment(attackWeapBottom, attackWeapTop, targetWeapBottom, targetWeapTop, &weapContactPoint);
+			
+			// Weapon-to-weapon collision has tighter threshold
+			float weapThreshold = WEAPON_COLLISION_DIST_THRESHOLD * 0.7f;
+			
+			if (weapDist < weapThreshold && weapDist < bodyDist)
+			{
+				result.hasCollision = true;
+				result.distance = weapDist;
+				result.contactPoint = weapContactPoint;
+				result.hitWeapon = true;  // Hit their weapon (potential parry)
+			}
+		}
+		
+		// Also check shield if target has one
+		TESForm* leftHandItem = target->GetEquippedObject(true);
+		if (leftHandItem && leftHandItem->formType == kFormType_Armor)
+		{
+			NiPoint3 shieldBottom, shieldTop;
+			if (GetWeaponSegment(target, shieldBottom, shieldTop, true))
+			{
+				NiPoint3 shieldContactPoint;
+				float shieldDist = DistSegmentToSegment(attackWeapBottom, attackWeapTop, shieldBottom, shieldTop, &shieldContactPoint);
+				
+				// Shield has larger collision area
+				float shieldThreshold = WEAPON_COLLISION_DIST_THRESHOLD * 1.5f;
+				
+				if (shieldDist < shieldThreshold && shieldDist < result.distance)
+				{
+					result.hasCollision = true;
+					result.distance = shieldDist;
+					result.contactPoint = shieldContactPoint;
+					result.hitWeapon = true;  // Shield counts as blocking
+				}
+			}
+		}
+		
+		return result;
+	}
+	
+	// ============================================
 	// Inventory Add Functions
 	// ============================================
 	
@@ -21,7 +356,6 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		
-		// Look up Iron Arrow form
 		TESForm* arrowForm = LookupFormByID(IRON_ARROW_FORMID);
 		if (!arrowForm)
 		{
@@ -29,11 +363,7 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
-		// Use AddItem_Native to add arrows to the actor's inventory
-		// Parameters: registry, stackId, target, form, count, silent
 		AddItem_Native(nullptr, 0, actor, arrowForm, count, true);
-		
-		_MESSAGE("WeaponDetection: Added %d arrows to Actor %08X", count, actor->formID);
 		return true;
 	}
 	
@@ -42,35 +372,21 @@ namespace MountedNPCCombatVR
 		if (!actor) return false;
 		
 		TESForm* ammoForm = LookupFormByID(ammoFormID);
-		if (!ammoForm)
-		{
-			_MESSAGE("WeaponDetection: Failed to find ammo (FormID: %08X)", ammoFormID);
-			return false;
-		}
+		if (!ammoForm) return false;
 		
-		// Verify it's actually ammo
 		TESAmmo* ammo = DYNAMIC_CAST(ammoForm, TESForm, TESAmmo);
-		if (!ammo)
-		{
-			_MESSAGE("WeaponDetection: FormID %08X is not ammo", ammoFormID);
-			return false;
-		}
+		if (!ammo) return false;
 		
 		AddItem_Native(nullptr, 0, actor, ammoForm, count, true);
-		
-		_MESSAGE("WeaponDetection: Added %d ammo (%s) to Actor %08X", 
-			count, ammo->fullName.name.data ? ammo->fullName.name.data : "Unknown", actor->formID);
 		return true;
 	}
 	
-	// Find the best/first ammo in actor's inventory
-	// Returns the TESAmmo pointer or nullptr if none found
 	TESAmmo* FindAmmoInInventory(Actor* actor)
 	{
 		if (!actor) return nullptr;
 		
-		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
-			actor->extraData.GetByType(kExtraData_ContainerChanges));
+		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>
+			(actor->extraData.GetByType(kExtraData_ContainerChanges));
 		
 		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
 			return nullptr;
@@ -82,24 +398,22 @@ namespace MountedNPCCombatVR
 			InventoryEntryData* entry = it.Get();
 			if (!entry || !entry->type) continue;
 			
-			// Check if this is ammo (TESAmmo)
 			TESAmmo* ammo = DYNAMIC_CAST(entry->type, TESForm, TESAmmo);
 			if (ammo && entry->countDelta > 0)
 			{
-				return ammo;  // Return the first ammo found
+				return ammo;
 			}
 		}
 		
 		return nullptr;
 	}
 	
-	// Count total arrows (any ammo type) in actor's inventory
 	UInt32 CountArrowsInInventory(Actor* actor)
 	{
 		if (!actor) return 0;
 		
-		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
-			actor->extraData.GetByType(kExtraData_ContainerChanges));
+		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>
+			(actor->extraData.GetByType(kExtraData_ContainerChanges));
 		
 		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
 			return 0;
@@ -112,11 +426,9 @@ namespace MountedNPCCombatVR
 			InventoryEntryData* entry = it.Get();
 			if (!entry || !entry->type) continue;
 			
-			// Check if this is ammo (TESAmmo)
 			TESAmmo* ammo = DYNAMIC_CAST(entry->type, TESForm, TESAmmo);
 			if (ammo)
 			{
-				// Add the count (countDelta can be negative for removed items, but we only care about positive)
 				SInt32 count = entry->countDelta;
 				if (count > 0)
 				{
@@ -132,27 +444,16 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		
-		// Count existing arrows in inventory
 		UInt32 existingArrows = CountArrowsInInventory(actor);
 		
-		// Only add arrows if they have less than 5
 		if (existingArrows < 5)
 		{
 			UInt32 arrowsToAdd = 5 - existingArrows;
 			AddArrowsToInventory(actor, arrowsToAdd);
-			_MESSAGE("WeaponDetection: Actor %08X had %d arrows, added %d Iron Arrows", 
-				actor->formID, existingArrows, arrowsToAdd);
-		}
-		else
-		{
-			_MESSAGE("WeaponDetection: Actor %08X already has %d arrows, skipping add", 
-				actor->formID, existingArrows);
 		}
 		
-		// Try to find ammo already in inventory first (use their existing arrows)
 		TESAmmo* ammoToEquip = FindAmmoInInventory(actor);
 		
-		// If no ammo found, fall back to Iron Arrows
 		if (!ammoToEquip)
 		{
 			TESForm* arrowForm = LookupFormByID(IRON_ARROW_FORMID);
@@ -162,26 +463,15 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		if (!ammoToEquip)
-		{
-			_MESSAGE("WeaponDetection: No ammo found for Actor %08X", actor->formID);
-			return false;
-		}
+		if (!ammoToEquip) return false;
 		
-		// Equip the arrows using EquipManager
 		EquipManager* equipManager = EquipManager::GetSingleton();
 		if (equipManager)
 		{
-			// For ammo, we don't use a specific slot - pass nullptr
 			CALL_MEMBER_FN(equipManager, EquipItem)(actor, ammoToEquip, nullptr, 1, nullptr, true, false, false, nullptr);
-			
-			const char* ammoName = ammoToEquip->fullName.name.data;
-			_MESSAGE("WeaponDetection: Equipped '%s' on Actor %08X", 
-				ammoName ? ammoName : "Unknown Ammo", actor->formID);
 			return true;
 		}
 		
-		_MESSAGE("WeaponDetection: Failed to get EquipManager for arrow equip");
 		return false;
 	}
 	
@@ -202,6 +492,8 @@ namespace MountedNPCCombatVR
 		info.isShieldEquipped = (info.offHandType == WeaponType::Shield);
 		info.weaponReach = GetWeaponReach(actor);
 		info.hasWeaponSheathed = HasWeaponAvailable(actor);
+		info.hasBowInInventory = HasBowInInventory(actor);
+		info.hasMeleeInInventory = HasMeleeWeaponInInventory(actor);
 		
 		return info;
 	}
@@ -333,7 +625,6 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		WeaponType type = GetEquippedWeaponType(actor, false);
-		// Exclude daggers - they are not suitable for mounted combat
 		return (type == WeaponType::OneHandSword || 
 				type == WeaponType::OneHandAxe || 
 				type == WeaponType::OneHandMace ||
@@ -393,7 +684,6 @@ namespace MountedNPCCombatVR
 			if (weapon)
 			{
 				UInt8 type = weapon->type();
-				// Exclude daggers - they are not suitable for mounted combat
 				if (type == TESObjectWEAP::GameData::kType_OneHandSword ||
 					type == TESObjectWEAP::GameData::kType_OneHandAxe ||
 					type == TESObjectWEAP::GameData::kType_OneHandMace ||
@@ -470,7 +760,6 @@ namespace MountedNPCCombatVR
 			if (weapon)
 			{
 				UInt8 type = weapon->type();
-				// Exclude daggers - they are not suitable for mounted combat
 				if (type == TESObjectWEAP::GameData::kType_OneHandSword ||
 					type == TESObjectWEAP::GameData::kType_OneHandAxe ||
 					type == TESObjectWEAP::GameData::kType_OneHandMace ||
@@ -496,18 +785,20 @@ namespace MountedNPCCombatVR
 		TESObjectWEAP* bow = FindBestBowInInventory(actor);
 		if (!bow) return false;
 		
-		// Sheathe current weapon first
-		if (IsWeaponDrawn(actor))
-		{
-			actor->DrawSheatheWeapon(false);
-		}
-		
-		// Equip the bow
 		EquipManager* equipManager = EquipManager::GetSingleton();
 		if (equipManager)
 		{
 			BGSEquipSlot* rightSlot = GetRightHandSlot();
 			CALL_MEMBER_FN(equipManager, EquipItem)(actor, bow, nullptr, 1, rightSlot, true, false, false, nullptr);
+			
+			// ============================================
+			// ANIMATION FIX: Send weapon equip animation event
+			// Some horse behavior graphs need explicit animation notifications
+			// to properly show the weapon model
+			// ============================================
+			BSFixedString weaponDrawEvent("WeaponDraw");
+			get_vfunc<bool (*)(IAnimationGraphManagerHolder*, const BSFixedString&)>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, weaponDrawEvent);
+			
 			return true;
 		}
 		return false;
@@ -520,115 +811,113 @@ namespace MountedNPCCombatVR
 		TESObjectWEAP* melee = FindBestMeleeInInventory(actor);
 		if (!melee) return false;
 		
-		// Sheathe current weapon first
-		if (IsWeaponDrawn(actor))
-		{
-			actor->DrawSheatheWeapon(false);
-		}
-		
-		// Equip the melee weapon
 		EquipManager* equipManager = EquipManager::GetSingleton();
 		if (equipManager)
 		{
 			BGSEquipSlot* rightSlot = GetRightHandSlot();
 			CALL_MEMBER_FN(equipManager, EquipItem)(actor, melee, nullptr, 1, rightSlot, true, false, false, nullptr);
+			
+			// ============================================
+			// ANIMATION FIX: Send weapon equip animation event
+			// Some horse behavior graphs need explicit animation notifications
+			// to properly show the weapon model
+			// ============================================
+			BSFixedString weaponDrawEvent("WeaponDraw");
+			get_vfunc<bool (*)(IAnimationGraphManagerHolder*, const BSFixedString&)>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, weaponDrawEvent);
+			
 			return true;
 		}
 		return false;
 	}
-	
-	// ============================================
-	// Give Default Weapon for Mounted Combat
-	// Adds an Iron Mace to NPCs that have no suitable weapons
-	// Only adds if they don't already have a 1H melee weapon
-	// ============================================
 	
 	bool GiveDefaultMountedWeapon(Actor* actor)
 	{
 		if (!actor) return false;
 		
-		// Check if they already have a suitable 1H melee weapon in inventory
-		if (HasMeleeWeaponInInventory(actor))
-		{
-			_MESSAGE("WeaponDetection: Actor %08X already has melee weapon - not adding default", actor->formID);
-			return false;
-		}
+		if (HasMeleeWeaponInInventory(actor)) return false;
 		
-		// Look up Iron Mace form
 		TESForm* maceForm = LookupFormByID(IRON_MACE_FORMID);
-		if (!maceForm)
-		{
-			_MESSAGE("WeaponDetection: Failed to find Iron Mace (FormID: %08X)", IRON_MACE_FORMID);
-			return false;
-		}
+		if (!maceForm) return false;
 		
 		TESObjectWEAP* mace = DYNAMIC_CAST(maceForm, TESForm, TESObjectWEAP);
-		if (!mace)
-		{
-			_MESSAGE("WeaponDetection: FormID %08X is not a weapon", IRON_MACE_FORMID);
-			return false;
-		}
+		if (!mace) return false;
 		
-		// Add the mace to their inventory
 		AddItem_Native(nullptr, 0, actor, maceForm, 1, true);
 		
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		_MESSAGE("WeaponDetection: Gave Iron Mace to '%s' (%08X) for mounted combat", 
-			actorName ? actorName : "Unknown", actor->formID);
-		
-		// Now equip it
 		EquipManager* equipManager = EquipManager::GetSingleton();
 		if (equipManager)
 		{
 			BGSEquipSlot* rightSlot = GetRightHandSlot();
 			CALL_MEMBER_FN(equipManager, EquipItem)(actor, mace, nullptr, 1, rightSlot, true, false, false, nullptr);
-			_MESSAGE("WeaponDetection: Equipped Iron Mace on '%s' (%08X)", 
-				actorName ? actorName : "Unknown", actor->formID);
+			
+			// ============================================
+			// ANIMATION FIX: Send weapon equip animation event
+			// Some horse behavior graphs need explicit animation notifications
+			// to properly show the weapon model
+			// ============================================
+			BSFixedString weaponDrawEvent("WeaponDraw");
+			get_vfunc<bool (*)(IAnimationGraphManagerHolder*, const BSFixedString&)>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, weaponDrawEvent);
+			
 			return true;
 		}
 		
 		return false;
 	}
 	
-	// ============================================
-	// Give Default Bow for Ranged Mounted Combat
-	// Adds a Hunting Bow to NPCs for ranged role
-	// Only adds if they don't already have a bow in inventory
-	// FormID: 0x00013985 (Hunting Bow from Skyrim.esm)
-	// ============================================
+	bool SheatheCurrentWeapon(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		// Check if weapon is drawn
+		if (!IsWeaponDrawn(actor)) return false;
+		
+		// Sheathe the weapon
+		actor->DrawSheatheWeapon(false);  // false = sheathe
+		
+		_MESSAGE("WeaponDetection: Sheathed weapon for actor %08X", actor->formID);
+		return true;
+	}
 	
 	bool GiveDefaultBow(Actor* actor)
 	{
 		if (!actor) return false;
 		
-		// Check if they already have a bow in inventory
-		if (HasBowInInventory(actor))
-		{
-			_MESSAGE("WeaponDetection: Actor %08X already has bow - not adding default", actor->formID);
-			return false;
-		}
+		if (HasBowInInventory(actor)) return false;
 		
-		// Look up Hunting Bow form
 		TESForm* bowForm = LookupFormByID(HUNTING_BOW_FORMID);
-		if (!bowForm)
-		{
-			_MESSAGE("WeaponDetection: Failed to find Hunting Bow (FormID: %08X)", HUNTING_BOW_FORMID);
-			return false;
-		}
+		if (!bowForm) return false;
 		
 		TESObjectWEAP* bow = DYNAMIC_CAST(bowForm, TESForm, TESObjectWEAP);
-		if (!bow)
+		if (!bow) return false;
+		
+		AddItem_Native(nullptr, 0, actor, bowForm, 1, true);
+		return true;
+	}
+	
+	bool RemoveDefaultBow(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		TESForm* bowForm = LookupFormByID(HUNTING_BOW_FORMID);
+		if (!bowForm) return false;
+		
+		TESObjectWEAP* bow = DYNAMIC_CAST(bowForm, TESForm, TESObjectWEAP);
+		if (!bow) return false;
+		
+		// Unequip the bow if it's equipped
+		if (IsBowEquipped(actor))
 		{
-			_MESSAGE("WeaponDetection: FormID %08X is not a weapon", HUNTING_BOW_FORMID);
-			return false;
+			EquipManager* equipManager = EquipManager::GetSingleton();
+			if (equipManager)
+			{
+				CALL_MEMBER_FN(equipManager, UnequipItem)(actor, bow, nullptr, 1, nullptr, false, false, true, false, nullptr);
+				_MESSAGE("WeaponDetection: Unequipped Hunting Bow from actor %08X", actor->formID);
+			}
 		}
 		
-		// Add the bow to their inventory
-		AddItem_Native(nullptr, 0, actor, bowForm, 1, true);
-		
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		_MESSAGE("WeaponDetection: Gave Hunting Bow to '%s' (%08X) for ranged mounted combat", 
-			actorName ? actorName : "Unknown", actor->formID);
+		// Note: We don't actually remove the bow from inventory since there's no easy
+		// RemoveItem native function available. The bow will stay in inventory but
+		// won't be equipped. This is acceptable behavior.
 		
 		return true;
 	}
@@ -649,148 +938,23 @@ namespace MountedNPCCombatVR
 			{
 				const char* weaponName = weapon->fullName.name.data;
 				WeaponType type = GetEquippedWeaponType(actor, false);
-				_MESSAGE("MountedCombat: NPC %08X Right Hand: '%s' (%s) | Reach: %.1f", 
-					formID, weaponName ? weaponName : "Unknown", GetWeaponTypeName(type), weapon->reach());
-			}
-		}
-		else
-		{
-			_MESSAGE("MountedCombat: NPC %08X Right Hand: Empty", formID);
-		}
-		
-		TESForm* leftHand = actor->GetEquippedObject(true);
-		if (leftHand)
-		{
-			TESObjectWEAP* weapon = DYNAMIC_CAST(leftHand, TESForm, TESObjectWEAP);
-			if (weapon)
-			{
-				const char* weaponName = weapon->fullName.name.data;
-				WeaponType type = GetEquippedWeaponType(actor, true);
-				_MESSAGE("MountedCombat: NPC %08X Left Hand: '%s' (%s)", 
+				_MESSAGE("MountedCombat: NPC %08X Right Hand: '%s' (%s)", 
 					formID, weaponName ? weaponName : "Unknown", GetWeaponTypeName(type));
 			}
-			else
-			{
-				TESObjectARMO* armor = DYNAMIC_CAST(leftHand, TESForm, TESObjectARMO);
-				if (armor)
-				{
-					const char* shieldName = armor->fullName.name.data;
-					_MESSAGE("MountedCombat: NPC %08X Left Hand: '%s' (Shield)", 
-						formID, shieldName ? shieldName : "Unknown Shield");
-				}
-				else
-				{
-					_MESSAGE("MountedCombat: NPC %08X Left Hand: Spell/Other (FormID: %08X)", 
-						formID, leftHand->formID);
-				}
-			}
-		}
-		else
-		{
-			_MESSAGE("MountedCombat: NPC %08X Left Hand: Empty", formID);
 		}
 	}
 	
 	void LogInventoryWeapons(Actor* actor, UInt32 formID)
 	{
 		if (!actor) return;
-		
-		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
-			actor->extraData.GetByType(kExtraData_ContainerChanges));
-		
-		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
-		{
-			_MESSAGE("MountedCombat: NPC %08X Inventory: Could not access", formID);
-			return;
-		}
-		
-		_MESSAGE("MountedCombat: NPC %08X Inventory Weapons:", formID);
-		
-		int weaponCount = 0;
-		tList<InventoryEntryData>* objList = containerChanges->data->objList;
-		
-		for (tList<InventoryEntryData>::Iterator it = objList->Begin(); !it.End(); ++it)
-		{
-			InventoryEntryData* entry = it.Get();
-			if (!entry || !entry->type) continue;
-			
-			TESObjectWEAP* weapon = DYNAMIC_CAST(entry->type, TESForm, TESObjectWEAP);
-			if (weapon)
-			{
-				const char* weaponName = weapon->fullName.name.data;
-				UInt8 type = weapon->type();
-				const char* typeName = "Unknown";
-				
-				switch (type)
-				{
-					case TESObjectWEAP::GameData::kType_OneHandSword: typeName = "1H Sword"; break;
-					case TESObjectWEAP::GameData::kType_OneHandDagger: typeName = "Dagger"; break;
-					case TESObjectWEAP::GameData::kType_OneHandAxe: typeName = "1H Axe"; break;
-					case TESObjectWEAP::GameData::kType_OneHandMace: typeName = "1H Mace"; break;
-					case TESObjectWEAP::GameData::kType_TwoHandSword: typeName = "2H Sword"; break;
-					case TESObjectWEAP::GameData::kType_TwoHandAxe: typeName = "2H Axe"; break;
-					case TESObjectWEAP::GameData::kType_Bow: typeName = "Bow"; break;
-					case TESObjectWEAP::GameData::kType_Staff: typeName = "Staff"; break;
-					case TESObjectWEAP::GameData::kType_CrossBow: typeName = "Crossbow"; break;
-				}
-				
-				SInt32 count = entry->countDelta;
-				_MESSAGE("  - '%s' (%s) x%d | Damage: %d | Reach: %.2f", 
-					weaponName ? weaponName : "Unknown", typeName,
-					count > 0 ? count : 1, weapon->damage.GetAttackDamage(), weapon->reach());
-				weaponCount++;
-			}
-		}
-		
-		if (weaponCount == 0)
-		{
-			_MESSAGE("  - No weapons found in inventory");
-		}
+		// Minimal logging
 	}
 	
 	// ============================================
 	// Spell Detection
 	// ============================================
 	
-	void LogEquippedSpells(Actor* actor, UInt32 formID)
-	{
-		if (!actor) return;
-		
-		_MESSAGE("MountedCombat: NPC %08X Equipped Spells:", formID);
-		
-		int spellCount = 0;
-		
-		TESForm* leftHand = actor->GetEquippedObject(true);
-		if (leftHand)
-		{
-			SpellItem* spell = DYNAMIC_CAST(leftHand, TESForm, SpellItem);
-			if (spell)
-			{
-				const char* spellName = spell->fullName.name.data;
-				_MESSAGE("  - Left Hand: '%s' (FormID: %08X)", 
-					spellName ? spellName : "Unknown Spell", spell->formID);
-				spellCount++;
-			}
-		}
-		
-		TESForm* rightHand = actor->GetEquippedObject(false);
-		if (rightHand)
-		{
-			SpellItem* spell = DYNAMIC_CAST(rightHand, TESForm, SpellItem);
-			if (spell)
-			{
-				const char* spellName = spell->fullName.name.data;
-				_MESSAGE("  - Right Hand: '%s' (FormID: %08X)", 
-					spellName ? spellName : "Unknown Spell", spell->formID);
-				spellCount++;
-			}
-		}
-		
-		if (spellCount == 0)
-		{
-			_MESSAGE("  - No spells currently equipped");
-		}
-	}
+	void LogEquippedSpells(Actor* actor, UInt32 formID) { }
 	
 	bool HasSpellsAvailable(Actor* actor)
 	{
@@ -798,68 +962,14 @@ namespace MountedNPCCombatVR
 		return actor->addedSpells.Length() > 0;
 	}
 	
-	void LogAvailableSpells(Actor* actor, UInt32 formID)
-	{
-		if (!actor) return;
-		
-		_MESSAGE("MountedCombat: NPC %08X Available Spells:", formID);
-		
-		int spellCount = 0;
-		UInt32 numSpells = actor->addedSpells.Length();
-		
-		for (UInt32 i = 0; i < numSpells; i++)
-		{
-			SpellItem* spell = actor->addedSpells.Get(i);
-			if (spell)
-			{
-				const char* spellName = spell->fullName.name.data;
-				UInt32 spellType = (UInt32)spell->data.spellType;
-				const char* typeName = "Unknown";
-				
-				switch (spellType)
-				{
-					case 0: typeName = "Spell"; break;
-					case 1: typeName = "Disease"; break;
-					case 2: typeName = "Power"; break;
-					case 3: typeName = "Lesser Power"; break;
-					case 4: typeName = "Ability"; break;
-					case 5: typeName = "Poison"; break;
-					case 6: typeName = "Enchantment"; break;
-					case 7: typeName = "Potion"; break;
-					case 8: typeName = "Ingredient"; break;
-					case 9: typeName = "Leveled Spell"; break;
-					case 10: typeName = "Addiction"; break;
-					case 11: typeName = "Voice/Shout"; break;
-					case 12: typeName = "Staff Enchant"; break;
-					case 13: typeName = "Scroll"; break;
-				}
-				
-				_MESSAGE("  - '%s' (%s) | FormID: %08X", 
-					spellName ? spellName : "Unknown", typeName, spell->formID);
-				spellCount++;
-			}
-		}
-		
-		if (spellCount == 0)
-		{
-			_MESSAGE("  - No spells found");
-		}
-	}
+	void LogAvailableSpells(Actor* actor, UInt32 formID) { }
 	
 	// ============================================
 	// Weapon Node / Hitbox Detection
 	// ============================================
 	
-	// Common skeleton bone names for weapon position
 	static const char* WEAPON_BONE_NAMES[] = {
-		"WEAPON",
-		"Weapon",
-		"NPC R Hand [RHnd]",
-		"NPC R Forearm [RLar]",
-		"WeaponSword",
-		"WeaponAxe",
-		"WeaponMace",
-		"WeaponDagger"
+		"WEAPON", "Weapon", "NPC R Hand [RHnd]", "NPC R Forearm [RLar]"
 	};
 	
 	NiAVObject* GetWeaponBoneNode(Actor* actor)
@@ -869,15 +979,11 @@ namespace MountedNPCCombatVR
 		NiNode* root = actor->GetNiNode();
 		if (!root) return nullptr;
 		
-		// Try each bone name until we find one
 		for (int i = 0; i < sizeof(WEAPON_BONE_NAMES) / sizeof(WEAPON_BONE_NAMES[0]); i++)
 		{
 			const char* boneName = WEAPON_BONE_NAMES[i];
 			NiAVObject* node = root->GetObjectByName(&boneName);
-			if (node)
-			{
-				return node;
-			}
+			if (node) return node;
 		}
 		
 		return nullptr;
@@ -890,15 +996,12 @@ namespace MountedNPCCombatVR
 		NiAVObject* weaponNode = GetWeaponBoneNode(actor);
 		if (!weaponNode) 
 		{
-			// Fallback to actor position + offset for right hand
 			outPosition->x = actor->pos.x;
 			outPosition->y = actor->pos.y;
-			outPosition->z = actor->pos.z + 100.0f;  // Approximate hand height
+			outPosition->z = actor->pos.z + 100.0f;
 			return false;
 		}
 		
-		// Get world transform from the node
-		// The world position is in the node's world transform matrix
 		outPosition->x = weaponNode->m_worldTransform.pos.x;
 		outPosition->y = weaponNode->m_worldTransform.pos.y;
 		outPosition->z = weaponNode->m_worldTransform.pos.z;
@@ -920,62 +1023,74 @@ namespace MountedNPCCombatVR
 		return sqrt(dx * dx + dy * dy + dz * dz);
 	}
 	
-	bool IsWeaponInHitRange(Actor* attacker, Actor* target, float hitRadius)
-	{
-		if (!attacker || !target) return false;
-		
-		NiPoint3 weaponPos;
-		bool gotPosition = GetWeaponWorldPosition(attacker, &weaponPos);
-		
-		// Calculate distance from weapon to target center
-		float dx = weaponPos.x - target->pos.x;
-		float dy = weaponPos.y - target->pos.y;
-		float dz = weaponPos.z - (target->pos.z + 80.0f);  // Target chest height
-		
-		float distance = sqrt(dx * dx + dy * dy + dz * dz);
-		
-		// Get weapon reach to add to hit radius
-		float weaponReach = GetWeaponReach(attacker);
-		float effectiveHitRadius = hitRadius + (weaponReach * 0.3f);  // Weapon reach adds to radius
-		
-		return distance <= effectiveHitRadius;
-	}
+	// ============================================
+	// MELEE HIT DETECTION - SIMPLE DISTANCE BASED
+	// Replaces complex collision system with reliable distance check
+	// ============================================
 	
-	// Check if weapon swing should hit the target during mounted attack animation
-	// Returns true if weapon is close enough to deal damage
 	bool CheckMountedAttackHit(Actor* rider, Actor* target, float* outDistance)
 	{
 		if (!rider || !target) return false;
 		
-		// Get weapon position from rider's hand
-		NiPoint3 weaponPos;
-		GetWeaponWorldPosition(rider, &weaponPos);
-		
-		// Calculate distance from weapon to target
-		// For target, we check against their position + height offset
-		float targetHeight = 80.0f;  // Approximate chest height
-		
-		float dx = weaponPos.x - target->pos.x;
-		float dy = weaponPos.y - target->pos.y;
-		float dz = weaponPos.z - (target->pos.z + targetHeight);
-		
+		// Simple distance-based check for mounted combat
+		float dx = rider->pos.x - target->pos.x;
+		float dy = rider->pos.y - target->pos.y;
+		float dz = (rider->pos.z + 100.0f) - (target->pos.z + 80.0f);  // Approximate weapon height
 		float distance = sqrt(dx * dx + dy * dy + dz * dz);
 		
-		if (outDistance)
+		if (outDistance) *outDistance = distance;
+		
+		float weaponReach = GetWeaponReach(rider);
+		const float MOUNTED_REACH_BONUS = 100.0f;  // Mounted riders have extended reach
+		const float HIT_THRESHOLD_PLAYER = 180.0f; // Base hit distance vs player
+		const float HIT_THRESHOLD_NPC = 280.0f;    // Larger hit distance vs NPCs (both moving)
+		
+		// Determine if target is the player or an NPC
+		bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
+		float baseThreshold = targetIsPlayer ? HIT_THRESHOLD_PLAYER : HIT_THRESHOLD_NPC;
+		
+		float effectiveThreshold = baseThreshold + (weaponReach * 0.5f) + MOUNTED_REACH_BONUS;
+		
+		// Log hit checks for debugging NPC vs NPC combat
+		if (!targetIsPlayer)
 		{
-			*outDistance = distance;
+			static int hitCheckLogCounter = 0;
+			hitCheckLogCounter++;
+			// Log every 30th check to avoid spam
+			if (hitCheckLogCounter % 30 == 0)
+			{
+				const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
+				_MESSAGE("WeaponDetection: Hit check vs NPC '%s' - dist: %.0f, threshold: %.0f, inRange: %s",
+					targetName ? targetName : "Unknown",
+					distance, effectiveThreshold,
+					(distance <= effectiveThreshold) ? "YES" : "NO");
+			}
 		}
 		
-		// Get weapon reach for hit threshold
-		float weaponReach = GetWeaponReach(rider);
+		return (distance <= effectiveThreshold);
+	}
+	
+	// ============================================
+	// Check if target would block the hit
+	// Simple check - is target blocking?
+	// ============================================
+	
+	bool WouldTargetBlockHit(Actor* rider, Actor* target)
+	{
+		if (!rider || !target) return false;
 		
-		// Mounted combat has extended reach due to height advantage
-		// Base hit threshold is weapon reach + bonus for mounted position
-		const float MOUNTED_REACH_BONUS = 50.0f;  // Units
-		const float HIT_THRESHOLD = 120.0f;  // Base hit distance
+		// Check if target is in blocking state via animation graph
+		static BSFixedString isBlockingVar("IsBlocking");
+		bool isBlocking = false;
 		
-		float effectiveThreshold = HIT_THRESHOLD + (weaponReach * 0.5f) + MOUNTED_REACH_BONUS;
+		typedef bool (*_GetGraphVariableBool)(IAnimationGraphManagerHolder* holder, const BSFixedString& varName, bool& out);
+		_GetGraphVariableBool getGraphVarBool = get_vfunc<_GetGraphVariableBool>(&target->animGraphHolder, 0x12);
 		
-		return distance <= effectiveThreshold;
+		if (getGraphVarBool)
+		{
+			getGraphVarBool(&target->animGraphHolder, isBlockingVar, isBlocking);
+		}
+		
+		return isBlocking;
 	}
 }

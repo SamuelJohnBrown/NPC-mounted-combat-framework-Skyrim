@@ -30,6 +30,9 @@ namespace MountedNPCCombatVR
 	bool IsActorGrabbedByPlayer(UInt32 actorFormID);
 	GrabInfo* GetActiveGrabInfo(UInt32 actorFormID);
 	
+	// Check if a horse is currently grabbed by player (stops movement while grabbed)
+	bool IsHorseGrabbedByPlayer(UInt32 horseFormID);
+	
 	// PushActorAway native function
 	typedef void(*_PushActorAway)(VMClassRegistry* registry, UInt32 stackId, TESObjectREFR* akSource, Actor* akActor, float afKnockbackForce);
 	extern RelocAddr<_PushActorAway> PushActorAway;

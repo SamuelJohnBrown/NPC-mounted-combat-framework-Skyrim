@@ -1,6 +1,10 @@
 #include "SpecialDismount.h"
 #include "Engine.h"
 #include "NPCProtection.h"
+#include "MountedCombat.h"
+#include "DynamicPackages.h"
+#include "AILogging.h"
+#include "HorseMountScanner.h"
 #include "skse64/GameReferences.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -8,17 +12,35 @@
 #include "skse64/PapyrusVM.h"
 #include <chrono>
 #include <thread>
+#include <string>
 
 namespace MountedNPCCombatVR
 {
-	// ============================================
+	// ===========================================
 	// Forward declarations
-	// ============================================
+	// ===========================================
 	static bool IsActorMounted(Actor* actor);
 	static bool IsActorBeingRidden(Actor* actor);
+	static void StopHorseMovementOnGrab(Actor* horse);
+	static void RestoreHorseMovementOnRelease(Actor* horse);
+	static void TriggerAggressionOnPulledRider(Actor* pulledRider);
 	
 	// PushActorAway native function address (SKSEVR offset)
 	RelocAddr<_PushActorAway> PushActorAway(0x009D0E60);
+	
+	// SendAssaultAlarm - triggers crime/aggression response from NPC
+	// Signature: void Actor_SendAssaultAlarm(UInt64 a1, UInt64 a2, Actor* actor)
+	typedef void (*_Actor_SendAssaultAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
+	RelocAddr<_Actor_SendAssaultAlarm> Actor_SendAssaultAlarm(0x986530);
+	
+	// StartCombat - forces an actor into combat with a target
+	// From Engine.h, but we may need a different approach
+	
+	// ============================================
+	// CRIME/AGGRESSION CONFIGURATION
+	// ============================================
+	static const float ALLY_ALERT_RADIUS = 2000.0f;  // How far nearby allies are alerted
+	static const int MAX_ALLIES_TO_ALERT = 5;     // Max allies to alert at once
 	
 	// Task delegate implementation - uses FormIDs for safety
 	taskPushActorAway::taskPushActorAway(UInt32 sourceFormID, UInt32 targetFormID, float afKnockbackForce)
@@ -30,31 +52,16 @@ namespace MountedNPCCombatVR
 
 	void taskPushActorAway::Run()
 	{
-		// Re-lookup actors from FormIDs to ensure they're still valid
 		TESForm* sourceForm = LookupFormByID(m_sourceFormID);
 		TESForm* targetForm = LookupFormByID(m_targetFormID);
 		
-		if (!sourceForm || !targetForm)
-		{
-			_MESSAGE("SpecialDismount: PushActorAway skipped - source or target no longer valid");
-			return;
-		}
+		if (!sourceForm || !targetForm) return;
 		
 		TESObjectREFR* source = DYNAMIC_CAST(sourceForm, TESForm, TESObjectREFR);
 		Actor* target = DYNAMIC_CAST(targetForm, TESForm, Actor);
 		
-		if (!source || !target)
-		{
-			_MESSAGE("SpecialDismount: PushActorAway skipped - invalid cast");
-			return;
-		}
-		
-		// Check if target is still alive
-		if (target->IsDead(1))
-		{
-			_MESSAGE("SpecialDismount: PushActorAway skipped - target is dead");
-			return;
-		}
+		if (!source || !target) return;
+		if (target->IsDead(1)) return;
 		
 		PushActorAway((*g_skyrimVM)->GetClassRegistry(), 0, source, target, m_afKnockbackForce);
 	}
@@ -63,6 +70,64 @@ namespace MountedNPCCombatVR
 	{
 		delete this;
 	}
+	
+	// ============================================
+	// Task to trigger aggression on main thread
+	// ============================================
+	class taskTriggerAggression : public TaskDelegate
+	{
+	public:
+		taskTriggerAggression(UInt32 pulledRiderFormID) : m_pulledRiderFormID(pulledRiderFormID) {}
+		
+		virtual void Run()
+		{
+			TESForm* form = LookupFormByID(m_pulledRiderFormID);
+			if (!form) return;
+			
+			Actor* pulledRider = DYNAMIC_CAST(form, TESForm, Actor);
+			if (!pulledRider) return;
+			
+			TriggerAggressionOnPulledRider(pulledRider);
+		}
+		
+		virtual void Dispose() { delete this; }
+		
+	private:
+		UInt32 m_pulledRiderFormID;
+	};
+	
+	// ============================================
+	// Task to restore actor from ragdoll state
+	// ============================================
+	class taskRestoreFromRagdoll : public TaskDelegate
+	{
+	public:
+		taskRestoreFromRagdoll(UInt32 actorFormID) : m_actorFormID(actorFormID) {}
+		
+		virtual void Run()
+		{
+			TESForm* form = LookupFormByID(m_actorFormID);
+			if (!form) return;
+			
+			Actor* actor = DYNAMIC_CAST(form, TESForm, Actor);
+			if (!actor) return;
+			if (actor->IsDead(1)) return;
+			
+			// Reset mass back to default (50)
+			const float DEFAULT_MASS = 50.0f;
+			SetActorMass(actor, DEFAULT_MASS);
+			
+			// Force actor to get up / exit ragdoll by evaluating package
+			Actor_EvaluatePackage(actor, false, false);
+			
+			_MESSAGE("SpecialDismount: Restored actor %08X from ragdoll (mass reset to %.0f)", m_actorFormID, DEFAULT_MASS);
+		}
+		
+		virtual void Dispose() { delete this; }
+		
+	private:
+		UInt32 m_actorFormID;
+	};
 
 	static const int MAX_GRABS = 8;
 	static GrabInfo g_grabs[MAX_GRABS];
@@ -70,11 +135,11 @@ namespace MountedNPCCombatVR
 
 	static HiggsPluginAPI::IHiggsInterface001* s_higgs = nullptr;
 	
-	// Controller Z tracking
-	static const int CONTROLLER_Z_TRACK_INTERVAL_MS = 50;   // 50ms polling
-	static const float PULL_DOWN_THRESHOLD = 30.0f;  // Z drop threshold in units
-	static const float RAGDOLL_FORCE = 5.0f;// Knockback force for ragdoll
-	static const int RAGDOLL_DELAY_MS = 200;  // Delay after stagger before ragdoll (milliseconds)
+	// Controller Z tracking - INSTANT response
+	static const int CONTROLLER_Z_TRACK_INTERVAL_MS = 8;    // ~120fps polling
+	static const float PULL_DOWN_THRESHOLD = 15.0f;     // Lower threshold for faster detection
+	static const float RAGDOLL_FORCE = 1.0f;      // Very gentle force to prevent floor clipping
+	static const int RAGDOLL_DURATION_MS = 1750;   // 1.75 seconds ragdoll duration
 	static std::thread g_controllerTrackThread;
 	static bool g_trackingActive = false;
 	
@@ -86,11 +151,31 @@ namespace MountedNPCCombatVR
 	static const char* kLeftHandName = "NPC L Hand [LHnd]";
 	static const char* kRightHandName = "NPC R Hand [RHnd]";
 	
-	// Stagger spell from MountedNPCCombat.esp (ESL-flagged)
-	static const char* STAGGER_SPELL_ESP = "MountedNPCCombat.esp";
-	static const UInt32 STAGGER_SPELL_BASE_FORMID = 0x08ED;  // Base form ID without ESL prefix
-	static SpellItem* g_staggerSpell = nullptr;
-	static bool g_staggerSpellInitialized = false;
+	// ============================================
+	// GRABBED HORSE TRACKING
+	// ============================================
+	
+	struct GrabbedHorseData
+	{
+		UInt32 horseFormID;
+		UInt32 riderFormID;
+		UInt32 targetFormID;
+		bool wasInCombat;
+		bool isValid;
+		
+		void Reset()
+		{
+			horseFormID = 0;
+			riderFormID = 0;
+			targetFormID = 0;
+			wasInCombat = false;
+			isValid = false;
+		}
+	};
+	
+	static const int MAX_GRABBED_HORSES = 4;
+	static GrabbedHorseData g_grabbedHorses[MAX_GRABBED_HORSES];
+	static int g_grabbedHorseCount = 0;
 
 	static double NowSeconds()
 	{
@@ -99,93 +184,316 @@ namespace MountedNPCCombatVR
 		return duration_cast<duration<double>>(t.time_since_epoch()).count();
 	}
 
-	// Initialize stagger spell from ESP - MUST be called after DATA LOADED
-	static bool InitStaggerSpell()
+	// ============================================
+	// CRIME/AGGRESSION SYSTEM
+	// ============================================
+	
+	// Check if two actors share a faction (are allies) - simplified version
+	// Uses combat state and faction data instead of IsHostileToActor
+	static bool AreActorsAllies(Actor* a, Actor* b)
 	{
-		// If already successfully initialized, return true
-		if (g_staggerSpell != nullptr) return true;
+		if (!a || !b) return false;
 		
-		_MESSAGE("SpecialDismount: Attempting to load stagger spell from %s, base FormID: %08X", 
-			STAGGER_SPELL_ESP, STAGGER_SPELL_BASE_FORMID);
+		// Check if they're in combat with each other - if so, not allies
+		UInt32 aCombatTarget = a->currentCombatTarget;
+		UInt32 bCombatTarget = b->currentCombatTarget;
 		
-		UInt32 fullFormID = GetFullFormIdMine(STAGGER_SPELL_ESP, STAGGER_SPELL_BASE_FORMID);
-		_MESSAGE("SpecialDismount: GetFullFormIdMine returned: %08X", fullFormID);
-		
-		if (fullFormID == 0)
+		if (aCombatTarget != 0)
 		{
-			_MESSAGE("SpecialDismount: Failed to get full form ID for stagger spell from %s", STAGGER_SPELL_ESP);
-			return false;
+			NiPointer<TESObjectREFR> aTargetRef;
+			LookupREFRByHandle(aCombatTarget, aTargetRef);
+			if (aTargetRef && aTargetRef->formID == b->formID)
+			{
+				return false;  // a is fighting b
+			}
 		}
 		
-		TESForm* form = LookupFormByID(fullFormID);
-		if (!form)
+		if (bCombatTarget != 0)
 		{
-			_MESSAGE("SpecialDismount: Failed to lookup stagger spell form (FormID: %08X)", fullFormID);
-			return false;
+			NiPointer<TESObjectREFR> bTargetRef;
+			LookupREFRByHandle(bCombatTarget, bTargetRef);
+			if (bTargetRef && bTargetRef->formID == a->formID)
+			{
+				return false;  // b is fighting a
+			}
 		}
 		
-		_MESSAGE("SpecialDismount: Found form, type: %d", form->formType);
-		
-		g_staggerSpell = DYNAMIC_CAST(form, TESForm, SpellItem);
-		if (!g_staggerSpell)
-		{
-			_MESSAGE("SpecialDismount: Form %08X is not a SpellItem (formType: %d)", fullFormID, form->formType);
-			return false;
-		}
-		
-		_MESSAGE("SpecialDismount: Successfully loaded stagger spell from %s (FormID: %08X)", STAGGER_SPELL_ESP, fullFormID);
-		g_staggerSpellInitialized = true;
+		// If neither is fighting the other, consider them potential allies
 		return true;
 	}
-
-	// Apply ragdoll (PushActorAway) to an actor - queued via task for thread safety
-	static void ApplyRagdollToActor(Actor* target, float force)
+	
+	// Find nearby allies of the pulled rider and alert them
+	static void AlertNearbyAllies(Actor* pulledRider, Actor* player)
 	{
-		if (!target) return;
+		if (!pulledRider || !player) return;
+		
+		const char* riderName = CALL_MEMBER_FN(pulledRider, GetReferenceName)();
+		_MESSAGE("SpecialDismount: Alerting nearby allies of '%s' within %.0f units",
+			riderName ? riderName : "Rider", ALLY_ALERT_RADIUS);
+		
+		int alliesAlerted = 0;
+		
+		// Get current cell
+		TESObjectCELL* cell = pulledRider->parentCell;
+		if (!cell) return;
+		
+		// Iterate through actors in the cell
+		for (UInt32 i = 0; i < cell->objectList.count && alliesAlerted < MAX_ALLIES_TO_ALERT; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			if (ref->formType != kFormType_Character) continue;
+			
+			Actor* ally = static_cast<Actor*>(ref);
+			
+			// Skip the pulled rider themselves
+			if (ally->formID == pulledRider->formID) continue;
+			
+			// Skip the player
+			if (ally->formID == player->formID) continue;
+			
+			// Skip dead actors
+			if (ally->IsDead(1)) continue;
+			
+			// Check distance
+			float dx = ally->pos.x - pulledRider->pos.x;
+			float dy = ally->pos.y - pulledRider->pos.y;
+			float distance = sqrt(dx * dx + dy * dy);
+			
+			if (distance > ALLY_ALERT_RADIUS) continue;
+			
+			// Check if they're allies (not fighting each other)
+			if (!AreActorsAllies(pulledRider, ally)) continue;
+			
+			const char* allyName = CALL_MEMBER_FN(ally, GetReferenceName)();
+			_MESSAGE("SpecialDismount: Alerting ally '%s' (%08X) at distance %.0f",
+				allyName ? allyName : "Unknown", ally->formID, distance);
+			
+			// Send assault alarm - this makes the ally hostile to player
+			Actor_SendAssaultAlarm(0, 0, ally);
+			
+			// Set attack on sight flag
+			ally->flags2 |= Actor::kFlag_kAttackOnSight;
+			
+			// Force AI re-evaluation
+			Actor_EvaluatePackage(ally, false, false);
+			
+			alliesAlerted++;
+		}
+		
+		_MESSAGE("SpecialDismount: Alerted %d nearby allies", alliesAlerted);
+	}
+	
+	// Main function to trigger aggression when rider is pulled off
+	static void TriggerAggressionOnPulledRider(Actor* pulledRider)
+	{
+		if (!pulledRider) return;
 		if (!g_thePlayer || !(*g_thePlayer)) return;
-		if (!g_task) return;
 		
 		Actor* player = *g_thePlayer;
 		
-		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-		_MESSAGE("SpecialDismount: Applying ragdoll (force: %.1f) to '%s' (FormID: %08X)", 
-			force, targetName ? targetName : "Unknown", target->formID);
+		const char* riderName = CALL_MEMBER_FN(pulledRider, GetReferenceName)();
+		_MESSAGE("SpecialDismount: ========================================");
+		_MESSAGE("SpecialDismount: TRIGGERING AGGRESSION - Pulled rider: '%s' (%08X)",
+			riderName ? riderName : "Unknown", pulledRider->formID);
+		_MESSAGE("SpecialDismount: ========================================");
 		
-		// Queue the push via task interface for thread safety
-		// Pass FormIDs instead of raw pointers for safety
-		g_task->AddTask(new taskPushActorAway(player->formID, target->formID, force));
+		// Check if the rider was already in combat with player
+		bool wasAlreadyInCombat = pulledRider->IsInCombat();
+		_MESSAGE("SpecialDismount: Was already in combat: %s", wasAlreadyInCombat ? "YES" : "NO");
+		
+		// Send assault alarm on the pulled rider - this triggers crime/aggression
+		_MESSAGE("SpecialDismount: Sending assault alarm to pulled rider...");
+		Actor_SendAssaultAlarm(0, 0, pulledRider);
+		
+		// Set attack on sight flag
+		pulledRider->flags2 |= Actor::kFlag_kAttackOnSight;
+		
+		// Force AI re-evaluation to make them attack
+		Actor_EvaluatePackage(pulledRider, false, false);
+		
+		// Alert nearby allies
+		AlertNearbyAllies(pulledRider, player);
+		
+		// Check post-aggression state
+		bool isNowInCombat = pulledRider->IsInCombat();
+		_MESSAGE("SpecialDismount: Post-aggression: InCombat=%s",
+			isNowInCombat ? "YES" : "NO");
+		
+		_MESSAGE("SpecialDismount: Aggression triggered successfully");
 	}
 
-	// Apply stagger spell to a mounted NPC, then ragdoll after a short delay
-	static void ApplyStaggerAndRagdollToActor(Actor* target)
+	// ============================================
+	// HORSE GRAB MOVEMENT CONTROL
+	// ============================================
+	
+	static GrabbedHorseData* GetGrabbedHorseData(UInt32 horseFormID)
 	{
-		if (!target) return;
-		
-		// CRITICAL: Only apply ragdoll if the target is STILL MOUNTED
-		// Don't ragdoll them repeatedly after they've been dismounted
-		if (!IsActorMounted(target))
+		for (int i = 0; i < MAX_GRABBED_HORSES; i++)
 		{
-			_MESSAGE("SpecialDismount: Target is no longer mounted - skipping ragdoll");
-			return;
+			if (g_grabbedHorses[i].isValid && g_grabbedHorses[i].horseFormID == horseFormID)
+			{
+				return &g_grabbedHorses[i];
+			}
+		}
+		return nullptr;
+	}
+	
+	static GrabbedHorseData* CreateGrabbedHorseData(UInt32 horseFormID)
+	{
+		GrabbedHorseData* existing = GetGrabbedHorseData(horseFormID);
+		if (existing) return existing;
+		
+		for (int i = 0; i < MAX_GRABBED_HORSES; i++)
+		{
+			if (!g_grabbedHorses[i].isValid)
+			{
+				g_grabbedHorses[i].Reset();
+				g_grabbedHorses[i].horseFormID = horseFormID;
+				g_grabbedHorses[i].isValid = true;
+				g_grabbedHorseCount++;
+				return &g_grabbedHorses[i];
+			}
+		}
+		return nullptr;
+	}
+	
+	static void RemoveGrabbedHorseData(UInt32 horseFormID)
+	{
+		for (int i = 0; i < MAX_GRABBED_HORSES; i++)
+		{
+			if (g_grabbedHorses[i].isValid && g_grabbedHorses[i].horseFormID == horseFormID)
+			{
+				g_grabbedHorses[i].Reset();
+				g_grabbedHorseCount--;
+				return;
+			}
+		}
+	}
+	
+	static void StopHorseMovementOnGrab(Actor* horse)
+	{
+		if (!horse) return;
+		
+		_MESSAGE("SpecialDismount: STOPPING horse %08X", horse->formID);
+		
+		Actor_ClearKeepOffsetFromActor(horse);
+		ClearInjectedPackages(horse);
+		Actor_EvaluatePackage(horse, false, false);
+		
+		GrabbedHorseData* data = CreateGrabbedHorseData(horse->formID);
+		if (data)
+		{
+			NiPointer<Actor> rider;
+			if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
+			{
+				data->riderFormID = rider->formID;
+				data->wasInCombat = rider->IsInCombat();
+				
+				UInt32 targetHandle = rider->currentCombatTarget;
+				if (targetHandle != 0)
+				{
+					NiPointer<TESObjectREFR> targetRef;
+					LookupREFRByHandle(targetHandle, targetRef);
+					if (targetRef)
+					{
+						data->targetFormID = targetRef->formID;
+					}
+				}
+			}
+		}
+	}
+	
+	static void RestoreHorseMovementOnRelease(Actor* horse)
+	{
+		if (!horse) return;
+		
+		GrabbedHorseData* data = GetGrabbedHorseData(horse->formID);
+		if (!data) return;
+		
+		_MESSAGE("SpecialDismount: RESTORING horse %08X", horse->formID);
+		
+		if (data->wasInCombat && data->riderFormID != 0 && data->targetFormID != 0)
+		{
+			TESForm* riderForm = LookupFormByID(data->riderFormID);
+			TESForm* targetForm = LookupFormByID(data->targetFormID);
+			
+			if (riderForm && targetForm)
+			{
+				Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
+				Actor* target = DYNAMIC_CAST(targetForm, TESForm, Actor);
+				
+				if (rider && target && rider->IsInCombat() && !target->IsDead(1))
+				{
+					UInt32 targetHandle = target->CreateRefHandle();
+					if (targetHandle != 0 && targetHandle != *g_invalidRefHandle)
+					{
+						NiPoint3 offset = {0, -300.0f, 0};
+						NiPoint3 offsetAngle = {0, 0, 0};
+						Actor_KeepOffsetFromActor(horse, targetHandle, offset, offsetAngle, 1500.0f, 300.0f);
+						Actor_EvaluatePackage(horse, false, false);
+					}
+				}
+			}
 		}
 		
-		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-		_MESSAGE("SpecialDismount: Applying ragdoll to '%s' (FormID: %08X)", 
-			targetName ? targetName : "Unknown", target->formID);
-		
-		// Note: Stagger spell casting via ActorMagicCaster->CastSpellImmediate is not available
-		// in this SKSE version. Just apply ragdoll directly instead.
-		
-		// Apply ragdoll immediately
-		ApplyRagdollToActor(target, RAGDOLL_FORCE);
+		Actor_EvaluatePackage(horse, false, false);
+		RemoveGrabbedHorseData(horse->formID);
 	}
 
-	// Recursive node search by name
+	// ============================================
+	// INSTANT RAGDOLL with timed recovery
+	// ============================================
+	static void ApplyInstantRagdoll(Actor* target)
+	{
+		if (!target) return;
+		if (!IsActorMounted(target)) return;
+		if (!g_thePlayer || !(*g_thePlayer)) return;
+		if (!g_task) return;
+		
+		_MESSAGE("SpecialDismount: INSTANT RAGDOLL on %08X (force: %.1f, duration: %dms)", 
+			target->formID, RAGDOLL_FORCE, RAGDOLL_DURATION_MS);
+		
+		// Get horse FormID BEFORE the ragdoll (while still mounted)
+		UInt32 horseFormID = 0;
+		NiPointer<Actor> mount;
+		if (CALL_MEMBER_FN(target, GetMount)(mount) && mount)
+		{
+			horseFormID = mount->formID;
+		}
+		
+		// Queue ragdoll on main thread
+		Actor* player = *g_thePlayer;
+		g_task->AddTask(new taskPushActorAway(player->formID, target->formID, RAGDOLL_FORCE));
+		
+		// Queue aggression trigger on main thread (must be done from main thread)
+		UInt32 targetFormID = target->formID;
+		g_task->AddTask(new taskTriggerAggression(targetFormID));
+		
+		// Notify scanner that this NPC was dismounted (pulled off by player)
+		// This registers them for remount AI tracking
+		OnNPCDismounted(targetFormID, horseFormID);
+		
+		// Schedule recovery after ragdoll duration
+		std::thread([targetFormID]() {
+			std::this_thread::sleep_for(std::chrono::milliseconds(RAGDOLL_DURATION_MS));
+			
+			if (g_task)
+			{
+				g_task->AddTask(new taskRestoreFromRagdoll(targetFormID));
+			}
+		}).detach();
+	}
+
+	// ============================================
+	// Node finding
+	// ============================================
 	static NiAVObject* FindNodeByName(NiAVObject* root, const char* name)
 	{
 		if (!root || !name) return nullptr;
 		
-		// Compare exact name (case-insensitive)
 		if (root->m_name && _stricmp(root->m_name, name) == 0)
 			return root;
 		
@@ -202,7 +510,6 @@ namespace MountedNPCCombatVR
 		return nullptr;
 	}
 
-	// Get VR controller node (left or right hand)
 	static NiAVObject* GetVRControllerNode(bool isLeft)
 	{
 		if (!g_thePlayer || !(*g_thePlayer)) return nullptr;
@@ -215,7 +522,6 @@ namespace MountedNPCCombatVR
 		return FindNodeByName(root, nodeName);
 	}
 
-	// Get controller world Z position
 	static float GetControllerWorldZ(bool isLeft)
 	{
 		NiAVObject* node = GetVRControllerNode(isLeft);
@@ -226,7 +532,9 @@ namespace MountedNPCCombatVR
 		return 0.0f;
 	}
 
-	// Controller tracking thread function
+	// ============================================
+	// Controller tracking thread - FAST polling
+	// ============================================
 	static void ControllerTrackingThread()
 	{
 		g_hasLastZ = false;
@@ -234,12 +542,10 @@ namespace MountedNPCCombatVR
 		
 		while (g_trackingActive)
 		{
-			// Check all active rider grabs
 			for (int i = 0; i < g_grabCount; i++)
 			{
 				if (g_grabs[i].isValid && !g_grabs[i].isMount)
 				{
-					// This is a rider grab - first check if they're still mounted
 					TESForm* form = LookupFormByID(g_grabs[i].grabbedFormID);
 					if (!form)
 					{
@@ -254,39 +560,27 @@ namespace MountedNPCCombatVR
 						continue;
 					}
 					
-					// If rider is no longer mounted, stop tracking this grab
 					if (!IsActorMounted(grabbedActor))
 					{
-						_MESSAGE("SpecialDismount: Rider %08X dismounted - stopping pull detection", g_grabs[i].grabbedFormID);
 						g_grabs[i].isValid = false;
 						continue;
 					}
 					
-					// Get controller Z
 					float currentZ = GetControllerWorldZ(g_grabs[i].isLeftHand);
 					
 					if (g_hasLastZ)
 					{
-						// Calculate delta (negative = pulling down)
 						float deltaZ = currentZ - g_lastControllerZ;
 						
-						// Check if there's a sharp drop (deltaZ is negative and exceeds threshold)
+						// Pull detected!
 						if (deltaZ < -PULL_DOWN_THRESHOLD)
 						{
-							_MESSAGE("SpecialDismount: [PULL DETECTED] Rider %08X - %s hand pulled DOWN by %.2f units (Z: %.2f -> %.2f)",
-								g_grabs[i].grabbedFormID,
-								g_grabs[i].isLeftHand ? "LEFT" : "RIGHT",
-								-deltaZ,
-								g_lastControllerZ,
-								currentZ);
+							_MESSAGE("SpecialDismount: [PULL] DOWN %.1f units", -deltaZ);
 							
-							// Apply ragdoll (function will check if still mounted)
-							ApplyStaggerAndRagdollToActor(grabbedActor);
+							// INSTANT ragdoll with timed recovery AND aggression trigger
+							ApplyInstantRagdoll(grabbedActor);
 							
-							// Mark this grab as processed so we don't ragdoll again
-							// The rider will either dismount or stay mounted, but we only ragdoll once per grab
 							g_grabs[i].isValid = false;
-							_MESSAGE("SpecialDismount: Grab processed - will not ragdoll again for this grab");
 						}
 					}
 					
@@ -299,7 +593,6 @@ namespace MountedNPCCombatVR
 		}
 	}
 
-	// Start tracking controller Z
 	static void StartControllerTracking()
 	{
 		if (g_trackingActive) return;
@@ -307,11 +600,8 @@ namespace MountedNPCCombatVR
 		g_trackingActive = true;
 		g_hasLastZ = false;
 		g_controllerTrackThread = std::thread(ControllerTrackingThread);
-		_MESSAGE("SpecialDismount: Started controller tracking (interval: %dms, threshold: %.0f units)", 
-			CONTROLLER_Z_TRACK_INTERVAL_MS, PULL_DOWN_THRESHOLD);
 	}
 
-	// Stop tracking controller Z
 	static void StopControllerTracking()
 	{
 		if (!g_trackingActive) return;
@@ -322,10 +612,8 @@ namespace MountedNPCCombatVR
 			g_controllerTrackThread.join();
 		}
 		g_hasLastZ = false;
-		_MESSAGE("SpecialDismount: Stopped controller tracking");
 	}
 
-	// Check if any rider is currently grabbed
 	static bool IsAnyRiderGrabbed()
 	{
 		for (int i = 0; i < g_grabCount; i++)
@@ -338,7 +626,6 @@ namespace MountedNPCCombatVR
 		return false;
 	}
 
-	// Check if actor is mounted (is a rider on a horse)
 	static bool IsActorMounted(Actor* actor)
 	{
 		if (!actor) return false;
@@ -346,7 +633,6 @@ namespace MountedNPCCombatVR
 		return CALL_MEMBER_FN(actor, GetMount)(mount) && mount;
 	}
 
-	// Check if actor is a mount with a rider (is a horse being ridden)
 	static bool IsActorBeingRidden(Actor* actor)
 	{
 		if (!actor) return false;
@@ -356,7 +642,6 @@ namespace MountedNPCCombatVR
 
 	static GrabInfo* CreateOrGetGrab(UInt32 formID, bool isLeft, bool isMount)
 	{
-		// Check if already tracked
 		for (int i = 0; i < g_grabCount; i++)
 		{
 			if (g_grabs[i].isValid && g_grabs[i].grabbedFormID == formID)
@@ -366,7 +651,6 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		// Create new entry
 		if (g_grabCount < MAX_GRABS)
 		{
 			GrabInfo& g = g_grabs[g_grabCount++];
@@ -387,7 +671,6 @@ namespace MountedNPCCombatVR
 			if (g_grabs[i].isValid && g_grabs[i].grabbedFormID == formID)
 			{
 				g_grabs[i].isValid = false;
-				// Compact array
 				for (int j = i; j < g_grabCount - 1; j++)
 				{
 					g_grabs[j] = g_grabs[j + 1];
@@ -398,136 +681,117 @@ namespace MountedNPCCombatVR
 		}
 	}
 
-	// HIGGS Grabbed Callback
+	// ============================================
+	// HIGGS Callbacks
+	// ============================================
+	
 	static void HiggsGrabCallback(bool isLeft, TESObjectREFR* grabbed)
 	{
 		if (!grabbed) return;
-		
-		// Only care about Actors
 		if (grabbed->formType != kFormType_Character) return;
 		
 		Actor* grabbedActor = DYNAMIC_CAST(grabbed, TESObjectREFR, Actor);
 		if (!grabbedActor) return;
 		
-		// Check if this is a mounted rider OR a mount being ridden
 		bool isMountedRider = IsActorMounted(grabbedActor);
 		bool isBeingRidden = IsActorBeingRidden(grabbedActor);
 		
-		// Only track if part of a mounted pair
 		if (!isMountedRider && !isBeingRidden) return;
 		
 		UInt32 formID = grabbed->formID;
-		const char* actorName = CALL_MEMBER_FN(grabbedActor, GetReferenceName)();
-		const char* handStr = isLeft ? "LEFT" : "RIGHT";
-		const char* typeStr = isMountedRider ? "MOUNTED RIDER" : "MOUNT (with rider)";
 		
-		_MESSAGE("SpecialDismount: ========================================");
-		_MESSAGE("SpecialDismount: PLAYER GRABBED %s", typeStr);
-		_MESSAGE("SpecialDismount: Actor: '%s' (FormID: %08X)", actorName ? actorName : "Unknown", formID);
-		_MESSAGE("SpecialDismount: Hand: %s", handStr);
+		_MESSAGE("SpecialDismount: GRABBED %s %08X", 
+			isMountedRider ? "RIDER" : "HORSE", formID);
 		
-		// If this is a rider, remove their protection so they can be staggered/dismounted
-		if (isMountedRider)
+		// HORSE: Stop movement
+		if (isBeingRidden)
 		{
-			_MESSAGE("SpecialDismount: Removing stagger/bleedout/dismount protection from rider");
-			RemoveMountedProtection(grabbedActor);
+			StopHorseMovementOnGrab(grabbedActor);
 		}
 		
-		_MESSAGE("SpecialDismount: ========================================");
+		// RIDER: Remove protection and capture initial Z for instant pull detection
+		if (isMountedRider)
+		{
+			RemoveMountedProtection(grabbedActor);
+			
+			// Capture initial Z position IMMEDIATELY so first pull can be detected
+			g_lastControllerZ = GetControllerWorldZ(isLeft);
+			g_hasLastZ = true;
+		}
 		
 		CreateOrGetGrab(formID, isLeft, isBeingRidden);
 		
-		// If rider grabbed, start tracking controller Z
 		if (isMountedRider)
 		{
 			StartControllerTracking();
 		}
 	}
 
-	// HIGGS Dropped Callback
 	static void HiggsDroppedCallback(bool isLeft, TESObjectREFR* dropped)
 	{
 		if (!dropped) return;
 		
 		UInt32 formID = dropped->formID;
 		
-		// Check if we were tracking this grab
 		GrabInfo* gi = GetActiveGrabInfo(formID);
 		if (!gi) return;
 		
 		bool wasRider = !gi->isMount;
+		bool wasHorse = gi->isMount;
 		
-		double now = NowSeconds();
-		double duration = now - gi->startTime;
-		
-		const char* handStr = gi->isLeftHand ? "LEFT" : "RIGHT";
-		const char* typeStr = gi->isMount ? "MOUNT" : "MOUNTED RIDER";
-		
-		// Get actor
 		Actor* droppedActor = DYNAMIC_CAST(dropped, TESObjectREFR, Actor);
-		const char* actorName = "Unknown";
-		if (droppedActor)
+		
+		if (wasHorse && droppedActor)
 		{
-			actorName = CALL_MEMBER_FN(droppedActor, GetReferenceName)();
+			RestoreHorseMovementOnRelease(droppedActor);
 		}
 		
-		_MESSAGE("SpecialDismount: ========================================");
-		_MESSAGE("SpecialDismount: PLAYER RELEASED %s", typeStr);
-		_MESSAGE("SpecialDismount: Actor: '%s' (FormID: %08X)", actorName ? actorName : "Unknown", formID);
-		_MESSAGE("SpecialDismount: Hand: %s", handStr);
-		_MESSAGE("SpecialDismount: Grab Duration: %.2f seconds", duration);
-		
-		// If this was a rider and they're still mounted, restore their protection
 		if (wasRider && droppedActor)
 		{
 			if (IsActorMounted(droppedActor))
 			{
-				_MESSAGE("SpecialDismount: Rider still mounted - restoring stagger/bleedout/dismount protection");
 				ApplyMountedProtection(droppedActor);
-			}
-			else
-			{
-				_MESSAGE("SpecialDismount: Rider is no longer mounted - not restoring protection");
 			}
 		}
 		
-		_MESSAGE("SpecialDismount: ========================================");
-		
 		RemoveGrab(formID);
 		
-		// If no more riders grabbed, stop tracking
 		if (wasRider && !IsAnyRiderGrabbed())
 		{
 			StopControllerTracking();
 		}
 	}
 
+	// ============================================
+	// Init / Shutdown
+	// ============================================
+	
 	void InitSpecialDismount()
 	{
 		_MESSAGE("SpecialDismount: Initializing...");
 		
-		// Note: Don't call InitStaggerSpell() here - data isn't loaded yet
-		// Call InitSpecialDismountSpells() from main.cpp after kMessage_DataLoaded
+		for (int i = 0; i < MAX_GRABBED_HORSES; i++)
+		{
+			g_grabbedHorses[i].Reset();
+		}
+		g_grabbedHorseCount = 0;
 		
 		if (!higgsInterface)
 		{
-			_MESSAGE("SpecialDismount: HIGGS interface not available - cannot register callbacks");
+			_MESSAGE("SpecialDismount: HIGGS interface not available");
 			return;
 		}
 		
 		s_higgs = higgsInterface;
-		
-		// Register callbacks
 		s_higgs->AddGrabbedCallback(HiggsGrabCallback);
 		s_higgs->AddDroppedCallback(HiggsDroppedCallback);
 		
-		_MESSAGE("SpecialDismount: Registered with HIGGS (build: %d)", s_higgs->GetBuildNumber());
+		_MESSAGE("SpecialDismount: Registered with HIGGS");
 	}
 	
 	void InitSpecialDismountSpells()
 	{
-		_MESSAGE("SpecialDismount: Initializing spells (post DATA LOADED)...");
-		InitStaggerSpell();
+		// Not using spells anymore - instant ragdoll
 	}
 	
 	void ShutdownSpecialDismount()
@@ -540,16 +804,17 @@ namespace MountedNPCCombatVR
 		}
 		g_grabCount = 0;
 		
-		// Clear cached spell
-		g_staggerSpell = nullptr;
-		g_staggerSpellInitialized = false;
+		for (int i = 0; i < MAX_GRABBED_HORSES; i++)
+		{
+			g_grabbedHorses[i].Reset();
+		}
+		g_grabbedHorseCount = 0;
 	}
 
 	bool IsActorGrabbedByPlayer(UInt32 actorFormID)
 	{
 		for (int i = 0; i < g_grabCount; i++)
 		{
-			// Only return true for rider grabs (not mount grabs)
 			if (g_grabs[i].isValid && g_grabs[i].grabbedFormID == actorFormID && !g_grabs[i].isMount)
 			{
 				return true;
@@ -568,5 +833,10 @@ namespace MountedNPCCombatVR
 			}
 		}
 		return nullptr;
+	}
+	
+	bool IsHorseGrabbedByPlayer(UInt32 horseFormID)
+	{
+		return GetGrabbedHorseData(horseFormID) != nullptr;
 	}
 }

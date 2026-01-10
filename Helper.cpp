@@ -4,10 +4,12 @@
 #include "DynamicPackages.h"
 #include "SpecialDismount.h"
 #include "SingleMountedCombat.h"
-#include "HorseStabilization.h"
 #include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "ArrowSystem.h"
+#include "CompanionCombat.h"
+#include "WeaponDetection.h"
+#include "config.h"
 
 namespace MountedNPCCombatVR
 {
@@ -262,10 +264,6 @@ namespace MountedNPCCombatVR
 		// Update mounted combat system
 		UpdateMountedCombat();
 		
-		// Check for cell changes and process any pending horse stabilizations
-		CheckCellChangeForStabilization();
-		ProcessPendingStabilizations();
-		
 		// Validate actor with SEH protection
 		if (!IsActorValid(actor))
 		{
@@ -343,18 +341,97 @@ namespace MountedNPCCombatVR
 			bool inCombat = actor->IsInCombat();
 			
 			// ============================================
+			// RATE-LIMITED LOGGING FOR MOUNTED NPCs
+			// Uses a simple circular buffer to track recently logged NPCs
+			// ============================================
+			static UInt32 recentlyLoggedNPCs[8] = {0};
+			static float recentLogTimes[8] = {0};
+			static int logIndex = 0;
+			float currentTime = (float)clock() / CLOCKS_PER_SEC;
+			const float LOG_COOLDOWN = 10.0f;  // Only log each NPC once per 10 seconds
+			
+			// Check if this NPC was recently logged
+			bool shouldLog = true;
+			for (int i = 0; i < 8; i++)
+			{
+				if (recentlyLoggedNPCs[i] == actor->formID && 
+					(currentTime - recentLogTimes[i]) < LOG_COOLDOWN)
+				{
+					shouldLog = false;
+					break;
+				}
+			}
+			
+			// Only log new NPCs in combat (not routine dismount checks)
+			if (shouldLog && inCombat && !IsNPCTracked(actor->formID))
+			{
+				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+				_MESSAGE("DismountHook: Checking mounted NPC '%s' (FormID: %08X) - InCombat: %s", 
+					actorName ? actorName : "Unknown", actor->formID, inCombat ? "YES" : "NO");
+				
+				// Store in circular buffer
+				recentlyLoggedNPCs[logIndex] = actor->formID;
+				recentLogTimes[logIndex] = currentTime;
+				logIndex = (logIndex + 1) % 8;
+			}
+			
+			// ============================================
 			// NPC IS MOUNTED AND IN COMBAT: BLOCK DISMOUNT
 			// ============================================
 			if (inCombat)
 			{
-				// Track new combat NPCs
-				if (!IsNPCTracked(actor->formID))
+				// Check if this is a companion (uses CompanionCombat tracking)
+				bool isTrackedCompanion = (GetCompanionData(actor->formID) != nullptr);
+				
+				// Track new combat NPCs (not yet tracked by either system)
+				if (!IsNPCTracked(actor->formID) && !isTrackedCompanion)
 				{
 					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-					_MESSAGE("DismountHook: BLOCKING '%s' (FormID: %08X) - in combat, preventing dismount", 
-						actorName ? actorName : "Unknown", actor->formID);
 					
-					OnDismountBlocked(actor, mount);
+					// ============================================
+					// COMPANION CHECK: Companions get FULL combat capability
+					// Route them through the EXACT SAME system as guards
+					// The game's AI handles targeting - we just enable the combat
+					// ============================================
+					if (CompanionCombatEnabled && IsCompanion(actor))
+					{
+						Actor* mountActor = mount.get();
+						if (mountActor)
+						{
+							_MESSAGE("DismountHook: BLOCKING COMPANION '%s' (FormID: %08X) - SAME AS GUARD", 
+								actorName ? actorName : "Unknown", actor->formID);
+							
+							// Register with companion tracking system (for friendly fire prevention)
+							RegisterMountedCompanion(actor, mountActor);
+							
+							// ============================================
+							// COMPANION WEAPON SETUP
+							// Give companions a bow if they don't have one
+							// ============================================
+							if (!HasBowInInventory(actor))
+							{
+								GiveDefaultBow(actor);
+								_MESSAGE("DismountHook: Gave default bow to companion '%s'", 
+									actorName ? actorName : "Unknown");
+							}
+							EquipArrows(actor);
+							
+							// ============================================
+							// ROUTE THROUGH STANDARD GUARD COMBAT SYSTEM
+							// Exact same as any other mounted NPC
+							// Game AI handles targeting
+							// ============================================
+							OnDismountBlocked(actor, mount);
+						}
+					}
+					else
+					{
+						// Regular NPC - use standard MountedCombat system
+						_MESSAGE("DismountHook: BLOCKING '%s' (FormID: %08X) - in combat, preventing dismount", 
+							actorName ? actorName : "Unknown", actor->formID);
+						
+						OnDismountBlocked(actor, mount);
+					}
 				}
 				
 				// BLOCK DISMOUNT - NPC is in combat
@@ -407,6 +484,9 @@ namespace MountedNPCCombatVR
 		// Reset SingleMountedCombat cached forms (arrow spell, bow idles, etc.)
 		ResetSingleMountedCombatCache();
 		
+		// Reset CombatStyles cached forms (attack animations, etc.)
+		ResetCombatStylesCache();
+		
 		// Reset MultiMountedCombat system (ranged riders, Captain tracking, etc.)
 		ClearAllMultiRiders();
 		
@@ -415,6 +495,12 @@ namespace MountedNPCCombatVR
 		
 		// Reset Arrow system
 		ResetArrowSystem();
+		
+		// Reset DynamicPackage state (weapon switch tracking, horse movement, etc.)
+		ResetDynamicPackageState();
+		
+		// Reset CompanionCombat system (mounted teammates/followers)
+		ResetCompanionCombat();
 		
 		_MESSAGE("MountedNPCCombatVR: Mod DEACTIVATED - all state reset");
 	}
@@ -718,10 +804,6 @@ namespace MountedNPCCombatVR
 		// Hot-reload config on every game load
 		loadConfig();
 		
-		// Initialize and run horse stabilization to prevent falling through ground
-		InitHorseStabilization();
-		StabilizeAllHorses();
-		
 		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->loadedState)
 		{
 			_MESSAGE("MountedNPCCombatVR: Player loaded successfully - activating mod with delay");
@@ -735,10 +817,6 @@ namespace MountedNPCCombatVR
 		
 		// Hot-reload config on new game
 		loadConfig();
-		
-		// Initialize and run horse stabilization
-		InitHorseStabilization();
-		StabilizeAllHorses();
 		
 		ActivateModWithDelay();
 	}

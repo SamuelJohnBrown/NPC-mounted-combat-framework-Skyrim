@@ -121,6 +121,10 @@ namespace MountedNPCCombatVR
 	// ALWAYS use this with explicit target - never default to player!
 	bool ForceHorseCombatWithTarget(Actor* horse, Actor* target);
 	
+	// Force companion horse to follow target at CompanionMeleeRange (tighter engagement)
+	// Used for player follower companions who need to get closer for melee
+	bool ForceCompanionHorseCombatWithTarget(Actor* horse, Actor* target);
+
 	// ============================================
 	// HELPER TEMPLATE FOR VTABLE ACCESS
 	// ============================================
@@ -198,4 +202,14 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	int InjectTravelPackageToHorse(Actor* horse, Actor* target);
+	
+	// ============================================
+	// RESET FUNCTIONS (for game load/reload)
+	// ============================================
+	
+	// Reset all DynamicPackage state (weapon switch tracking, horse movement, etc.)
+	void ResetDynamicPackageState();
+	
+	// Clear weapon switch data for a specific actor
+	void ClearWeaponSwitchData(UInt32 actorFormID);
 }

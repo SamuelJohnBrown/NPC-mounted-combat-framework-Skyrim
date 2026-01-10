@@ -28,6 +28,26 @@ namespace MountedNPCCombatVR
 	bool IsTargetMounted(Actor* target);
 	
 	// ============================================
+	// Mobile Target Interception (vs Moving NPCs)
+	// ============================================
+	// When fighting a mobile NPC (wolf, bandit, etc.), both the
+	// horse and target move toward each other causing collisions.
+	// This system makes the horse approach from an angle instead.
+	
+	// Check if target is a mobile NPC (not player, and moving)
+	bool IsTargetMobileNPC(Actor* target, UInt32 horseFormID);
+	
+	// Get interception angle for approaching a mobile target
+	// Makes the horse approach at ~60 degree offset to avoid head-on collision
+	float GetMobileTargetInterceptionAngle(UInt32 horseFormID, Actor* horse, Actor* target);
+	
+	// Called when leaving melee range - reset interception side for next approach
+	void NotifyHorseLeftMobileTargetRange(UInt32 horseFormID);
+	
+	// Clear mobile intercept data for a horse
+	void ClearMobileInterceptData(UInt32 horseFormID);
+	
+	// ============================================
 	// 90-Degree Turn Maneuver (vs On-Foot Target)
 	// ============================================
 	// When horse enters melee range, it turns 90 degrees
@@ -187,6 +207,49 @@ namespace MountedNPCCombatVR
 	
 	// Clear rapid fire data for a horse
 	void ClearRapidFireData(UInt32 horseFormID);
+
+	// ============================================
+	// Stand Ground Maneuver (vs Mobile NPC Targets)
+	// ============================================
+	// When fighting a non-player NPC target at close range (<260 units),
+	// the horse will stop moving and hold position for 3-8 seconds.
+	// This allows the rider to land attacks instead of constantly chasing.
+	// Only used against non-player targets (both are moving toward each other).
+	// 25% chance to trigger when conditions are met.
+	
+	// Check and trigger stand ground maneuver
+	// Returns true if stand ground was initiated
+	bool TryStandGroundManeuver(Actor* horse, Actor* rider, Actor* target, float distanceToTarget);
+	
+	// Check if horse is currently in stand ground mode
+	bool IsInStandGround(UInt32 horseFormID);
+	
+	// Check if horse in stand ground has noRotation flag (50% chance - faces target directly)
+	bool IsStandGroundNoRotation(UInt32 horseFormID);
+	
+	// Update stand ground state - call every frame while standing ground
+	// Returns true if still standing ground, false if completed
+	bool UpdateStandGroundManeuver(Actor* horse, Actor* target);
+	
+	// Stop/cancel stand ground
+	void StopStandGroundManeuver(UInt32 horseFormID);
+	
+	// Clear stand ground data for a horse
+	void ClearStandGroundData(UInt32 horseFormID);
+
+	// ============================================
+	// Player Aggro Switch (vs Non-Player Target)
+	// ============================================
+	// When fighting a non-player NPC and player is within 1500 units,
+	// there's a 15% chance every 20 seconds to switch targets to the
+	// player and trigger a charge maneuver for variety.
+	
+	// Check and trigger player aggro switch
+	// Returns true if switch was initiated (also triggers charge)
+	bool TryPlayerAggroSwitch(Actor* horse, Actor* rider, Actor* currentTarget);
+	
+	// Clear player aggro switch data for a horse
+	void ClearPlayerAggroSwitchData(UInt32 horseFormID);
 
 	// ============================================
 	// Melee Rider Collision Avoidance

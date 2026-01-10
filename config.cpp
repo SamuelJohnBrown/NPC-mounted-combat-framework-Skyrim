@@ -2,122 +2,343 @@
 
 namespace MountedNPCCombatVR {
 		
-	int logging = 1;  // Default to WARN level so we see important messages
+	int logging = 1;
     int leftHandedMode = 0;
 	
-	// NPC Dismount Prevention - enabled by default
+	// ============================================
+	// GENERAL SETTINGS
+	// ============================================
+	
 	bool PreventNPCDismountOnAttack = true;
+	bool EnableRemounting = true;
 	
-	// Weapon switch distance - default 230 units
+	// ============================================
+	// COMBAT RANGE SETTINGS
+	// ============================================
+	
 	float WeaponSwitchDistance = 230.0f;
+	float MeleeRangeOnFoot = 150.0f;
+	float MeleeRangeOnFootNPC = 230.0f;
+	float MeleeRangeMounted = 300.0f;
 	
-	// Horse Stabilization - enabled by default
-	bool EnableHorseStabilization = true;
+	// ============================================
+	// WEAPON SWITCH SETTINGS
+	// ============================================
+	
+	float WeaponSwitchCooldown = 5.0f;
+	float SheatheTransitionTime = 0.8f;
+
+	// ============================================
+	// MOUNT ROTATION SETTINGS
+	// ============================================
+	
+	float HorseRotationSpeed = 0.15f;
+
+	// ============================================
+	// MELEE ATTACK ANGLE SETTINGS
+	// ============================================
+	
+	float AttackAnglePlayer = 0.26f;
+	float AttackAngleNPC = 0.52f;
+	float AttackAngleMounted = 0.35f;
+
+	// ============================================
+	// CHARGE MANEUVER SETTINGS
+	// ============================================
+	
+	bool ChargeEnabled = true;
+	int ChargeChancePercent = 7;
+	float ChargeCooldown = 45.0f;
+	float ChargeMinDistance = 700.0f;
+	float ChargeMaxDistance = 1500.0f;
+	
+	// ============================================
+	// RAPID FIRE MANEUVER SETTINGS
+	// ============================================
+	
+	bool RapidFireEnabled = true;
+	int RapidFireChancePercent = 7;
+	float RapidFireCooldown = 45.0f;
+	float RapidFireDuration = 7.0f;
+	int RapidFireShotCount = 5;
+	
+	// ============================================
+	// BOW ATTACK SETTINGS
+	// ============================================
+	
+	bool RangedAttacksEnabled = true;
+	float BowDrawMinTime = 2.0f;
+	float BowDrawMaxTime = 3.5f;
+	
+	// ============================================
+	// ARROW AIM SETTINGS
+	// ============================================
+	
+	float ArrowShooterHeightOffset = 0.0f;    // Height offset for shooter position
+	float ArrowTargetFootHeight = 80.0f;      // Target height when on foot (chest level)
+	float ArrowTargetMountedHeight = 120.0f;  // Target height when mounted (chest level on horse)
+
+	// ============================================
+	// REAR UP SETTINGS
+	// ============================================
+	
+	bool RearUpEnabled = true;
+	int RearUpApproachChance = 7;
+	int RearUpDamageChance = 10;
+	float RearUpCooldown = 20.0f;
+	
+	// ============================================
+	// STAND GROUND SETTINGS
+	// ============================================
+	
+	bool StandGroundEnabled = true;
+	float StandGroundMaxDistance = 260.0f;      // Must be within this distance to trigger
+	float StandGroundMinDuration = 3.0f;        // Minimum stand time
+	float StandGroundMaxDuration = 8.0f;     // Maximum stand time
+	int StandGroundChancePercent = 25;          // 25% chance to trigger per check
+	float StandGroundCheckInterval = 2.0f;      // Check every 2 seconds
+	float StandGroundCooldown = 5.0f;  // 5 seconds between attempts
+	
+	// ============================================
+	// SPECIAL RIDER COMBAT SETTINGS (Captains & Companions)
+	// ============================================
+	
+	float RangedRoleMinDistance = 500.0f;       // If closer than this, switch to melee
+	float RangedRoleIdealDistance = 800.0f;     // Ideal distance to hold position
+	float RangedRoleMaxDistance = 1400.0f;      // If further than this, move closer
+	float RangedPositionTolerance = 100.0f;     // How close to ideal is "close enough"
+	float RangedFireMinDistance = 300.0f;       // Minimum distance to fire bow
+	float RangedFireMaxDistance = 2800.0f;      // Maximum distance to fire bow
+	float RoleCheckInterval = 2.0f;             // Time in seconds to re-check roles
+
+	// ============================================
+	// MOUNTED ATTACK STAGGER SETTINGS
+	// ============================================
+	
+	bool MountedAttackStaggerEnabled = true;    // Enable stagger on unblocked hits vs NPCs
+	int MountedAttackStaggerChance = 20;        // 20% chance to stagger
+	float MountedAttackStaggerForce = 0.5f;     // Knockback force (gentle to avoid flying)
+
+	// ============================================
+	// HOSTILE DETECTION SETTINGS
+	// ============================================
+	
+	float HostileDetectionRange = 1400.0f;
+	float HostileScanInterval = 3.0f;
+	
+	// ============================================
+	// TRACKING LIMITS
+	// ============================================
+	
+	int MaxTrackedMountedNPCs = 5;
+	
+	// ============================================
+	// COMPANION COMBAT SETTINGS
+	// ============================================
+	
+	bool CompanionCombatEnabled = true;
+	int MaxTrackedCompanions = 5;
+	float CompanionScanRange = 4000.0f;
+	float CompanionScanInterval = 1.0f;
+	float CompanionTargetRange = 2000.0f;
+	float CompanionEngageRange = 1500.0f;
+	float CompanionUpdateInterval = 0.5f;
+	float CompanionMeleeRange = 175.0f;
+
+	// ============================================
+	// COMPANION NAME LIST (for mod-added followers)
+	// ============================================
+	
+	std::string CompanionNameList[MAX_COMPANION_NAMES];
+	int CompanionNameCount = 0;
+	
+	static std::string ToLowerCase(const std::string& str)
+	{
+		std::string lower = str;
+		std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+		return lower;
+	}
+	
+	bool IsInCompanionNameList(const char* actorName)
+	{
+		if (!actorName || CompanionNameCount == 0) return false;
+		
+		std::string nameLower = ToLowerCase(actorName);
+		
+		for (int i = 0; i < CompanionNameCount; i++)
+		{
+			if (CompanionNameList[i].empty()) continue;
+			if (nameLower.find(CompanionNameList[i]) != std::string::npos)
+				return true;
+		}
+		
+		return false;
+	}
 
     void loadConfig() 
-    {
-        std::string runtimeDirectory = GetRuntimeDirectory();
+ {
+		std::string runtimeDirectory = GetRuntimeDirectory();
 
-        if (!runtimeDirectory.empty()) 
-  {
-     std::string filepath = runtimeDirectory + "Data\\SKSE\\Plugins\\Mounted_NPC_Combat_VR.ini";
-  
-        _MESSAGE("loadConfig: Looking for config file at: %s", filepath.c_str());
-     
-        std::ifstream file(filepath);
+   if (runtimeDirectory.empty()) 
+		{
+			_MESSAGE("loadConfig: Using defaults");
+			return;
+		}
+		
+		std::string filepath = runtimeDirectory + "Data\\SKSE\\Plugins\\Mounted_NPC_Combat_VR.ini";
+		std::ifstream file(filepath);
 
-            if (!file.is_open()) 
-            {
-  transform(filepath.begin(), filepath.end(), filepath.begin(), ::tolower);
-     _MESSAGE("loadConfig: Trying lowercase path: %s", filepath.c_str());
- file.open(filepath);
-          }
+		if (!file.is_open()) 
+		{
+			transform(filepath.begin(), filepath.end(), filepath.begin(), ::tolower);
+			file.open(filepath);
+		}
 
-if (file.is_open()) 
-            {
-      _MESSAGE("loadConfig: Config file opened successfully");
-  
-          std::string line;
-      std::string currentSection;
+		if (!file.is_open()) 
+		{
+			_MESSAGE("loadConfig: INI not found, using defaults");
+			return;
+		}
+		
+		std::string line;
+		std::string currentSection;
 
-      while (std::getline(file, line)) 
-   {
-  trim(line);
-        skipComments(line);
+		while (std::getline(file, line)) 
+		{
+			trim(line);
+			skipComments(line);
+			if (line.empty()) continue;
 
-          if (line.empty()) continue;
+			if (line[0] == '[') 
+			{
+				size_t endBracket = line.find(']');
+				if (endBracket != std::string::npos) 
+				{
+					currentSection = line.substr(1, endBracket - 1);
+					trim(currentSection);
+				}
+			}
+			else if (currentSection == "Settings") 
+			{
+				std::string variableName;
+				std::string variableValueStr = GetConfigSettingsStringValue(line, variableName);
 
-       if (line[0] == '[') 
-       {
-  // New section
-   size_t endBracket = line.find(']');
-    if (endBracket != std::string::npos) 
-    {
-           currentSection = line.substr(1, endBracket - 1);
-    trim(currentSection);
-        _MESSAGE("loadConfig: Entering section [%s]", currentSection.c_str());
-         }
-    }
-     else if (currentSection == "Settings") 
-        {
-    std::string variableName;
-      std::string variableValueStr = GetConfigSettingsStringValue(line, variableName);
-
-   if (variableName == "Logging") 
-       {
-          logging = std::stoi(variableValueStr);
-     _MESSAGE("loadConfig: Logging level set to %d", logging);
-     }
- else if (variableName == "PreventNPCDismountOnAttack")
-        {
-        PreventNPCDismountOnAttack = (std::stoi(variableValueStr) != 0);
-     _MESSAGE("loadConfig: PreventNPCDismountOnAttack set to %s", 
-           PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
-         }
-         else if (variableName == "WeaponSwitchDistance")
-    {
-   WeaponSwitchDistance = std::stof(variableValueStr);
- _MESSAGE("loadConfig: WeaponSwitchDistance set to %.0f", WeaponSwitchDistance);
-         }
-    else if (variableName == "EnableHorseStabilization")
-         {
-       EnableHorseStabilization = (std::stoi(variableValueStr) != 0);
-             _MESSAGE("loadConfig: EnableHorseStabilization set to %s", 
- EnableHorseStabilization ? "ENABLED" : "DISABLED");
-         }
-       }  
-        } 
-     
-      file.close();
-       }
-        else
-            {
-   _MESSAGE("loadConfig: Config file not found, using defaults:");
-   _MESSAGE("  - Logging: %d", logging);
-  _MESSAGE("  - PreventNPCDismountOnAttack: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
-     _MESSAGE("  - WeaponSwitchDistance: %.0f", WeaponSwitchDistance);
-     _MESSAGE("  - EnableHorseStabilization: %s", EnableHorseStabilization ? "ENABLED" : "DISABLED");
-     }
-       
-        _MESSAGE("loadConfig: Configuration loaded:");
-     _MESSAGE("  - Logging level: %d (0=ERR, 1=WARN, 2=INFO)", logging);
-      _MESSAGE("  - PreventNPCDismountOnAttack: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
-   _MESSAGE("  - WeaponSwitchDistance: %.0f", WeaponSwitchDistance);
-   _MESSAGE("  - EnableHorseStabilization: %s", EnableHorseStabilization ? "ENABLED" : "DISABLED");
-       
-return;
-        }
-  
-        _MESSAGE("loadConfig: Runtime directory is empty, using defaults");
-   return;
+				// General Settings
+				if (variableName == "Logging") logging = std::stoi(variableValueStr);
+				else if (variableName == "PreventNPCDismountOnAttack") PreventNPCDismountOnAttack = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "EnableRemounting") EnableRemounting = (std::stoi(variableValueStr) != 0);
+				// Combat Range
+				else if (variableName == "WeaponSwitchDistance") WeaponSwitchDistance = std::stof(variableValueStr);
+				else if (variableName == "MeleeRangeOnFoot") MeleeRangeOnFoot = std::stof(variableValueStr);
+				else if (variableName == "MeleeRangeOnFootNPC") MeleeRangeOnFootNPC = std::stof(variableValueStr);
+				else if (variableName == "MeleeRangeMounted") MeleeRangeMounted = std::stof(variableValueStr);
+				// Weapon Switch
+				else if (variableName == "WeaponSwitchCooldown") WeaponSwitchCooldown = std::stof(variableValueStr);
+				else if (variableName == "SheatheTransitionTime") SheatheTransitionTime = std::stof(variableValueStr);
+				// Mount Rotation
+				else if (variableName == "HorseRotationSpeed") 
+				{
+					HorseRotationSpeed = std::stof(variableValueStr);
+					if (HorseRotationSpeed < 0.01f) HorseRotationSpeed = 0.01f;
+					if (HorseRotationSpeed > 1.0f) HorseRotationSpeed = 1.0f;
+				}
+				// Attack Angles
+				else if (variableName == "AttackAnglePlayer") AttackAnglePlayer = std::stof(variableValueStr);
+				else if (variableName == "AttackAngleNPC") AttackAngleNPC = std::stof(variableValueStr);
+				else if (variableName == "AttackAngleMounted") AttackAngleMounted = std::stof(variableValueStr);
+				// Charge
+				else if (variableName == "ChargeEnabled") ChargeEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "ChargeChancePercent") ChargeChancePercent = std::stoi(variableValueStr);
+				else if (variableName == "ChargeCooldown") ChargeCooldown = std::stof(variableValueStr);
+				else if (variableName == "ChargeMinDistance") ChargeMinDistance = std::stof(variableValueStr);
+				else if (variableName == "ChargeMaxDistance") ChargeMaxDistance = std::stof(variableValueStr);
+				// Rapid Fire
+				else if (variableName == "RapidFireEnabled") RapidFireEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "RapidFireChancePercent") RapidFireChancePercent = std::stoi(variableValueStr);
+				else if (variableName == "RapidFireCooldown") RapidFireCooldown = std::stof(variableValueStr);
+				else if (variableName == "RapidFireDuration") RapidFireDuration = std::stof(variableValueStr);
+				else if (variableName == "RapidFireShotCount") RapidFireShotCount = std::stoi(variableValueStr);
+				// Bow Attack
+				else if (variableName == "RangedAttacksEnabled") RangedAttacksEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "BowDrawMinTime") BowDrawMinTime = std::stof(variableValueStr);
+				else if (variableName == "BowDrawMaxTime") BowDrawMaxTime = std::stof(variableValueStr);
+				// Arrow Aim
+				else if (variableName == "ArrowShooterHeightOffset") ArrowShooterHeightOffset = std::stof(variableValueStr);
+				else if (variableName == "ArrowTargetFootHeight") ArrowTargetFootHeight = std::stof(variableValueStr);
+				else if (variableName == "ArrowTargetMountedHeight") ArrowTargetMountedHeight = std::stof(variableValueStr);
+				// Rear Up
+				else if (variableName == "RearUpEnabled") RearUpEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "RearUpApproachChance") RearUpApproachChance = std::stoi(variableValueStr);
+				else if (variableName == "RearUpDamageChance") RearUpDamageChance = std::stoi(variableValueStr);
+				else if (variableName == "RearUpCooldown") RearUpCooldown = std::stof(variableValueStr);
+				// Stand Ground
+				else if (variableName == "StandGroundEnabled") StandGroundEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "StandGroundMaxDistance") StandGroundMaxDistance = std::stof(variableValueStr);
+				else if (variableName == "StandGroundMinDuration") StandGroundMinDuration = std::stof(variableValueStr);
+				else if (variableName == "StandGroundMaxDuration") StandGroundMaxDuration = std::stof(variableValueStr);
+				else if (variableName == "StandGroundChancePercent") StandGroundChancePercent = std::stoi(variableValueStr);
+				else if (variableName == "StandGroundCheckInterval") StandGroundCheckInterval = std::stof(variableValueStr);
+				else if (variableName == "StandGroundCooldown") StandGroundCooldown = std::stof(variableValueStr);
+				// Special Rider Combat
+				else if (variableName == "RangedRoleMinDistance") RangedRoleMinDistance = std::stof(variableValueStr);
+				else if (variableName == "RangedRoleIdealDistance") RangedRoleIdealDistance = std::stof(variableValueStr);
+				else if (variableName == "RangedRoleMaxDistance") RangedRoleMaxDistance = std::stof(variableValueStr);
+				else if (variableName == "RangedPositionTolerance") RangedPositionTolerance = std::stof(variableValueStr);
+				else if (variableName == "RangedFireMinDistance") RangedFireMinDistance = std::stof(variableValueStr);
+				else if (variableName == "RangedFireMaxDistance") RangedFireMaxDistance = std::stof(variableValueStr);
+				else if (variableName == "RoleCheckInterval") RoleCheckInterval = std::stof(variableValueStr);
+				// Mounted Attack Stagger
+				else if (variableName == "MountedAttackStaggerEnabled") MountedAttackStaggerEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "MountedAttackStaggerChance") MountedAttackStaggerChance = std::stoi(variableValueStr);
+				else if (variableName == "MountedAttackStaggerForce") MountedAttackStaggerForce = std::stof(variableValueStr);
+				// Hostile Detection
+				else if (variableName == "HostileDetectionRange") HostileDetectionRange = std::stof(variableValueStr);
+				else if (variableName == "HostileScanInterval") HostileScanInterval = std::stof(variableValueStr);
+				// Tracking Limits
+				else if (variableName == "MaxTrackedMountedNPCs") 
+				{
+					MaxTrackedMountedNPCs = std::stoi(variableValueStr);
+					if (MaxTrackedMountedNPCs < 1) MaxTrackedMountedNPCs = 1;
+					if (MaxTrackedMountedNPCs > 10) MaxTrackedMountedNPCs = 10;
+				}
+				// Companion Combat
+				else if (variableName == "CompanionCombatEnabled") CompanionCombatEnabled = (std::stoi(variableValueStr) != 0);
+				else if (variableName == "MaxTrackedCompanions") 
+				{
+					MaxTrackedCompanions = std::stoi(variableValueStr);
+					if (MaxTrackedCompanions < 1) MaxTrackedCompanions = 1;
+					if (MaxTrackedCompanions > 5) MaxTrackedCompanions = 5;
+				}
+				else if (variableName == "CompanionScanRange") CompanionScanRange = std::stof(variableValueStr);
+				else if (variableName == "CompanionScanInterval") CompanionScanInterval = std::stof(variableValueStr);
+				else if (variableName == "CompanionTargetRange") CompanionTargetRange = std::stof(variableValueStr);
+				else if (variableName == "CompanionEngageRange") CompanionEngageRange = std::stof(variableValueStr);
+				else if (variableName == "CompanionUpdateInterval") CompanionUpdateInterval = std::stof(variableValueStr);
+				else if (variableName == "CompanionMeleeRange") CompanionMeleeRange = std::stof(variableValueStr);
+				// Companion Names
+				else if (variableName.find("CompanionName") == 0 && variableName.length() > 13)
+				{
+					std::string indexStr = variableName.substr(13);
+					if (!indexStr.empty() && std::all_of(indexStr.begin(), indexStr.end(), ::isdigit))
+					{
+						int index = std::stoi(indexStr) - 1;
+						if (index >= 0 && index < MAX_COMPANION_NAMES)
+						{
+							CompanionNameList[index] = ToLowerCase(variableValueStr);
+							if (index >= CompanionNameCount) CompanionNameCount = index + 1;
+						}
+					}
+				}
+			}  
+		} 
+	
+		file.close();
+		_MESSAGE("loadConfig: INI loaded successfully");
     }
 
 	void Log(const int msgLogLevel, const char* fmt, ...)
 	{
-		if (msgLogLevel > logging)
-		{
-			return;
-		}
+		if (msgLogLevel > logging) return;
 
 		va_list args;
 		char logBuffer[4096];

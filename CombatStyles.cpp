@@ -7,17 +7,20 @@
 #include "WeaponDetection.h"
 #include "ArrowSystem.h"
 #include "AILogging.h"
+#include "NPCProtection.h"  // For AllowTemporaryStagger
+#include "CompanionCombat.h"  // For IsCompanion
 #include "skse64/GameData.h"
 #include "skse64/GameReferences.h"
 #include "skse64/GameForms.h"
 #include "skse64/GameRTTI.h"
+#include "skse64/GameInput.h"  // For g_leftHandedMode
 
 namespace MountedNPCCombatVR
 {
 	// ============================================
 	// Configuration
 	// ============================================
-	
+
 	const float MELEE_ATTACK_RANGE = 256.0f;
 	const float MELEE_CHARGE_RANGE = 512.0f;
 	const float RANGED_MIN_RANGE = 384.0f;
@@ -60,17 +63,125 @@ namespace MountedNPCCombatVR
 	// Attack Animation Tracking
 	// ============================================
 	
+	// RIDER:
+	// Actor variable, formID is the rider's form ID
+	// Track the attack state and timing for mounted riders (e.g., NPCs on horses)
 	struct RiderAttackData
 	{
 		UInt32 riderFormID;
 		RiderAttackState state;
-		float lastAttackTime;
-		float stateStartTime;
+		float lastAttackTime;     // Time when the last attack occurred
+		float stateStartTime;    // Time when the current state was entered
+		bool isValid;            // True if this data is valid and in use
+	};
+	
+	// Global arrays to track active riders and their attack data
+	static RiderAttackData g_riderAttackData[5];
+	static int g_riderAttackCount = 0;
+	
+	// FOLLOWING NPCs:
+	// Actors that are currently following or targeting something (e.g., companions, guards)
+	struct FollowingNPCData
+	{
+		UInt32 actorFormID;
+		UInt32 targetFormID;   // The target this NPC is following/attacking
+		bool hasInjectedPackage;
+		float lastFollowUpdateTime;
+		int reinforceCount;
+		bool isValid;
+		bool inMeleeRange;          // True when horse is close enough for melee
+		bool inAttackPosition;      // True when horse has turned sideways (90 deg)
+	};
+	
+	static FollowingNPCData g_followingNPCs[5];
+	static int g_followingNPCCount = 0;
+	
+	// Mount Tracking arrays (forward declaration for ResetCombatStylesCache)
+	static UInt32 g_controlledMounts[5] = {0};
+	static int g_controlledMountCount = 0;
+	
+	// Hit Detection arrays (forward declaration for ResetCombatStylesCache)
+	struct MountedAttackHitData
+	{
+		UInt32 riderFormID;
+		bool hitRegistered;
+		bool isPowerAttack;
+		float attackStartTime;
 		bool isValid;
 	};
 	
-	static RiderAttackData g_riderAttackData[5];
-	static int g_riderAttackCount = 0;
+	static MountedAttackHitData g_hitData[5];
+	static int g_hitDataCount = 0;
+	
+	// Animation timing constants
+	const float ATTACK_ANIMATION_WINDUP = 0.4f;   // Time before hit can register (animation wind-up)
+	const float ATTACK_ANIMATION_WINDOW = 0.8f;   // Window during which hit can register (0.4 - 1.2 seconds)
+	
+	// ============================================
+	// BLOCK STAGGER SPELL (forward declarations for cache reset)
+	// Applied to rider when their attack is blocked
+	// From MountedNPCCombat.esp (ESL flagged)
+	// Uses the same stagger spell as SpecialDismount (0x08ED)
+	// ============================================
+	
+	static const UInt32 BLOCK_STAGGER_SPELL_BASE_FORMID = 0x08ED;  // Stagger spell (same as SpecialDismount)
+	static const char* BLOCK_STAGGER_ESP_NAME = "MountedNPCCombat.esp";
+	static SpellItem* g_blockStaggerSpell = nullptr;
+	static bool g_blockStaggerSpellInitialized = false;
+	
+	// ============================================
+	// Reset CombatStyles Cache
+	// Called on game load/reload to clear stale pointers
+	// ============================================
+	
+	void ResetCombatStylesCache()
+	{
+		_MESSAGE("CombatStyles: === RESETTING CACHE ===");
+		
+		// Reset cached animation forms (they become invalid after reload)
+		g_idleAttackLeft = nullptr;
+		g_idleAttackRight = nullptr;
+		g_idlePowerAttackLeft = nullptr;
+		g_idlePowerAttackRight = nullptr;
+		g_attackAnimsInitialized = false;
+		
+		// Reset cached spell (becomes invalid after reload)
+		g_blockStaggerSpell = nullptr;
+		g_blockStaggerSpellInitialized = false;
+		
+		// Reset combat styles initialization flag
+		g_combatStylesInitialized = false;
+		
+		// Clear all following NPC data
+		for (int i = 0; i < 5; i++)
+		{
+			g_followingNPCs[i].isValid = false;
+		}
+		g_followingNPCCount = 0;
+		
+		// Clear all rider attack data
+		for (int i = 0; i < 5; i++)
+		{
+			g_riderAttackData[i].isValid = false;
+		}
+		g_riderAttackCount = 0;
+		
+		// Clear all hit detection data
+		for (int i = 0; i < 5; i++)
+		{
+			g_hitData[i].isValid = false;
+		}
+		g_hitDataCount = 0;
+		
+		// Clear controlled mounts
+		for (int i = 0; i < 5; i++)
+		{
+			g_controlledMounts[i] = 0;
+		}
+		g_controlledMountCount = 0;
+		
+		_MESSAGE("CombatStyles: Cache reset complete");
+	}
 	
 	// ============================================
 	// Attack Animation Functions
@@ -296,11 +407,19 @@ namespace MountedNPCCombatVR
 				animName = "LEFT";
 				attackType = "POWER";
 			}
-			else
+			else if (g_idleAttackLeft)
 			{
 				idleToPlay = g_idleAttackLeft;
 				animName = "LEFT";
 				attackType = "normal";
+			}
+			else if (g_idlePowerAttackLeft)
+			{
+				// Fallback: use power attack if normal attack unavailable
+				idleToPlay = g_idlePowerAttackLeft;
+				animName = "LEFT";
+				attackType = "POWER (fallback)";
+				isPowerAttack = true;  // Treat as power attack for damage
 			}
 		}
 		else if (strcmp(targetSide, "RIGHT") == 0)
@@ -311,11 +430,19 @@ namespace MountedNPCCombatVR
 				animName = "RIGHT";
 				attackType = "POWER";
 			}
-			else
+			else if (g_idleAttackRight)
 			{
 				idleToPlay = g_idleAttackRight;
 				animName = "RIGHT";
 				attackType = "normal";
+			}
+			else if (g_idlePowerAttackRight)
+			{
+				// Fallback: use power attack if normal attack unavailable
+				idleToPlay = g_idlePowerAttackRight;
+				animName = "RIGHT";
+				attackType = "POWER (fallback)";
+				isPowerAttack = true;  // Treat as power attack for damage
 			}
 		}
 		else
@@ -375,10 +502,8 @@ namespace MountedNPCCombatVR
 	
 	// ============================================
 	// Mount Tracking (for cleanup purposes only)
+	// Note: g_controlledMounts and g_controlledMountCount defined earlier
 	// ============================================
-	
-	static UInt32 g_controlledMounts[5] = {0};
-	static int g_controlledMountCount = 0;
 	
 	void ReleaseAllMountControl()
 	{
@@ -388,22 +513,8 @@ namespace MountedNPCCombatVR
 
 	// ============================================
 	// Follow Target Tracking
+	// Note: FollowingNPCData struct and g_followingNPCs defined earlier
 	// ============================================
-	
-	struct FollowingNPCData
-	{
-		UInt32 actorFormID;
-		UInt32 targetFormID;   // The target this NPC is following/attacking
-		bool hasInjectedPackage;
-		float lastFollowUpdateTime;
-		int reinforceCount;
-		bool isValid;
-		bool inMeleeRange;          // True when horse is close enough for melee
-		bool inAttackPosition;      // True when horse has turned sideways (90 deg)
-	};
-	
-	static FollowingNPCData g_followingNPCs[5];
-	static int g_followingNPCCount = 0;
 	
 	int FindFollowingNPCSlot(UInt32 formID)
 	{
@@ -463,6 +574,63 @@ namespace MountedNPCCombatVR
 			g_combatStylesInitialized = true;
 		}
 		
+		// ============================================
+		// INITIAL WEAPON EQUIP - DISTANCE BASED!
+		// Calculate distance to target and equip appropriate weapon
+		// ============================================
+		float dx = target->pos.x - actor->pos.x;
+		float dy = target->pos.y - actor->pos.y;
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		
+		// Force initial weapon equip based on distance (bypass cooldown for first equip)
+		bool hasMelee = HasMeleeWeaponInInventory(actor);
+		bool hasBow = HasBowInInventory(actor);
+		bool wantMelee = (distanceToTarget <= WeaponSwitchDistance);
+		
+		if (wantMelee)
+		{
+			// Close range - equip melee
+			if (hasMelee)
+			{
+				EquipBestMeleeWeapon(actor);
+				_MESSAGE("CombatStyles: Initial equip MELEE for '%s' (dist: %.0f)", 
+					actorName ? actorName : "Unknown", distanceToTarget);
+			}
+			else
+			{
+				// No melee - give default
+				GiveDefaultMountedWeapon(actor);
+				_MESSAGE("CombatStyles: Initial equip DEFAULT MELEE for '%s' (dist: %.0f)", 
+					actorName ? actorName : "Unknown", distanceToTarget);
+			}
+		}
+		else
+		{
+			// Far range - equip bow if available
+			if (hasBow)
+			{
+				EquipBestBow(actor);
+				EquipArrows(actor);
+				_MESSAGE("CombatStyles: Initial equip BOW for '%s' (dist: %.0f)", 
+					actorName ? actorName : "Unknown", distanceToTarget);
+			}
+			else if (hasMelee)
+			{
+				// No bow, use melee instead
+				EquipBestMeleeWeapon(actor);
+				_MESSAGE("CombatStyles: Initial equip MELEE (no bow) for '%s' (dist: %.0f)", 
+					actorName ? actorName : "Unknown", distanceToTarget);
+			}
+			else
+			{
+				// No weapons at all - give default
+				GiveDefaultMountedWeapon(actor);
+				_MESSAGE("CombatStyles: Initial equip DEFAULT (no weapons) for '%s' (dist: %.0f)", 
+					actorName ? actorName : "Unknown", distanceToTarget);
+			}
+		}
+		
+		// Now draw the weapon
 		SetWeaponDrawn(actor, true);
 		actor->flags2 |= Actor::kFlag_kAttackOnSight;
 		
@@ -482,11 +650,6 @@ namespace MountedNPCCombatVR
 			g_followingNPCCount++;
 		}
 	}
-	
-	// REMOVED: Single-argument overload that defaulted to player
-	// This was causing guards to target the player instead of hostiles!
-	// void SetNPCFollowTarget(Actor* actor) - DO NOT USE
-	// Always use SetNPCFollowTarget(actor, target) with explicit target
 	
 	void ClearNPCFollowTarget(Actor* actor)
 	{
@@ -620,13 +783,43 @@ namespace MountedNPCCombatVR
 			
 			// ============================================
 			// GET THE TARGET FOR THIS NPC
+			// First check the actor's ACTUAL combat target from the game
+			// Then fall back to stored target
 			// ============================================
 			Actor* target = nullptr;
-			UInt32 targetFormID = g_followingNPCs[i].targetFormID;
+			UInt32 storedTargetFormID = g_followingNPCs[i].targetFormID;
 			
-			if (targetFormID != 0)
+			// ============================================
+			// PRIORITY 1: Check the actor's actual combat target
+			// This allows the game AI to switch targets naturally
+			// ============================================
+			UInt32 combatTargetHandle = actor->currentCombatTarget;
+			if (combatTargetHandle != 0)
 			{
-				TESForm* targetForm = LookupFormByID(targetFormID);
+				NiPointer<TESObjectREFR> targetRef;
+				LookupREFRByHandle(combatTargetHandle, targetRef);
+				if (targetRef && targetRef->formType == kFormType_Character)
+				{
+					Actor* combatTarget = static_cast<Actor*>(targetRef.get());
+					if (combatTarget && !combatTarget->IsDead(1))
+					{
+						target = combatTarget;
+						
+						// Update stored target if it changed
+						if (combatTarget->formID != storedTargetFormID)
+						{
+							g_followingNPCs[i].targetFormID = combatTarget->formID;
+						}
+					}
+				}
+			}
+			
+			// ============================================
+			// PRIORITY 2: Fall back to stored target
+			// ============================================
+			if (!target && storedTargetFormID != 0)
+			{
+				TESForm* targetForm = LookupFormByID(storedTargetFormID);
 				if (targetForm && targetForm->formType == kFormType_Character)
 				{
 					target = static_cast<Actor*>(targetForm);
@@ -634,22 +827,23 @@ namespace MountedNPCCombatVR
 					if (target->IsDead(1))
 					{
 						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-						_MESSAGE("CombatStyles: Target died - NPC '%s' disengaging",
+						_MESSAGE("CombatStyles: Target died - NPC '%s' looking for new target",
 							actorName ? actorName : "Unknown");
-						ClearNPCFollowTarget(actor);
-						continue;
+						target = nullptr;
+						g_followingNPCs[i].targetFormID = 0;
 					}
 				}
 				else
 				{
-					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-					_MESSAGE("CombatStyles: Target invalid - NPC '%s' disengaging",
-						actorName ? actorName : "Unknown");
-					ClearNPCFollowTarget(actor);
-					continue;
+					// Target form invalid - clear it
+					g_followingNPCs[i].targetFormID = 0;
 				}
 			}
-			else
+			
+			// ============================================
+			// PRIORITY 3: Default to player if no target
+			// ============================================
+			if (!target)
 			{
 				if (g_thePlayer && (*g_thePlayer))
 				{
@@ -664,12 +858,16 @@ namespace MountedNPCCombatVR
 			
 			// ============================================
 			// CHECK DISTANCE - DISENGAGE IF TOO FAR (3500 units)
+			// SKIP FOR COMPANIONS - let game AI handle their targeting
 			// ============================================
 			float dx = target->pos.x - actor->pos.x;
 			float dy = target->pos.y - actor->pos.y;
 			float distanceToTarget = sqrt(dx * dx + dy * dy);
 			
-			if (distanceToTarget > MAX_COMBAT_DISTANCE)
+			// Check if this is a companion (skip disengage for companions)
+			bool isCompanion = IsCompanion(actor);
+			
+			if (!isCompanion && distanceToTarget > MAX_COMBAT_DISTANCE)
 			{
 				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 				_MESSAGE("CombatStyles: Target too far (%.0f) - NPC '%s' disengaging",
@@ -698,7 +896,7 @@ namespace MountedNPCCombatVR
 			if (attackState == 2 && !wasInAttackPosition)
 			{
 				_MESSAGE("CombatStyles: NPC %08X entered ATTACK POSITION", actor->formID);
-			}
+		}
 			
 			actor->flags2 |= Actor::kFlag_kAttackOnSight;
 		}
@@ -758,7 +956,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Combat Styles
 	// ============================================
-	
+
 	namespace GuardCombat
 	{
 		MountedCombatState DetermineState(Actor* actor, Actor* mount, Actor* target, MountedWeaponInfo* weaponInfo)
@@ -781,83 +979,20 @@ namespace MountedNPCCombatVR
 			
 			float currentTime = GetCurrentGameTime();
 			
-			// Wait for weapon draw delay, then draw weapon and start following
+			// Wait for weapon draw delay, then start following
 			if (!npcData->weaponDrawn)
 			{
 				if ((currentTime - npcData->combatStartTime) >= WEAPON_DRAW_DELAY)
 				{
-					// ============================================
-					// CHECK IF THIS IS A CAPTAIN - SKIP MELEE WEAPON LOGIC
-					// Captains are forced to RANGED role in MultiMountedCombat
-					// ============================================
-					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-					bool isCaptain = false;
-					if (actorName && strstr(actorName, "Captain") != nullptr)
-					{
-						isCaptain = true;
-						_MESSAGE("CombatStyles: '%s' is a CAPTAIN - skipping melee weapon setup (will use bow)", actorName);
-					}
+					// NOTE: Weapon equipping handled by centralized system in DynamicPackages
+					// Just mark as ready and start following
+					npcData->weaponDrawn = true;
+					npcData->weaponInfo = GetWeaponInfo(actor);
 					
-					bool hasWeapon = HasWeaponAvailable(actor);
-					bool hasMeleeInInventory = HasMeleeWeaponInInventory(actor);
-					
-					// If no weapon equipped but has melee in inventory, equip it (unless Captain)
-					if (!isCaptain && !hasWeapon && hasMeleeInInventory)
+					// Start the follow behavior - USE THE ACTUAL TARGET, not player!
+					if (target)
 					{
-						_MESSAGE("CombatStyles: NPC '%s' (%08X) has melee in inventory - equipping it", 
-							actorName ? actorName : "Unknown", actor->formID);
-						EquipBestMeleeWeapon(actor);
-						hasWeapon = HasWeaponAvailable(actor);
-					}
-					
-					// If still no weapon, give them an Iron Mace (unless Captain)
-					if (!isCaptain && !hasWeapon && !hasMeleeInInventory)
-					{
-						_MESSAGE("CombatStyles: NPC '%s' (%08X) has NO suitable weapons - giving Iron Mace", 
-							actorName ? actorName : "Unknown", actor->formID);
-						
-						if (GiveDefaultMountedWeapon(actor))
-						{
-							hasWeapon = HasWeaponAvailable(actor);
-						}
-					}
-					
-					// For Captains, let MultiMountedCombat handle weapon setup
-					if (isCaptain)
-					{
-						hasWeapon = true;  // Skip weapon check - bow will be equipped by multi-combat
-					}
-					
-					if (hasWeapon || isCaptain)
-					{
-						SetWeaponDrawn(actor, true);
-						npcData->weaponDrawn = true;
-						npcData->weaponInfo = GetWeaponInfo(actor);
-						
-						// Start the follow behavior - USE THE ACTUAL TARGET, not player!
-						if (target)
-						{
-							_MESSAGE("CombatStyles: NPC %08X drew weapon - following target %08X", 
-								actor->formID, target->formID);
-							SetNPCFollowTarget(actor, target);
-						}
-						else
-						{
-							// No target? Log this problem
-							_MESSAGE("CombatStyles: NPC %08X drew weapon but has NO TARGET!", actor->formID);
-						}
-					}
-					else
-					{
-						// Still no weapon even after trying to give one - set up follow anyway
-						_MESSAGE("CombatStyles: NPC '%s' (%08X) UNARMED (couldn't give weapon) - setting up follow anyway", 
-							actorName ? actorName : "Unknown", actor->formID);
-						npcData->weaponDrawn = true;  // Mark as done so we don't keep trying
-						
-						if (target)
-						{
-							SetNPCFollowTarget(actor, target);
-						}
+						SetNPCFollowTarget(actor, target);
 					}
 				}
 				return;
@@ -917,19 +1052,6 @@ namespace MountedNPCCombatVR
 		}
 	}
 	
-	namespace HunterCombat
-	{
-		MountedCombatState DetermineState(Actor* actor, Actor* mount, Actor* target, MountedWeaponInfo* weaponInfo)
-		{
-			return GuardCombat::DetermineState(actor, mount, target, weaponInfo);
-		}
-		
-		void ExecuteBehavior(MountedNPCData* npcData, Actor* actor, Actor* mount, Actor* target)
-		{
-			GuardCombat::ExecuteBehavior(npcData, actor, mount, target);
-		}
-	}
-	
 	namespace MageCombat
 	{
 		MountedCombatState DetermineState(Actor* actor, Actor* mount, Actor* target, MountedWeaponInfo* weaponInfo)
@@ -945,22 +1067,11 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Mounted Attack Hit Detection
 	// Called during attack animation to check if weapon hits target
+	// Note: MountedAttackHitData struct and g_hitData defined earlier
 	// ============================================
 	
 	// Actor Value IDs
 	static const UInt32 AV_Health = 24;
-	
-	struct MountedAttackHitData
-	{
-		UInt32 riderFormID;
-		bool hitRegistered;// Already dealt damage this attack
-		bool isPowerAttack;      // Was this a power attack?
-		float attackStartTime;
-		bool isValid;
-	};
-	
-	static MountedAttackHitData g_hitData[5];
-	static int g_hitDataCount = 0;
 	
 	MountedAttackHitData* GetOrCreateHitData(UInt32 riderFormID)
 	{
@@ -1025,10 +1136,244 @@ namespace MountedNPCCombatVR
 		return (float)weapon->damage.GetAttackDamage();
 	}
 	
+	// ============================================
+	// SOUND FORM IDs FOR HIT IMPACTS
+	// These are SOUN (TESSound) records, not SNDR
+	// ============================================
+	
+	// Sound FormID from Skyrim.esm (SOUN record)
+	static const UInt32 SOUND_UNBLOCKED_HIT = 0x0001939D;    // Unblocked hit sound
+	static const UInt32 SOUND_WEAPON_BLOCK = 0x0001939B;    // Weapon block sound
+	static const UInt32 SOUND_SHIELD_BLOCK = 0x0001939F;    // Shield block sound
+	
+	// ============================================
+	// PLAY SOUND AT ACTOR LOCATION
+	// Uses TESSound and PlaySoundEffect (Papyrus native function)
+	// ============================================
+	
+	// PlaySoundEffect function signature - same as WeaponThrowVR
+	typedef void(*_PlaySoundEffect)(VMClassRegistry* VMinternal, UInt32 stackId, TESSound* sound, TESObjectREFR* source);
+	static RelocAddr<_PlaySoundEffect> PlaySoundEffect(0x009EF150);
+	
+	// DoCombatSpellApply function - same as WeaponThrowVR (applies spell from one actor to another)
+	typedef bool(*_DoCombatSpellApply)(VMClassRegistry* registry, UInt32 stackId, Actor* akActor, SpellItem* spell, TESObjectREFR* akTarget);
+	static RelocAddr<_DoCombatSpellApply> DoCombatSpellApply(0x00992240);
+	
+	// PushActorAway function - same as WeaponThrowVR (applies knockback/stagger)
+	typedef void(*_PushActorAway)(VMClassRegistry* registry, UInt32 stackId, TESObjectREFR* akSource, Actor* akActor, float afKnockbackForce);
+	static RelocAddr<_PushActorAway> PushActorAway(0x009D0E60);
+	
+	static void PlaySoundAtActor(UInt32 soundFormID, Actor* actor)
+	{
+		if (!actor) return;
+		
+		// Look up the sound form (SOUN type)
+		TESForm* form = LookupFormByID(soundFormID);
+		if (!form) 
+		{
+			_MESSAGE("CombatStyles: Failed to find sound form %08X", soundFormID);
+			return;
+		}
+		
+		// Cast to TESSound (SOUN record)
+		TESSound* sound = DYNAMIC_CAST(form, TESForm, TESSound);
+		if (!sound)
+		{
+			_MESSAGE("CombatStyles: Form %08X is not a TESSound (type=%d, expected=%d)", 
+				soundFormID, form->formType, kFormType_Sound);
+			return;
+		}
+		
+		// Play the sound using the Papyrus native function
+		PlaySoundEffect((*g_skyrimVM)->GetClassRegistry(), 0, sound, actor);
+	}
+	
+	// ============================================
+	// INITIALIZE BLOCK STAGGER SPELL
+	// Looks up the spell from our ESP
+	// ============================================
+	
+	static bool InitBlockStaggerSpell()
+	{
+		// If already successfully initialized, return true
+		if (g_blockStaggerSpell != nullptr) return true;
+		
+		_MESSAGE("CombatStyles: Attempting to load stagger spell from %s, base FormID: %08X", 
+			BLOCK_STAGGER_ESP_NAME, BLOCK_STAGGER_SPELL_BASE_FORMID);
+		
+		UInt32 spellFormID = GetFullFormIdMine(BLOCK_STAGGER_ESP_NAME, BLOCK_STAGGER_SPELL_BASE_FORMID);
+		_MESSAGE("CombatStyles: GetFullFormIdMine returned: %08X", spellFormID);
+		
+		if (spellFormID == 0)
+		{
+			_MESSAGE("CombatStyles: ERROR - Could not resolve block stagger spell FormID from %s", BLOCK_STAGGER_ESP_NAME);
+			return false;
+		}
+		
+		TESForm* form = LookupFormByID(spellFormID);
+		if (!form)
+		{
+			_MESSAGE("CombatStyles: ERROR - LookupFormByID failed for block stagger spell %08X", spellFormID);
+			return false;
+		}
+		
+		_MESSAGE("CombatStyles: Found form, type: %d", form->formType);
+		
+		g_blockStaggerSpell = DYNAMIC_CAST(form, TESForm, SpellItem);
+		if (!g_blockStaggerSpell)
+		{
+			_MESSAGE("CombatStyles: ERROR - Form %08X is not a SpellItem (formType: %d)", spellFormID, form->formType);
+			return false;
+		}
+		
+		g_blockStaggerSpellInitialized = true;
+		_MESSAGE("CombatStyles: Successfully loaded block stagger spell from %s (FormID: %08X)", BLOCK_STAGGER_ESP_NAME, spellFormID);
+		return true;
+	}
+	
+	// ============================================
+	// APPLY BLOCK STAGGER TO RIDER
+	// Called when target successfully blocks the rider's attack
+	// Uses DoCombatSpellApply (same method as WeaponThrowVR)
+	// ============================================
+	
+	static void ApplyBlockStaggerToRider(Actor* rider, Actor* blocker)
+	{
+		if (!rider) return;
+		
+		// Temporarily allow stagger by removing mass protection for 2.5 seconds
+		AllowTemporaryStagger(rider, 2.5f);
+		
+		// Use the blocker as the source if available, otherwise fall back to player
+		Actor* spellSource = blocker;
+		if (!spellSource)
+		{
+			if (!g_thePlayer || !(*g_thePlayer))
+			{
+				_MESSAGE("CombatStyles: WARNING - Could not apply block stagger (no source)");
+				return;
+			}
+			spellSource = *g_thePlayer;
+		}
+		
+		// Use the stagger spell (same as WeaponThrowVR)
+		if (InitBlockStaggerSpell() && g_blockStaggerSpell)
+		{
+			DoCombatSpellApply((*g_skyrimVM)->GetClassRegistry(), 0, spellSource, g_blockStaggerSpell, rider);
+			_MESSAGE("CombatStyles: Applied block stagger spell to rider %08X (source: %08X)", rider->formID, spellSource->formID);
+		}
+		else
+		{
+			_MESSAGE("CombatStyles: WARNING - Could not apply block stagger spell (not initialized)");
+		}
+		
+		// NOTE: Removed PushActorAway - it was causing dismounts even at low force values
+	}
+	
+	// ============================================
+	// CHECK IF TARGET IS BLOCKING AND WITH WHAT
+	// Uses animation graph variable "IsBlocking"
+	// Returns: 0 = not blocking, 1 = blocking with weapon, 2 = blocking with shield
+	// Accounts for left-handed mode where shield is in the right hand
+	// Also checks if target is facing the attacker (can't block what you can't see)
+	// ============================================
+
+	static int GetActorBlockingType(Actor* actor, Actor* attacker = nullptr)
+	{
+		if (!actor) return 0;
+		
+		// Check animation graph variable "IsBlocking"
+		static BSFixedString isBlockingVar("IsBlocking");
+		bool isBlocking = false;
+		
+		typedef bool (*_GetGraphVariableBool)(IAnimationGraphManagerHolder* holder, const BSFixedString& varName, bool& out);
+		_GetGraphVariableBool getGraphVarBool = get_vfunc<_GetGraphVariableBool>(&actor->animGraphHolder, 0x12);
+		
+		if (getGraphVarBool)
+		{
+			getGraphVarBool(&actor->animGraphHolder, isBlockingVar, isBlocking);
+		}
+		
+		if (!isBlocking)
+		{
+			return 0;  // Not blocking
+		}
+		
+		// ============================================
+		// FIELD OF VIEW CHECK
+		// Target must be facing the attacker to block
+		// Can't block attacks from directly behind (~150 degree cone in front)
+		// ============================================
+		if (attacker)
+		{
+			// Calculate direction from target to attacker
+			float dx = attacker->pos.x - actor->pos.x;
+			float dy = attacker->pos.y - actor->pos.y;
+			float angleToAttacker = atan2(dx, dy);  // Angle from target to attacker
+			
+			// Get the direction the target is facing
+			float targetFacing = actor->rot.z;
+			
+			// Calculate angle difference
+			float angleDiff = angleToAttacker - targetFacing;
+			
+			// Normalize to -PI to PI
+			while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+			while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+			
+			// Check if attacker is within ~150 degree cone in front (75 degrees each side)
+			// fabs(angleDiff) > 1.309 radians = 75 degrees = attacker is outside frontal arc
+			const float BLOCK_FOV_HALF_ANGLE = 1.309f;  // 75 degrees in radians
+			
+			if (fabs(angleDiff) > BLOCK_FOV_HALF_ANGLE)
+			{
+				// Attacker is behind the target - can't block!
+				_MESSAGE("CombatStyles: Target %08X IS blocking but attacker is BEHIND (angle: %.1f deg) - block fails!", 
+					actor->formID, angleDiff * 57.2958f);
+				return 0;  // Treat as not blocking
+			}
+		}
+		
+		// Target IS blocking AND facing the attacker - now determine if shield or weapon
+		// Check for left-handed mode - shield is in opposite hand
+		bool leftHandedMode = (g_leftHandedMode && *g_leftHandedMode);
+		
+		// In right-handed mode: shield is in left hand (true)
+		// In left-handed mode: shield is in right hand (false)
+		bool shieldHand = !leftHandedMode;  // true = left hand, false = right hand
+		
+		TESForm* shieldHandItem = actor->GetEquippedObject(shieldHand);
+		
+		if (shieldHandItem && shieldHandItem->formType == kFormType_Armor)
+		{
+			// Armor in shield hand = shield
+			_MESSAGE("CombatStyles: Target %08X BLOCKING WITH SHIELD (leftHanded: %d)", actor->formID, leftHandedMode ? 1 : 0);
+			return 2;  // Blocking with shield
+		}
+		
+		// No shield in shield hand, but still blocking = weapon block
+		_MESSAGE("CombatStyles: Target %08X BLOCKING WITH WEAPON (leftHanded: %d)", actor->formID, leftHandedMode ? 1 : 0);
+		return 1;  // Blocking with weapon
+	}
+	
+	// Simple helper for backward compatibility
+	static bool IsActorBlocking(Actor* actor)
+	{
+		return GetActorBlockingType(actor, nullptr) > 0;
+	}
+	
 	// Apply damage to the target actor - INSTANT
 	void ApplyMountedAttackDamage(Actor* rider, Actor* target, bool isPowerAttack)
 	{
 		if (!rider || !target) return;
+		
+		// Check if target is the player or an NPC
+		bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
+		
+		// Check if target is blocking and with what
+		// 0 = not blocking, 1 = weapon block, 2 = shield block
+		// Pass rider as attacker for FOV check - can't block attacks from behind!
+		int blockType = GetActorBlockingType(target, rider);
 		
 		float baseDamage = GetRiderWeaponDamage(rider);
 		
@@ -1038,17 +1383,134 @@ namespace MountedNPCCombatVR
 			baseDamage += POWER_ATTACK_BONUS;
 		}
 		
-		target->actorValueOwner.RestoreActorValue(Actor::kDamage, AV_Health, -baseDamage);
+		// ============================================
+		// DOUBLE DAMAGE VS NON-PLAYER TARGETS
+		// NPCs fight each other with double damage to make
+		// mounted combat more effective against monsters/NPCs
+		// ============================================
+		if (!targetIsPlayer)
+		{
+			baseDamage *= 2.0f;
+		}
+		
+		// Blocking effects:
+		// - Shield block: 10% damage, costs 20 stamina
+		// - Weapon block: 25% damage, costs 30 stamina (less effective than shield)
+		// - No stamina: Full damage, no stamina cost (guard broken) - still play block sound
+		float actualDamage = baseDamage;
+		bool blockSuccessful = false;
+		bool guardBroken = false;
+		const char* blockTypeStr = "";
+		float staminaCost = 0;
+		
+		if (blockType > 0)
+		{
+			const UInt32 AV_Stamina = 26;
+			float currentStamina = target->actorValueOwner.GetCurrent(AV_Stamina);
+			
+			if (currentStamina > 0)
+			{
+				if (blockType == 2)  // Shield block
+				{
+					actualDamage = baseDamage * 0.1f;   // Only 10% damage
+					staminaCost = 20.0f;
+					blockTypeStr = "SHIELD";
+				}
+				else  // Weapon block
+				{
+					actualDamage = baseDamage * 0.25f;  // 25% damage
+					staminaCost = 30.0f;
+					blockTypeStr = "WEAPON";
+				}
+				
+				// Drain stamina from blocking the hit
+				target->actorValueOwner.RestoreActorValue(Actor::kDamage, AV_Stamina, -staminaCost);
+				blockSuccessful = true;
+			}
+			else
+			{
+				// No stamina - guard broken, full damage
+				guardBroken = true;
+			}
+		}
+		
+		// Apply damage
+		target->actorValueOwner.RestoreActorValue(Actor::kDamage, AV_Health, -actualDamage);
+		
+		// Play appropriate sound effect
+		if (blockSuccessful)
+		{
+			// Successful block - play block sound and stagger rider
+			if (blockType == 2)
+			{
+				PlaySoundAtActor(SOUND_SHIELD_BLOCK, target);  // Shield block sound
+			}
+			else
+			{
+				PlaySoundAtActor(SOUND_WEAPON_BLOCK, target);  // Weapon block sound
+			}
+			
+			// Apply stagger spell to the rider whose attack was blocked
+			// Pass target (blocker) as the spell source
+			ApplyBlockStaggerToRider(rider, target);
+		}
+		else if (guardBroken)
+		{
+			// Guard broken - play block sound (they tried to block) but NO stagger to rider
+			if (blockType == 2)
+			{
+				PlaySoundAtActor(SOUND_SHIELD_BLOCK, target);  // Shield block sound
+			}
+			else
+			{
+				PlaySoundAtActor(SOUND_WEAPON_BLOCK, target);  // Weapon block sound
+			}
+			
+			// NO ApplyBlockStaggerToRider - rider doesn't get staggered when guard is broken
+		}
+		else
+		{
+			// Unblocked hit - play hit sound
+			PlaySoundAtActor(SOUND_UNBLOCKED_HIT, target);
+		}
 		
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
 		
-		// Keep damage log but make it concise
-		_MESSAGE("CombatStyles: %s hit %s for %.0f dmg%s", 
-			riderName ? riderName : "Rider",
-			targetName ? targetName : "Target",
-			baseDamage,
-			isPowerAttack ? " (POWER)" : "");
+		// Log with blocking info and NPC damage bonus
+		if (blockType > 0)
+		{
+			if (blockSuccessful)
+			{
+				_MESSAGE("CombatStyles: %s hit %s for %.0f dmg (%s BLOCK - reduced from %.0f, -%.0f stamina)%s%s", 
+					riderName ? riderName : "Rider",
+					targetName ? targetName : "Target",
+					actualDamage,
+					blockTypeStr,
+					baseDamage,
+					staminaCost,
+					isPowerAttack ? " (POWER)" : "",
+					!targetIsPlayer ? " [2x NPC]" : "");
+			}
+			else
+			{
+				_MESSAGE("CombatStyles: %s hit %s for %.0f dmg (GUARD BROKEN - no stamina!)%s%s", 
+					riderName ? riderName : "Rider",
+					targetName ? targetName : "Target",
+					actualDamage,
+					isPowerAttack ? " (POWER)" : "",
+					!targetIsPlayer ? " [2x NPC]" : "");
+			}
+		}
+		else
+		{
+			_MESSAGE("CombatStyles: %s hit %s for %.0f dmg%s%s", 
+				riderName ? riderName : "Rider",
+				targetName ? targetName : "Target",
+				actualDamage,
+				isPowerAttack ? " (POWER)" : "",
+				!targetIsPlayer ? " [2x NPC]" : "");
+		}
 	}
 	
 	bool UpdateMountedAttackHitDetection(Actor* rider, Actor* target)
@@ -1058,8 +1520,28 @@ namespace MountedNPCCombatVR
 		MountedAttackHitData* hitData = GetOrCreateHitData(rider->formID);
 		if (!hitData) return false;
 		
+		// Already registered a hit this attack
 		if (hitData->hitRegistered) return false;
 		
+		// Check attack animation timing
+		float currentTime = GetAttackTimeSeconds();
+		float timeSinceAttackStart = currentTime - hitData->attackStartTime;
+		
+		// Hit can only register AFTER the wind-up phase (0.4 seconds)
+		// and BEFORE the attack window ends (1.2 seconds total)
+		if (timeSinceAttackStart < ATTACK_ANIMATION_WINDUP)
+		{
+			// Still in wind-up phase - too early to hit
+			return false;
+		}
+		
+		if (timeSinceAttackStart > (ATTACK_ANIMATION_WINDUP + ATTACK_ANIMATION_WINDOW))
+		{
+			// Past the attack window - missed the opportunity
+			return false;
+		}
+		
+		// We're in the valid attack window - check distance
 		float distance = 0;
 		bool inRange = CheckMountedAttackHit(rider, target, &distance);
 		
@@ -1067,7 +1549,6 @@ namespace MountedNPCCombatVR
 		{
 			hitData->hitRegistered = true;
 			ApplyMountedAttackDamage(rider, target, hitData->isPowerAttack);
-			// Removed verbose "MOUNTED HIT!" log - damage log is sufficient
 			return true;
 		}
 		

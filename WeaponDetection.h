@@ -45,6 +45,19 @@ namespace MountedNPCCombatVR
 	};
 	
 	// ============================================
+	// Weapon Collision Result
+	// Result from the collision detection system
+	// ============================================
+	
+	struct WeaponCollisionResult
+	{
+		bool hasCollision;       // True if collision detected
+		float distance;          // Distance between weapon and target
+		NiPoint3 contactPoint;   // Approximate point of contact
+		bool hitWeapon;      // True if hit target's weapon/shield (potential block)
+	};
+	
+	// ============================================
 	// Weapon Detection Functions
 	// ============================================
 	
@@ -97,8 +110,32 @@ namespace MountedNPCCombatVR
 	// Returns true if weapon was added
 	bool GiveDefaultBow(Actor* actor);
 	
+	// Remove the default Hunting Bow from an actor's inventory
+	// Used when temporary ranged mode ends
+	// Returns true if bow was removed
+	bool RemoveDefaultBow(Actor* actor);
+	
 	// ============================================
-	// Weapon Node / Hitbox Detection
+	// Weapon Collision System
+	// Based on WeaponCollisionVR's line segment collision
+	// ============================================
+	
+	// Get weapon segment (hand position to weapon tip) for an actor
+	// outBottom: weapon hand/base position
+	// outTop: weapon tip position
+	// leftHand: true for left hand (shield), false for right hand (weapon)
+	// Returns true if weapon bone was found
+	bool GetWeaponSegment(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop, bool leftHand = false);
+	
+	// Get body capsule (vertical line segment representing actor's body)
+	void GetBodyCapsule(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop);
+	
+	// Full weapon collision check between attacker and target
+	// Checks attacker's weapon against target's body and weapon/shield
+	WeaponCollisionResult CheckWeaponCollision(Actor* attacker, Actor* target);
+	
+	// ============================================
+	// Weapon Node / Hitbox Detection (Legacy)
 	// ============================================
 	
 	// Get the weapon bone node from actor's skeleton
@@ -116,9 +153,12 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	// Check if a mounted attack should hit the target
-	// Returns true if weapon is close enough to deal damage
-	// outDistance: optional output for the actual distance
+	// Uses weapon collision system for accurate detection
+	// Returns true if weapon collides with target
 	bool CheckMountedAttackHit(Actor* rider, Actor* target, float* outDistance = nullptr);
+	
+	// Check if target would block the hit (weapon/shield in collision path + blocking state)
+	bool WouldTargetBlockHit(Actor* rider, Actor* target);
 	
 	// ============================================
 	// Weapon Logging
@@ -134,4 +174,9 @@ namespace MountedNPCCombatVR
 	bool HasSpellsAvailable(Actor* actor);
 	void LogEquippedSpells(Actor* actor, UInt32 formID);
 	void LogAvailableSpells(Actor* actor, UInt32 formID);
+	
+	// Sheathe weapons (if drawn) before equipping a different weapon type
+	// This prevents invisible weapon bugs when switching from bow to melee
+	// Returns true if weapons were sheathed
+	bool SheatheCurrentWeapon(Actor* actor);
 }

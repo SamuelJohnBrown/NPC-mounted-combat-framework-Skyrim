@@ -42,9 +42,9 @@ namespace MountedNPCCombatVR
 		GuardMelee,
 		SoldierMelee,
 		BanditRanged,
-		HunterRanged,
 		MageCaster,
-		CivilianFlee
+		CivilianFlee,
+		Other           // Unknown/unclassified faction - defaults to aggressive melee behavior
 	};
 	
 	// ============================================
@@ -54,7 +54,6 @@ namespace MountedNPCCombatVR
 	extern bool g_guardInMountedCombat;
 	extern bool g_soldierInMountedCombat;
 	extern bool g_banditInMountedCombat;
-	extern bool g_hunterInMountedCombat;
 	extern bool g_mageInMountedCombat;
 	extern bool g_civilianFleeing;
 
@@ -141,6 +140,7 @@ namespace MountedNPCCombatVR
 	
 	MountedNPCData* GetOrCreateNPCData(Actor* actor);
 	MountedNPCData* GetNPCData(UInt32 formID);
+	MountedNPCData* GetNPCDataByIndex(int index);  // For iteration
 	void RemoveNPCFromTracking(UInt32 formID);
 	bool IsNPCTracked(UInt32 formID);
 	int GetTrackedNPCCount();
@@ -156,7 +156,6 @@ namespace MountedNPCCombatVR
 	bool IsSoldierFaction(Actor* actor);
 	bool IsBanditFaction(Actor* actor);
 	bool IsMageFaction(Actor* actor);
-	bool IsHunterFaction(Actor* actor);
 	bool IsCivilianFaction(Actor* actor);
 
 	// ============================================
@@ -197,6 +196,17 @@ namespace MountedNPCCombatVR
 	// Alert nearby mounted allies when a guard/soldier is attacked
 	// This makes nearby guards join the fight against the attacker
 	void AlertNearbyMountedAllies(Actor* attackedNPC, Actor* attacker);
+	
+	// ============================================
+	// REMOUNT AI SCANNING
+	// ============================================
+	// Scans for dismounted NPCs in combat within 2000 units of player
+	// and registers them with RemountAI for potential remount.
+	// Applies to ANY humanoid NPC in combat - they don't need to have
+	// been previously mounted. Called from UpdateMountedCombat.
+	// ============================================
+	
+	void ScanForDismountedNPCsInCombat();
 
 	// ============================================
 	// External System Connections

@@ -16,9 +16,9 @@ namespace MountedNPCCombatVR
 			case MountedCombatClass::GuardMelee: return "Guard (Melee/Ranged)";
 			case MountedCombatClass::SoldierMelee: return "Soldier (Melee/Ranged)";
 			case MountedCombatClass::BanditRanged: return "Bandit (Ranged/Melee)";
-			case MountedCombatClass::HunterRanged: return "Hunter (Ranged)";
 			case MountedCombatClass::MageCaster: return "Mage (Caster)";
 			case MountedCombatClass::CivilianFlee: return "Civilian (Flee)";
+			case MountedCombatClass::Other: return "Other (Unknown Faction - Aggressive)";
 			default: return "Unknown";
 		}
 	}
@@ -460,9 +460,20 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		
-		// Get base form ID
+		// ============================================
+		// DRAGON CHECK (by race - highest priority)
+		// Dragons are always hostile
+		// ============================================
+		if (IsDragon(actor)) return true;
+		
+		// Get base form ID for NPC checks
 		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
-		if (!actorBase) return false;
+		if (!actorBase) 
+		{
+			// Not a humanoid NPC - could still be a hostile creature
+			// Check if it's in combat and hostile
+			return false;
+		}
 		
 		UInt32 baseFormID = actorBase->formID;
 		
@@ -497,6 +508,9 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return "Unknown";
 		
+		// Check dragon first (by race)
+		if (IsDragon(actor)) return "Dragon";
+		
 		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
 		if (!actorBase) return "Unknown";
 		
@@ -523,6 +537,11 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
+	// Forward declaration for LogActorFactions
+	// ============================================
+	void LogActorFactions(Actor* actor);
+
+	// ============================================
 	// Combat Class Determination
 	// ============================================
 	
@@ -533,8 +552,10 @@ namespace MountedNPCCombatVR
 			return MountedCombatClass::None;
 		}
 		
+		// Log faction info (only at INFO level)
+		LogActorFactions(actor);
+		
 		// Check factions in order of specificity
-		// NOTE: These functions now check ALL factions, not just primary
 		if (IsGuardFaction(actor))
 		{
 			return MountedCombatClass::GuardMelee;
@@ -550,11 +571,6 @@ namespace MountedNPCCombatVR
 			return MountedCombatClass::BanditRanged;
 		}
 		
-		if (IsHunterFaction(actor))
-		{
-			return MountedCombatClass::HunterRanged;
-		}
-		
 		if (IsMageFaction(actor))
 		{
 			return MountedCombatClass::MageCaster;
@@ -565,15 +581,50 @@ namespace MountedNPCCombatVR
 			return MountedCombatClass::CivilianFlee;
 		}
 		
-		// Default: Check if has weapons - armed defaults to guard style
-		MountedWeaponInfo weaponInfo = GetWeaponInfo(actor);
-		if (weaponInfo.hasWeaponEquipped || weaponInfo.hasWeaponSheathed)
+		// No faction match - classify as "Other" (aggressive melee)
+		return MountedCombatClass::Other;
+	}
+
+	// ============================================
+	// LOG ALL FACTIONS FOR AN ACTOR
+	// Only logs on first detection - controlled by logging level
+	// ============================================
+	
+	void LogActorFactions(Actor* actor)
+	{
+		if (!actor) return;
+		
+		// Only log detailed faction info at INFO level (2)
+		// At WARN level (1), just log the final classification
+		if (logging < 2) return;
+		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		
+		_MESSAGE("FactionData: '%s' (%08X) - Scanning factions...", 
+			actorName ? actorName : "Unknown", actor->formID);
+		
+		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
+		if (!actorBase)
 		{
-			return MountedCombatClass::GuardMelee;  // Armed unknown = guard style
+			_MESSAGE("FactionData: ERROR - Could not get actor base form");
+			return;
 		}
 		
-		// Unarmed unknown = civilian flee
-		return MountedCombatClass::CivilianFlee;
+		// Log primary faction only
+		if (actorBase->faction)
+		{
+			const char* factionName = actorBase->faction->fullName.name.data;
+			_MESSAGE("FactionData:   Primary: '%s' (%08X)", 
+				factionName ? factionName : "(unnamed)", actorBase->faction->formID);
+		}
+		
+		// At INFO level, also log matched results (but not all factions)
+		_MESSAGE("FactionData:   Guard:%s Soldier:%s Bandit:%s Mage:%s Civilian:%s", 
+			IsGuardFaction(actor) ? "Y" : "N",
+			IsSoldierFaction(actor) ? "Y" : "N",
+			IsBanditFaction(actor) ? "Y" : "N",
+			IsMageFaction(actor) ? "Y" : "N",
+			IsCivilianFaction(actor) ? "Y" : "N");
 	}
 
 	// ============================================
@@ -587,7 +638,7 @@ namespace MountedNPCCombatVR
 		UInt8 modIndex = (factionFormID >> 24) & 0xFF;
 		UInt32 baseFactionID = factionFormID & 0x00FFFFFF;
 		
-		// Check by name first (display name, if set)
+		// Check by name first
 		const char* factionName = faction->fullName.name.data;
 		if (factionName && strlen(factionName) > 0)
 		{
@@ -600,45 +651,22 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		// Check by FormID (Skyrim.esm - verified from actual ESP data)
+		// Check by FormID (Skyrim.esm)
 		if (modIndex == 0x00)
 		{
 			switch (baseFactionID)
 			{
-				// ============================================
-				// Core Guard Factions (verified FormIDs)
-				// ============================================
-				case 0x0002BE3B:  // GuardDialogueFaction
-				case 0x00086EEE:  // IsGuardFaction
-				
-				// Hold Guard Factions
-				case 0x0002EBEE:  // GuardFactionSolitude (Haafingar)
-				case 0x000267EA:  // GuardFactionWhiterun
-				case 0x00029DB0:  // CrimeFactionHaafingar (guards respond to crimes)
-				case 0x0002816D:  // GuardFactionRiften
-				case 0x0002816C:  // GuardFactionMarkarth
-				case 0x00029DB4:  // GuardFactionFalkreath
-				case 0x0002816B:  // GuardFactionDawnstar
-				case 0x00029DB1:  // GuardFactionWindhelm
-				case 0x0002816E:  // (old GuardDialogueFaction reference, keep for safety)
-				case 0x00029DB9:  // (old GuardFactionSolitude reference, keep for safety)
-				case 0x000267E3:  // (old IsGuardFaction reference, keep for safety)
-				
-				// Additional Guard Factions
-				case 0x00104293:  // JobGuardCaptainFaction
-				case 0x000DB2E1:  // OrcGuardFaction
-				case 0x00051608:  // CaravanGuard
-				
-				// Quest/Location Guards
-				case 0x000E8DC4:  // WERoad02BodyguardFaction
-				case 0x000A4E48:  // MorthalGuardhouseFaction
-				case 0x00044D9A:  // dunDawnstarSanctuaryGuardianFaction
-				case 0x00083218:  // CWWhiterunGuardNeutralFaction
-				case 0x00027F9B:  // DA02GuardFaction
-				case 0x00027FA8:  // DA02GuardsPlayerEnemy
-				case 0x000628DB:  // MS03ChaletGuardEnemyFaction
-				case 0x000797ED:  // MQ201ExteriorGuardFaction
-				case 0x000A2C7C:  // MQ201PartyGuardFaction
+				case 0x00028713:  // GuardDialogueFaction
+				case 0x0002BE3B:  // CrimeFactionWhiterun
+				case 0x00029DB0:  // CrimeFactionSolitude
+				case 0x000267E3:  // CrimeFactionRiften
+				case 0x00029DB4:  // CrimeFactionMarkarth
+				case 0x0002816D:  // CrimeFactionWindhelm
+				case 0x00028849:  // CrimeFactionHaafingar
+				case 0x000267EA:  // CrimeFactionFalkreath
+				case 0x00028170:  // CrimeFactionPale
+				case 0x00028848:  // CrimeFactionWinterhold
+				case 0x0002816E:  // CrimeFactionHjaalmarch
 					return true;
 			}
 		}
@@ -663,8 +691,7 @@ namespace MountedNPCCombatVR
 			return true;
 		}
 		
-		// Check ALL factions in the actor's faction list
-		// TESNPC has a factions array: tArray<TESActorBaseData::FactionInfo> factions
+		// Check ALL factions
 		for (UInt32 i = 0; i < actorBase->actorData.factions.count; i++)
 		{
 			TESActorBaseData::FactionInfo factionInfo;
@@ -699,12 +726,9 @@ namespace MountedNPCCombatVR
 			std::transform(factionStr.begin(), factionStr.end(), factionStr.begin(), ::tolower);
 			
 			if (factionStr.find("soldier") != std::string::npos ||
-				factionStr.find("imperial") != std::string::npos ||
 				factionStr.find("stormcloak") != std::string::npos ||
-				factionStr.find("legion") != std::string::npos ||
-				factionStr.find("thalmor") != std::string::npos ||
-				factionStr.find("penitus") != std::string::npos ||
-				factionStr.find("sons of skyrim") != std::string::npos)
+				factionStr.find("imperial") != std::string::npos ||
+				factionStr.find("legion") != std::string::npos)
 			{
 				return true;
 			}
@@ -715,23 +739,10 @@ namespace MountedNPCCombatVR
 		{
 			switch (baseFactionID)
 			{
-				case 0x000D0607:  // MQ101SoldierFaction
-				case 0x000E1B85:  // MQ301SoldierDialogueFaction
-				case 0x000E0361:  // CWSoldierNoGuardDialogueFaction
-				case 0x000B34D3:  // CWSoldierPlayerEnemyFaction
-				case 0x000ABCE8:  // CWSoldierMageFaction
-				case 0x000ABCE7:  // CWSoldierArcherFaction
-				case 0x00083214:  // CWSoldierDefenderFaction
-				case 0x00083215:  // CWSoldierAttackerFaction
-				case 0x0003C37F:  // dunForelhostSoldierNeutral
-				case 0x0003C380:  // dunForelhostSoldierUnfriendly
-				case 0x0006D154:  // CWDialogueSoldierWaitingToDefendFaction
-				case 0x0006D155:  // CWDialogueSoldierWaitingToAttackFaction
-				case 0x0003ED94:// CWDialogueSoldierFaction
-				case 0x000DEBA5:  // MQ104SoldierFaction
-				case 0x000EE630:  // CWDisaffectedSoldierFaction
-				case 0x000D0603:  // MQ103SonsOfSkyrimSoldierFaction
-				case 0x000D0602:  // MQ103ImperialSoldierFaction
+				case 0x00028849:  // CWImperialFaction
+				case 0x00028848:  // CWSonsFaction (Stormcloaks)
+				case 0x0002BF9A:  // CWImperialSoldierFaction
+				case 0x0002BF9B:  // CWSonsSoldierFaction
 					return true;
 			}
 		}
@@ -792,7 +803,8 @@ namespace MountedNPCCombatVR
 			
 			if (factionStr.find("bandit") != std::string::npos ||
 				factionStr.find("forsworn") != std::string::npos ||
-				factionStr.find("silver hand") != std::string::npos)
+				factionStr.find("outlaw") != std::string::npos ||
+				factionStr.find("thief") != std::string::npos)
 			{
 				return true;
 			}
@@ -804,17 +816,8 @@ namespace MountedNPCCombatVR
 			switch (baseFactionID)
 			{
 				case 0x0001BCC0:  // BanditFaction
-				case 0x000E0CD7:  // BanditAllyFaction
-				case 0x000F6A9E:  // BanditFriendFaction
-				case 0x00039FB2:  // dunRobbersGorgeBanditFaction
-				case 0x0001B1EC:  // dunValtheimKeepBanditFaction
-				case 0x000E8D58:  // WE20BanditFaction
-				case 0x000E7ECC:  // WE19BanditFaction
-				case 0x000D1978:  // WE06BanditFaction
-				case 0x00033538:  // dunIcerunnerBanditFaction
-				case 0x00026B0B:  // MS07BanditFaction
-				case 0x00065BF0:  // MS07BanditSiblings
-				case 0x0006D2E4:  // DunAnsilvundBanditFaction
+				case 0x00043599:  // ForswornFaction
+				case 0x00105C20:  // BanditAllyFaction
 					return true;
 			}
 		}
@@ -874,12 +877,10 @@ namespace MountedNPCCombatVR
 			std::transform(factionStr.begin(), factionStr.end(), factionStr.begin(), ::tolower);
 			
 			if (factionStr.find("mage") != std::string::npos ||
-				factionStr.find("warlock") != std::string::npos ||
 				factionStr.find("wizard") != std::string::npos ||
+				factionStr.find("warlock") != std::string::npos ||
 				factionStr.find("necromancer") != std::string::npos ||
-				factionStr.find("witch") != std::string::npos ||
-				factionStr.find("enchanter") != std::string::npos ||
-				factionStr.find("court wizard") != std::string::npos)
+				factionStr.find("college") != std::string::npos)
 			{
 				return true;
 			}
@@ -890,22 +891,8 @@ namespace MountedNPCCombatVR
 		{
 			switch (baseFactionID)
 			{
-				case 0x00027EB6:  // WarlockFaction
-				case 0x000E8282:  // WarlockAllyFaction
-				case 0x000E8D57:  // WE20WarlockFaction
-				case 0x0002C6C8:// NecromancerFaction
-				case 0x00066124:  // JobCourtWizardFaction
-				case 0x00028848:  // CollegeofWinterholdArchMageFaction
-				case 0x00106433:  // dunPOIWitchAniseCrimeFaction
-				case 0x000A7AA5:  // dunMarkarthWizard_SpiderFaction
-				case 0x000AA06E:  // ServicesDawnstarCourtWizard
-				case 0x000C7C87:  // WICraftItem02AdditionalEnchanterFaction
-				case 0x00019A15:  // ServicesMarkarthCastleWizard
-				case 0x00068447:  // MarkarthWizardFaction
-				case 0x00039F09:  // dunHarmugstahlFactionWarlockAttackedbySpiders
-				case 0x00039F08:  // dunHarmugstahlFactionWarlock
-				case 0x00097D66:  // dunFellglow_WarlockPrisonerAllyFaction
-				case 0x000A7AA6:  // dunMarkarthWizard_SecureAreaFaction
+				case 0x00028848:  // WarlockFaction (placeholder)
+				case 0x00039F26:  // CollegeOfWinterholdFaction
 					return true;
 			}
 		}
@@ -914,7 +901,7 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
-	// Mage/Warlock Faction Check - NOW CHECKS ALL FACTIONS
+	// Mage Faction Check - NOW CHECKS ALL FACTIONS
 	// ============================================
 	
 	bool IsMageFaction(Actor* actor)
@@ -947,85 +934,8 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
-	// Helper: Check if a single faction matches hunter criteria
-	// ============================================
-	static bool IsHunterFactionByFormID(TESFaction* faction)
-	{
-		if (!faction) return false;
-		
-		UInt32 factionFormID = faction->formID;
-		UInt8 modIndex = (factionFormID >> 24) & 0xFF;
-		UInt32 baseFactionID = factionFormID & 0x00FFFFFF;
-		
-		// Check by name first
-		const char* factionName = faction->fullName.name.data;
-		if (factionName && strlen(factionName) > 0)
-		{
-			std::string factionStr = factionName;
-			std::transform(factionStr.begin(), factionStr.end(), factionStr.begin(), ::tolower);
-			
-			if (factionStr.find("hunter") != std::string::npos ||
-				factionStr.find("hircine") != std::string::npos ||
-				factionStr.find("bounty") != std::string::npos)
-			{
-				return true;
-			}
-		}
-		
-		// Check by FormID (Skyrim.esm)
-		if (modIndex == 0x00)
-		{
-			switch (baseFactionID)
-			{
-				case 0x000C6CD4:  // HunterFaction
-				case 0x000E68DE:  // WEDL09HunterFaction
-				case 0x000E3A01:  // WEBountyHunter
-				case 0x000D2B8A:  // DialogueOrcHuntersFaction
-				case 0x000DDF44:  // WEServicesHunterFaction
-				case 0x000E26F6:  // WE16HunterFaction
-				case 0x0002ACE1:  // DA05HuntersOfHircineFaction
-					return true;
-			}
-		}
-		
-		return false;
-	}
-
-	// ============================================
-	// Hunter Faction Check - NOW CHECKS ALL FACTIONS
-	// ============================================
-	
-	bool IsHunterFaction(Actor* actor)
-	{
-		if (!actor) return false;
-		
-		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
-		if (!actorBase) return false;
-		
-		// Check primary faction first
-		if (actorBase->faction && IsHunterFactionByFormID(actorBase->faction))
-		{
-			return true;
-		}
-		
-		// Check ALL factions
-		for (UInt32 i = 0; i < actorBase->actorData.factions.count; i++)
-		{
-			TESActorBaseData::FactionInfo factionInfo;
-			if (actorBase->actorData.factions.GetNthItem(i, factionInfo))
-			{
-				if (factionInfo.faction && IsHunterFactionByFormID(factionInfo.faction))
-				{
-					return true;
-				}
-			}
-		}
-		
-		return false;
-	}
-
-	// ============================================
 	// Helper: Check if a single faction matches civilian criteria
+	// (Now includes former Hunter faction types)
 	// ============================================
 	static bool IsCivilianFactionByFormID(TESFaction* faction)
 	{
@@ -1042,30 +952,13 @@ namespace MountedNPCCombatVR
 			std::string factionStr = factionName;
 			std::transform(factionStr.begin(), factionStr.end(), factionStr.begin(), ::tolower);
 			
-			// Passive/Civilian faction keywords
 			if (factionStr.find("citizen") != std::string::npos ||
 				factionStr.find("civilian") != std::string::npos ||
+				factionStr.find("townsfolk") != std::string::npos ||
 				factionStr.find("merchant") != std::string::npos ||
 				factionStr.find("farmer") != std::string::npos ||
-				factionStr.find("bard") != std::string::npos ||
-				factionStr.find("pilgrim") != std::string::npos ||
-				factionStr.find("traveler") != std::string::npos ||
-				factionStr.find("beggar") != std::string::npos ||
-				factionStr.find("servant") != std::string::npos ||
-				factionStr.find("priest") != std::string::npos ||
-				factionStr.find("noble") != std::string::npos ||
-				factionStr.find("courier") != std::string::npos ||
-				factionStr.find("innkeeper") != std::string::npos ||
-				factionStr.find("shopkeeper") != std::string::npos ||
-				factionStr.find("vendor") != std::string::npos ||
-				factionStr.find("miner") != std::string::npos ||
-				factionStr.find("fisher") != std::string::npos ||
-				factionStr.find("lumberjack") != std::string::npos ||
-				factionStr.find("blacksmith") != std::string::npos ||
-				factionStr.find("apothecary") != std::string::npos ||
-				factionStr.find("worker") != std::string::npos ||
-				factionStr.find("shopper") != std::string::npos ||
-				factionStr.find("services") != std::string::npos)
+				factionStr.find("hunter") != std::string::npos ||   // Hunters now civilian
+				factionStr.find("hircine") != std::string::npos)    // Hunters of Hircine
 			{
 				return true;
 			}
@@ -1076,72 +969,18 @@ namespace MountedNPCCombatVR
 		{
 			switch (baseFactionID)
 			{
-				// Job Factions (General)
-				case 0x00051596:  // JobMinerFaction
-				case 0x00051599:  // JobMerchantFaction
-				case 0x00051597:  // JobFarmerFaction
-				case 0x00051594:  // JobBlacksmithFaction
-				case 0x00051595:  // JobApothecaryFaction
-				case 0x00051598:  // JobInnkeeperFaction
-				case 0x0001032F:  // FavorJobsBeggarsFaction
-				// Farmer/Fisher Factions
-				case 0x000E1697:  // WEFarmerFaction
-				case 0x0005229B:  // FishermanFaction
-				case 0x00092A29:  // RiftenFisheryFaction
-				// Merchant Factions
-				case 0x000E68EF:  // WEJSMerchantHorseFaction
-				case 0x000DDF43:  // WEServiceMiscMerchant
-				case 0x0001F6AC:  // CaravanMerchant
-				// Miner Factions
-				case 0x00044D9D:  // DawnstarQuicksilverMinerFaction
-				case 0x00044D9C:  // DawnstarIronBreakerMinersFaction
-				case 0x00029786:  // MG02MinerFaction
-				case 0x00068B95:  // LeftHandMinersBarracksFaction
-				case 0x00068B96:  // KarthwastenMinersBarracksFaction
-				// Blacksmith Factions
-				case 0x000A7AA8:  // MarkarthCastleBlacksmithFaction
-				case 0x000878A7:  // SolitudeBlacksmithFaction
-				case 0x00039D7E:  // WindhelmBlacksmithFaction
-				case 0x000878A6:  // ServicesSolitudeBlacksmith
-				case 0x00039D6A:  // ServicesWindhelmBlacksmith
-				case 0x000A9638:  // ServicesMorKhazgurBlacksmith
-				case 0x000A9631:  // ServicesDushnikhYalBlacksmith
-				case 0x00019E18:  // ServicesMarkarthBlacksmith
-				case 0x00068BC8:  // ServicesFalkreathBlacksmith
-				case 0x000A7AA9:  // ServicesMarkarthCastleBlacksmith
-				case 0x000867F9:  // ServicesSpouseRiftenBlacksmith
-				case 0x000867FB:  // ServicesSpouseWindhelmBlacksmith
-				case 0x000867FD:  // ServicesSpouseSolitudeBlacksmith
-				case 0x000867FF:  // ServicesSpouseWhiterunBlacksmith
-				case 0x00086803:  // ServicesSpouseMarkarthBlacksmith
-				// Innkeeper Factions
-				case 0x000A4E47:  // KynesgroveBraidwoodInnkeeperFaction
-				case 0x00099157:  // WindhelmCornerclubInnkeeperFaction
-				case 0x000867F8:  // ServicesSpouseRiftenInnkeeper
-				case 0x000867FA:  // ServicesSpouseWindhelmInnkeeper
-				case 0x000867FC:  // ServicesSpouseSolitudeInnkeeper
-				case 0x000867FE:  // ServicesSpouseWhiterunInnkeeper
-				case 0x00086800:  // ServicesSpouseMarkarthInnkeeper
-				// Apothecary Factions
-				case 0x000AA06D:  // ServicesDawnstarUsefulThingsApothecary
-				case 0x00039D7F:  // WindhelmApothecaryFaction
-				case 0x000867E5:  // ServicesSpouseRiftenApothecary
-				case 0x000867E7:  // ServicesSpouseWindhelmApothecary
-				case 0x000867E9:  // ServicesSpouseSolitudeApothecary
-				case 0x000867EB:  // ServicesSpouseWhiterunApothecary
-				case 0x00086801:  // ServicesSpouseMarkarthApothecary
-				// Worker/Servant Factions
-				case 0x000878A8:  // MarkarthSmelterWorkersFaction
-				case 0x00068458:  // MarkarthSilverBloodInnWorkerFaction
-				case 0x00039D75:  // WindhelmCandlehearthWorkers
-				case 0x00029DA4:  // MarkarthCastleServantsFaction
-				case 0x00082DD9:  // WhiterunDragonsreachServants
-				case 0x00029D95:  // SolitudeBluePalaceServants
-				// Other Civilian Factions
-				case 0x0002E6EC:  // CWCivilianFaction
-				case 0x00019E17:  // ServicesMarkarthFoodMerchant
-				case 0x0008A645:  // WhiterunMarketShoppers
-				case 0x00078921:  // WindhelmPawnshopOwnerFaction
+				case 0x00013793:  // TownWhiterunFaction
+				case 0x00029DB1:  // TownSolitudeFaction  
+				case 0x000267E4:  // TownRiftenFaction
+				case 0x00029DB5:  // TownMarkarthFaction
+				case 0x0002816F:  // TownWindhelmFaction
+				case 0x000C6CD4:  // HunterFaction (now civilian)
+				case 0x000E68DE:  // WEDL09HunterFaction (now civilian)
+				case 0x000E3A01:  // WEBountyHunter (now civilian)
+				case 0x000D2B8A:  // DialogueOrcHuntersFaction (now civilian)
+				case 0x000DDF44:  // WEServicesHunterFaction (now civilian)
+				case 0x000E26F6:  // WE16HunterFaction (now civilian)
+				case 0x0002ACE1:  // DA05HuntersOfHircineFaction (now civilian)
 					return true;
 			}
 		}
@@ -1151,7 +990,6 @@ namespace MountedNPCCombatVR
 
 	// ============================================
 	// Civilian Faction Check - NOW CHECKS ALL FACTIONS
-	// NOTE: Only returns true if NO combat factions found
 	// ============================================
 	
 	bool IsCivilianFaction(Actor* actor)
@@ -1161,7 +999,7 @@ namespace MountedNPCCombatVR
 		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
 		if (!actorBase) return false;
 		
-		// First, make sure we DON'T have any combat factions
+		// IMPORTANT: If actor belongs to a combat faction, they're NOT civilian
 		// (This is called last in DetermineCombatClass, but double-check)
 		// This prevents a guard captain from being marked civilian just because
 		// they also belong to a civilian faction
@@ -1192,5 +1030,108 @@ namespace MountedNPCCombatVR
 		}
 		
 		return hasCivilianFaction;
+	}
+	
+	// ============================================
+	// DRAGON DETECTION (By Race)
+	// Dragons don't have a simple FormID list - detect by race name
+	// ============================================
+	
+	bool IsDragon(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		// Get the actor's race
+		TESRace* race = actor->race;
+		if (!race) return false;
+		
+		// Check race name
+		const char* raceName = race->fullName.name.data;
+		if (!raceName) return false;
+		
+		std::string raceStr = raceName;
+		std::transform(raceStr.begin(), raceStr.end(), raceStr.begin(), ::tolower);
+		
+		// Check for dragon race names
+		if (raceStr.find("dragon") != std::string::npos)
+		{
+			return true;
+		}
+		
+		// Also check editor ID if full name doesn't match
+		// Dragons have race FormIDs like DragonRace (0x000F6726)
+		UInt32 raceFormID = race->formID;
+		UInt8 modIndex = (raceFormID >> 24) & 0xFF;
+		UInt32 baseRaceID = raceFormID & 0x00FFFFFF;
+		
+		// Skyrim.esm dragon races
+		if (modIndex == 0x00)
+		{
+			switch (baseRaceID)
+			{
+				case 0x000F6726:  // DragonRace
+				case 0x00012E82:  // DragonBlackRace (Alduin)
+				case 0x0001CA03:  // DragonPriestRace (not a dragon but hostile)
+				case 0x0010E9D1:  // UndeadDragonRace
+					return true;
+			}
+		}
+		
+		return false;
+	}
+	
+	// ============================================
+	// ACTOR HOSTILITY CHECK
+	// Check if one actor is hostile to another using game engine
+	// This respects crime/bounty/faction relations
+	// ============================================
+	
+	bool IsActorHostileToActor(Actor* actor, Actor* target)
+	{
+		if (!actor || !target) return false;
+		
+		// Check if actor is in combat with target
+		UInt32 combatTargetHandle = actor->currentCombatTarget;
+		if (combatTargetHandle != 0)
+		{
+			NiPointer<TESObjectREFR> targetRef;
+			LookupREFRByHandle(combatTargetHandle, targetRef);
+			if (targetRef && targetRef->formID == target->formID)
+			{
+				return true;  // Actor is actively targeting this target
+			}
+		}
+		
+		// Check attack on sight flag
+		if (actor->flags2 & Actor::kFlag_kAttackOnSight)
+		{
+			// Actor has attack on sight - check if target is their combat target
+			if (combatTargetHandle != 0)
+			{
+				NiPointer<TESObjectREFR> targetRef;
+				LookupREFRByHandle(combatTargetHandle, targetRef);
+				if (targetRef && targetRef->formID == target->formID)
+				{
+					return true;
+				}
+			}
+		}
+		
+		// Check if actor is in combat and target is their enemy
+		if (actor->IsInCombat())
+		{
+			// If in combat and combat target is this target, they're hostile
+			if (combatTargetHandle != 0)
+			{
+				NiPointer<TESObjectREFR> targetRef;
+				LookupREFRByHandle(combatTargetHandle, targetRef);
+				if (targetRef && targetRef->formID == target->formID)
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
 	}
 }

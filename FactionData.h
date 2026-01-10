@@ -44,15 +44,19 @@ namespace MountedNPCCombatVR
 	bool IsHostileCreature(UInt32 baseFormID);
 	
 	// ============================================
-	// FACTION CLASSIFICATION
+	// DRAGON DETECTION (By Race)
 	// ============================================
-	// Functions implemented in FactionData.cpp:
-	// - IsGuardFaction(Actor* actor)
-	// - IsSoldierFaction(Actor* actor)
-	// - IsBanditFaction(Actor* actor)
-	// - IsMageFaction(Actor* actor)
-	// - IsHunterFaction(Actor* actor)
-	// - IsCivilianFaction(Actor* actor)
-	// - DetermineCombatClass(Actor* actor)
-	// - GetCombatClassName(MountedCombatClass combatClass)
+	
+	bool IsDragon(Actor* actor);
+	
+	// ============================================
+	// ACTOR HOSTILITY CHECK
+	// ============================================
+	
+	// Check if one actor is hostile to another (combat target, attack on sight, etc.)
+	bool IsActorHostileToActor(Actor* actor, Actor* target);
+	
+	// ============================================
+	// MASTER HOSTILE CHECK
+	// ============================================
 }

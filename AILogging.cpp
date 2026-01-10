@@ -8,7 +8,13 @@ namespace MountedNPCCombatVR
 	// ADDRESS DEFINITIONS
 	// ============================================
 	
-	// Stop combat alarm - clears the crime/alarm state on an actor
+	// Send assault alarm - triggers crime/aggression response (NPC becomes hostile to player)
+	// Address: 0x986530
+	typedef void (*_Actor_SendAssaultAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
+	RelocAddr<_Actor_SendAssaultAlarm> Actor_SendAssaultAlarm_AILog(0x986530);
+	
+	// Stop combat alarm - clears the crime/alarm state (NPC forgives player)
+	// Address: 0x987A70
 	typedef void (*_Actor_StopCombatAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
 	RelocAddr<_Actor_StopCombatAlarm> Actor_StopCombatAlarm(0x987A70);
 
@@ -315,10 +321,59 @@ namespace MountedNPCCombatVR
 	// ALARM PACKAGE HANDLING
 	// ============================================
 	
+	// Stop combat alarm on an NPC - makes them stop being hostile to player
+	// Based on activeragdoll implementation: the function is called with PLAYER
+	// as the third parameter to make the NPC forgive the player
 	void StopActorCombatAlarm(Actor* actor)
 	{
 		if (!actor) return;
-		Actor_StopCombatAlarm(0, 0, actor);
+		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		_MESSAGE("AILogging: Stopping combat alarm for '%s' (%08X)",
+			actorName ? actorName : "Unknown", actor->formID);
+		
+		// Get player reference - the alarm is cleared relative to player
+		if (!g_thePlayer || !(*g_thePlayer))
+		{
+			_MESSAGE("AILogging: WARNING - No player reference, using actor directly");
+			Actor_StopCombatAlarm(0, 0, actor);
+			return;
+		}
+		
+		Actor* player = *g_thePlayer;
+		
+		// Method 1: Call StopCombatAlarm with PLAYER to make NPC forgive player
+		// This is the correct usage based on activeragdoll reference
+		Actor_StopCombatAlarm(0, 0, player);
+		_MESSAGE("AILogging: Called Actor_StopCombatAlarm with player");
+		
+		// Method 2: Clear attack-on-sight flag on the NPC
+		actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
+		_MESSAGE("AILogging: Cleared kAttackOnSight flag");
+		
+		// Method 3: Clear the NPC's combat target if it's the player
+		UInt32 combatTargetHandle = actor->currentCombatTarget;
+		if (combatTargetHandle != 0)
+		{
+			NiPointer<TESObjectREFR> targetRef;
+			LookupREFRByHandle(combatTargetHandle, targetRef);
+			if (targetRef && targetRef->formID == player->formID)
+			{
+				actor->currentCombatTarget = 0;
+				_MESSAGE("AILogging: Cleared combat target (was player)");
+			}
+		}
+		
+		// Method 4: Force AI re-evaluation to exit combat state
+		Actor_EvaluatePackage(actor, false, false);
+		_MESSAGE("AILogging: Evaluated AI package");
+		
+		// Method 5: Reset AI to interrupt any ongoing hostile behavior
+		CALL_MEMBER_FN(actor, ResetAI)(0, 0);
+		_MESSAGE("AILogging: Reset AI");
+		
+		_MESSAGE("AILogging: Combat alarm stop complete for '%s'", 
+			actorName ? actorName : "Unknown");
 	}
 	
 	// ============================================

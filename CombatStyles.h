@@ -5,6 +5,13 @@
 namespace MountedNPCCombatVR
 {
 	// ============================================
+	// Reset CombatStyles Cache
+	// Called on game load/reload to clear stale pointers
+	// ============================================
+	
+	void ResetCombatStylesCache();
+	
+	// ============================================
 	// Mount Tracking (cleanup only)
 	// ============================================
 	
@@ -95,12 +102,6 @@ namespace MountedNPCCombatVR
 		MountedCombatState DetermineState(Actor* actor, Actor* mount, Actor* target, MountedWeaponInfo* weaponInfo);
 		void ExecuteBehavior(MountedNPCData* npcData, Actor* actor, Actor* mount, Actor* target);
 		bool ShouldUseMelee(Actor* actor, Actor* target, MountedWeaponInfo* weaponInfo);
-	}
-	
-	namespace HunterCombat
-	{
-		MountedCombatState DetermineState(Actor* actor, Actor* mount, Actor* target, MountedWeaponInfo* weaponInfo);
-		void ExecuteBehavior(MountedNPCData* npcData, Actor* actor, Actor* mount, Actor* target);
 	}
 	
 	namespace MageCombat

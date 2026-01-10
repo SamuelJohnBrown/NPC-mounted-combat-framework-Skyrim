@@ -7,6 +7,7 @@
 #include "skse64/PluginAPI.h"	
 #include "Engine.h"
 #include "SpecialDismount.h"
+#include "HorseMountScanner.h"
 
 #include "skse64_common/BranchTrampoline.h"
 
@@ -147,6 +148,10 @@ namespace MountedNPCCombatVR
 					// Initialize spells for SpecialDismount (ESP data is now available)
 					InitSpecialDismountSpells();
 					
+					// Initialize the horse mount scanner
+					InitHorseMountScanner();
+					ResetHorseMountScanner();
+					
 					// IMPORTANT: For Skyrim VR, kMessage_NewGame may not fire reliably
 					// Activate the mod here with a delay - it will be reset on actual game loads
 					_MESSAGE("=== DATA LOADED: Activating mod with delay (will be reset on game load events) ===");
@@ -163,21 +168,6 @@ namespace MountedNPCCombatVR
 					else
 					{
 						_MESSAGE("Did not get HIGGS interface");
-					}
-
-					vrikInterface = vrikPluginApi::getVrikInterface001(g_pluginHandle, g_messaging);
-					if (vrikInterface)
-					{
-						unsigned int vrikBuildNumber = vrikInterface->getBuildNumber();
-						if (vrikBuildNumber < 80400)
-						{
-							ShowErrorBoxAndTerminate("[CRITICAL] VRIK's older versions are not compatible with Mounted NPC Combat VR. Make sure you have VRIK version 0.8.4 or higher, preferably the latest.");
-						}
-						_MESSAGE("Got VRIK interface. Buildnumber: %d", vrikBuildNumber);
-					}
-					else
-					{
-						_MESSAGE("Did not get VRIK interface");
 					}
 
 					skyrimVRESLInterface = SkyrimVRESLPluginAPI::GetSkyrimVRESLInterface001(g_pluginHandle, g_messaging);
@@ -198,12 +188,15 @@ namespace MountedNPCCombatVR
 					_MESSAGE("=== NEW GAME STARTED ===");
 					_MESSAGE("Resetting all runtime state for new game...");
 					MountedNPCCombatVR::OnPreLoadGame();  // Reset state (same as before load)
+					InitHorseMountScanner();
+					ResetHorseMountScanner();
 					MountedNPCCombatVR::OnNewGame(); // Then activate with delay
 				}
 				else if (msg->type == SKSEMessagingInterface::kMessage_PreLoadGame)
 				{
 					_MESSAGE("=== PRE LOAD GAME ===");
 					MountedNPCCombatVR::OnPreLoadGame();
+					StopHorseMountScanner();
 				}
 				else if (msg->type == SKSEMessagingInterface::kMessage_PostLoadGame)
 				{
@@ -222,6 +215,8 @@ namespace MountedNPCCombatVR
 						}
 						
 						MountedNPCCombatVR::PostLoadGame();
+						InitHorseMountScanner();
+						ResetHorseMountScanner();
 					}
 					else
 					{

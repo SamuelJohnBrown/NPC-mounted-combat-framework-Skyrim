@@ -74,11 +74,9 @@ namespace MountedNPCCombatVR
 	
 	RelocPtr<_UpdateProjectileArrow> UpdateProjectileArrow_vtbl(ArrowProjectileVtbl_Offset + UpdateFunctionIndex * 8);
 	
-	// Arrow aiming configuration - HARDCODED VALUES
-	const float ArrowShooterHeightOffset = 0.0f;     // Height offset for shooter position
-	const float ArrowTargetFootHeight = 80.0f;       // Target height when on foot (chest level)
-	const float ArrowTargetMountedHeight = 120.0f;   // Target height when mounted (chest level on horse)
-	
+	// Note: Arrow aiming configuration is now in config.h
+	// ArrowShooterHeightOffset, ArrowTargetFootHeight, ArrowTargetMountedHeight
+
 	// ============================================
 	// ARROW SPELL CONFIGURATION
 	// ============================================
@@ -109,7 +107,7 @@ namespace MountedNPCCombatVR
 	const float BOW_EQUIP_DELAY = 1.5f;      // Must have bow equipped for 1.5 seconds before drawing
 	const float BOW_DRAW_MIN_TIME = 2.0f;    // Minimum draw hold time
 	const float BOW_DRAW_MAX_TIME = 3.5f;    // Maximum draw hold time
-	const float BOW_STATE_TIMEOUT = 5.0f;    // Force release if stuck in draw/hold for 5 seconds
+	const float BOW_STATE_TIMEOUT = 3.5f;    // Force release if stuck in draw/hold for 3.5 seconds (failsafe)
 	
 	// Cached bow attack idles
 	static TESIdleForm* g_bowAttackCharge = nullptr;
@@ -149,10 +147,9 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	// Rapid fire bow attack configuration
-	const int RAPID_FIRE_SHOT_COUNT = 4;           // Number of arrows to fire
-	const float RAPID_FIRE_DRAW_TIME = 0.5f;       // Quick draw time (0.5 seconds)
-	const float RAPID_FIRE_HOLD_TIME = 0.3f;       // Brief hold before release
-	const float RAPID_FIRE_BETWEEN_SHOTS = 0.2f;   // Time between shots
+	const float RAPID_FIRE_DRAW_TIME = 1.3f;       // Draw/aim time (1.3 seconds)
+	const float RAPID_FIRE_HOLD_TIME = 0.0f;     // No hold - release immediately after draw
+	const float RAPID_FIRE_BETWEEN_SHOTS = 0.0f;   // No delay between shots - instant redraw
 	
 	// Rapid fire bow attack state
 	enum class RapidFireBowState
@@ -172,6 +169,8 @@ namespace MountedNPCCombatVR
 		int shotsFired;
 		float stateStartTime;
 		bool isValid;
+		bool firedThisRelease;  // Track if we've fired in current Releasing state
+		bool drewThisDraw;      // Track if we've played draw animation in current Drawing state
 	};
 	
 	static RapidFireBowData g_rapidFireBowData[5];
@@ -371,6 +370,92 @@ namespace MountedNPCCombatVR
 		aim.registeredTime = (float)clock() / CLOCKS_PER_SEC;
 		
 		g_pendingAims.push_back(aim);
+	}
+
+	// ============================================
+	// TASK CLASS FOR DELAYED ARROW FIRING
+	// Waits 200ms after release animation before actually firing
+	// ============================================
+	
+	struct DelayedArrowFire
+	{
+		UInt32 shooterFormID;
+		UInt32 targetFormID;
+		float scheduledTime;
+		bool isValid;
+		
+		DelayedArrowFire() : shooterFormID(0), targetFormID(0), scheduledTime(0.0f), isValid(false) {}
+	};
+	
+	static DelayedArrowFire g_delayedArrows[10];
+	static int g_delayedArrowCount = 0;
+	static const float ARROW_FIRE_DELAY = 0.2f;  // 200ms delay
+	
+	void ScheduleDelayedArrowFire(Actor* shooter, Actor* target)
+	{
+		if (!shooter || !target) return;
+		
+		// Find an empty slot
+		for (int i = 0; i < 10; i++)
+		{
+			if (!g_delayedArrows[i].isValid)
+			{
+				g_delayedArrows[i].shooterFormID = shooter->formID;
+				g_delayedArrows[i].targetFormID = target->formID;
+				g_delayedArrows[i].scheduledTime = GetGameTimeSeconds() + ARROW_FIRE_DELAY;
+				g_delayedArrows[i].isValid = true;
+				return;
+			}
+		}
+		
+		// If no slot, use first slot (overwrite oldest)
+		g_delayedArrows[0].shooterFormID = shooter->formID;
+		g_delayedArrows[0].targetFormID = target->formID;
+		g_delayedArrows[0].scheduledTime = GetGameTimeSeconds() + ARROW_FIRE_DELAY;
+		g_delayedArrows[0].isValid = true;
+	}
+	
+	void UpdateDelayedArrowFires()
+	{
+		float currentTime = GetGameTimeSeconds();
+		
+		for (int i = 0; i < 10; i++)
+		{
+			if (!g_delayedArrows[i].isValid) continue;
+			if (currentTime < g_delayedArrows[i].scheduledTime) continue;
+			
+			// Mark as invalid first to prevent re-entry issues
+			g_delayedArrows[i].isValid = false;
+			
+			// Time to fire!
+			UInt32 shooterID = g_delayedArrows[i].shooterFormID;
+			UInt32 targetID = g_delayedArrows[i].targetFormID;
+			
+			// Validate form IDs
+			if (shooterID == 0 || targetID == 0) continue;
+			
+			TESForm* shooterForm = LookupFormByID(shooterID);
+			TESForm* targetForm = LookupFormByID(targetID);
+			
+			if (!shooterForm || !targetForm) continue;
+			
+			Actor* shooter = DYNAMIC_CAST(shooterForm, TESForm, Actor);
+			Actor* target = DYNAMIC_CAST(targetForm, TESForm, Actor);
+			
+			if (!shooter || !target) continue;
+			if (shooter->IsDead(1) || target->IsDead(1)) continue;
+			
+			FireArrowSpellAtTarget(shooter, target);
+		}
+	}
+	
+	void ClearDelayedArrowFires()
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			g_delayedArrows[i].isValid = false;
+		}
+		g_delayedArrowCount = 0;
 	}
 
 	// ============================================
@@ -596,7 +681,19 @@ namespace MountedNPCCombatVR
 		
 		if (!IsBowEquipped(rider))
 		{
+			_MESSAGE("ArrowSystem: PlayBowDrawAnimation FAILED - bow not equipped for rider %08X", rider->formID);
 			return false;
+		}
+		
+		// ============================================
+		// CHECK IF RIDER'S WEAPON IS DRAWN
+		// Bow animations won't work if weapon is sheathed
+		// ============================================
+		if (!IsWeaponDrawn(rider))
+		{
+			_MESSAGE("ArrowSystem: PlayBowDrawAnimation - weapon not drawn, drawing it first for rider %08X", rider->formID);
+			rider->DrawSheatheWeapon(true);
+			return false;  // Try again next frame after weapon is drawn
 		}
 		
 		InitBowIdles();
@@ -606,8 +703,22 @@ namespace MountedNPCCombatVR
 			const char* eventName = g_bowAttackCharge->animationEvent.c_str();
 			if (eventName && strlen(eventName) > 0)
 			{
-				return SendBowAnimationEvent(rider, eventName);
+				_MESSAGE("ArrowSystem: Sending bow draw event '%s' to rider %08X", eventName, rider->formID);
+				bool result = SendBowAnimationEvent(rider, eventName);
+				if (!result)
+				{
+					_MESSAGE("ArrowSystem: Bow draw animation REJECTED for rider %08X", rider->formID);
+				}
+				return result;
 			}
+			else
+			{
+				_MESSAGE("ArrowSystem: ERROR - g_bowAttackCharge has empty event name");
+			}
+		}
+		else
+		{
+			_MESSAGE("ArrowSystem: ERROR - g_bowAttackCharge is null");
 		}
 		
 		return false;
@@ -619,6 +730,7 @@ namespace MountedNPCCombatVR
 		
 		if (!IsBowEquipped(rider))
 		{
+			_MESSAGE("ArrowSystem: PlayBowReleaseAnimation FAILED - bow not equipped for rider %08X", rider->formID);
 			return false;
 		}
 		
@@ -629,16 +741,31 @@ namespace MountedNPCCombatVR
 			const char* eventName = g_bowAttackRelease->animationEvent.c_str();
 			if (eventName && strlen(eventName) > 0)
 			{
+				_MESSAGE("ArrowSystem: Sending bow release event '%s' to rider %08X", eventName, rider->formID);
 				if (SendBowAnimationEvent(rider, eventName))
 				{
-					// Fire arrow spell at target if we have one
+					// Schedule arrow to fire after 200ms delay (to sync with animation)
 					if (target)
 					{
-						FireArrowSpellAtTarget(rider, target);
+						_MESSAGE("ArrowSystem: Scheduling delayed arrow fire for rider %08X -> target %08X", 
+							rider->formID, target->formID);
+						ScheduleDelayedArrowFire(rider, target);
 					}
 					return true;
 				}
+				else
+				{
+					_MESSAGE("ArrowSystem: Bow release animation REJECTED for rider %08X", rider->formID);
+				}
 			}
+			else
+			{
+				_MESSAGE("ArrowSystem: ERROR - g_bowAttackRelease has empty event name");
+			}
+		}
+		else
+		{
+			_MESSAGE("ArrowSystem: ERROR - g_bowAttackRelease is null");
 		}
 		
 		return false;
@@ -658,18 +785,32 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
+		// ============================================
+		// CHECK IF WEAPON IS DRAWN - Don't try bow attacks with sheathed weapon
+		// ============================================
+		if (!IsWeaponDrawn(rider))
+		{
+			// Weapon not drawn - reset state and try to draw it
+			ResetBowAttackState(rider->formID);
+			rider->DrawSheatheWeapon(true);
+			return false;
+		}
+		
 		RiderBowAttackData* data = GetOrCreateBowAttackData(rider->formID);
 		if (!data) return false;
 		
 		float currentTime = GetGameTimeSeconds();
 		
-		// Timeout check
+		// Timeout check - ALSO reset if stuck for too long
 		if (data->state != BowAttackState::None && data->stateEntryTime > 0)
 		{
-			if ((currentTime - data->stateEntryTime) >= BOW_STATE_TIMEOUT)
+			float timeInState = currentTime - data->stateEntryTime;
+			
+			if (timeInState >= BOW_STATE_TIMEOUT)
 			{
 				if (data->state == BowAttackState::Drawing || data->state == BowAttackState::Holding)
 				{
+					_MESSAGE("ArrowSystem: Rider %08X bow state TIMEOUT (%.1fs) - forcing release", rider->formID, timeInState);
 					if (PlayBowReleaseAnimation(rider, target))
 					{
 						data->state = BowAttackState::Released;
@@ -677,10 +818,21 @@ namespace MountedNPCCombatVR
 					}
 					else
 					{
+						// Release failed - fully reset
+						_MESSAGE("ArrowSystem: Rider %08X bow release failed on timeout - full reset", rider->formID);
 						data->state = BowAttackState::None;
 						data->bowEquipTime = currentTime;
 						data->stateEntryTime = currentTime;
 					}
+					return false;
+				}
+				else if (data->state == BowAttackState::WaitingToEquip)
+				{
+					// Stuck in waiting state too long - reset
+					_MESSAGE("ArrowSystem: Rider %08X stuck in WaitingToEquip for %.1fs - resetting", rider->formID, timeInState);
+					data->state = BowAttackState::None;
+					data->bowEquipTime = currentTime;
+					data->stateEntryTime = currentTime;
 					return false;
 				}
 				else
@@ -693,6 +845,9 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
+		// Track consecutive animation rejections
+		static int s_consecutiveRejections = 0;
+		
 		switch (data->state)
 		{
 			case BowAttackState::None:
@@ -700,6 +855,7 @@ namespace MountedNPCCombatVR
 				data->state = BowAttackState::WaitingToEquip;
 				data->bowEquipTime = currentTime;
 				data->stateEntryTime = currentTime;
+				s_consecutiveRejections = 0;  // Reset rejection counter
 				return false;
 			}
 			
@@ -720,14 +876,29 @@ namespace MountedNPCCombatVR
 							data->state = BowAttackState::Drawing;
 							data->drawStartTime = currentTime;
 							data->stateEntryTime = currentTime;
+							s_consecutiveRejections = 0;  // Reset on success
 							
 							EnsureRandomSeeded();
-							float randomRange = BOW_DRAW_MAX_TIME - BOW_DRAW_MIN_TIME;
-							data->holdDuration = BOW_DRAW_MIN_TIME + (((float)(rand() % 100)) / 100.0f * randomRange);
+							float randomRange = BowDrawMaxTime - BowDrawMinTime;
+							data->holdDuration = BowDrawMinTime + (((float)(rand() % 100)) / 100.0f * randomRange);
 						}
 						else
 						{
-							data->bowEquipTime = currentTime;
+							// Animation rejected - track and reset if too many
+							s_consecutiveRejections++;
+							
+							if (s_consecutiveRejections >= 5)
+							{
+								_MESSAGE("ArrowSystem: Rider %08X - 5 consecutive animation rejections, full reset", rider->formID);
+								data->state = BowAttackState::None;
+								data->stateEntryTime = currentTime;
+								s_consecutiveRejections = 0;
+							}
+							else
+							{
+								// Just reset the equip timer to try again
+								data->bowEquipTime = currentTime;
+							}
 						}
 					}
 				}
@@ -752,6 +923,8 @@ namespace MountedNPCCombatVR
 					}
 					else
 					{
+						// Release failed - go back to None and try again
+						_MESSAGE("ArrowSystem: Rider %08X bow release failed - resetting", rider->formID);
 						data->state = BowAttackState::None;
 						data->bowEquipTime = currentTime;
 						data->stateEntryTime = currentTime;
@@ -856,8 +1029,10 @@ namespace MountedNPCCombatVR
 		data->state = RapidFireBowState::Drawing;
 		data->shotsFired = 0;
 		data->stateStartTime = GetGameTimeSeconds();
+		data->firedThisRelease = false;
+		data->drewThisDraw = false;
 		
-		_MESSAGE("ArrowSystem: Rider %08X starting RAPID FIRE (%d shots)", riderFormID, RAPID_FIRE_SHOT_COUNT);
+		_MESSAGE("ArrowSystem: Rider %08X starting RAPID FIRE (%d shots)", riderFormID, RapidFireShotCount);
 	}
 	
 	bool UpdateRapidFireBowAttack(Actor* rider, Actor* target)
@@ -880,54 +1055,92 @@ namespace MountedNPCCombatVR
 		{
 			case RapidFireBowState::Drawing:
 			{
-				if (timeInState < 0.1f)
+				// Play draw animation once when entering this state
+				if (!data->drewThisDraw)
 				{
+					data->drewThisDraw = true;
+					_MESSAGE("ArrowSystem: RAPID FIRE Drawing - playing bow draw animation for rider %08X", rider->formID);
 					PlayBowDrawAnimation(rider);
 				}
 				
+				// After draw time, go straight to releasing (skip hold since it's 0)
 				if (timeInState >= RAPID_FIRE_DRAW_TIME)
 				{
-					data->state = RapidFireBowState::Holding;
+					_MESSAGE("ArrowSystem: RAPID FIRE - Draw complete, transitioning to Release for rider %08X", rider->formID);
+					data->state = RapidFireBowState::Releasing;
 					data->stateStartTime = currentTime;
+					data->firedThisRelease = false;  // Reset flag for new release state
+					data->drewThisDraw = false;      // Reset for next draw cycle
+				}
+				// FAILSAFE: If stuck in drawing for too long (3.5+ seconds), force release
+				else if (timeInState >= 3.5f)
+				{
+					_MESSAGE("ArrowSystem: RAPID FIRE FAILSAFE - Rider %08X stuck in draw, forcing release", rider->formID);
+					data->state = RapidFireBowState::Releasing;
+					data->stateStartTime = currentTime;
+					data->firedThisRelease = false;  // Reset flag for new release state
+					data->drewThisDraw = false;      // Reset for next draw cycle
 				}
 				return true;
 			}
 			
 			case RapidFireBowState::Holding:
 			{
-				if (timeInState >= RAPID_FIRE_HOLD_TIME)
-				{
-					data->state = RapidFireBowState::Releasing;
-					data->stateStartTime = currentTime;
-				}
+				// Skip this state entirely since hold time is 0
+				data->state = RapidFireBowState::Releasing;
+				data->stateStartTime = currentTime;
+				data->firedThisRelease = false;  // Reset flag for new release state
+				data->drewThisDraw = false;      // Reset for next draw cycle
 				return true;
 			}
 			
 			case RapidFireBowState::Releasing:
 			{
-				if (timeInState < 0.1f)
+				// Fire arrow once when entering this state
+				if (!data->firedThisRelease)
 				{
-					PlayBowReleaseAnimation(rider, target);
-					data->shotsFired++;
+					data->firedThisRelease = true;
 					
-					_MESSAGE("ArrowSystem: RAPID FIRE - Rider %08X shot %d/%d", 
-						rider->formID, data->shotsFired, RAPID_FIRE_SHOT_COUNT);
-				}
-				
-				if (timeInState >= 0.2f)
-				{
-					if (data->shotsFired < RAPID_FIRE_SHOT_COUNT)
+					_MESSAGE("ArrowSystem: RAPID FIRE Releasing - firing arrow for rider %08X (shot %d)", 
+						rider->formID, data->shotsFired + 1);
+					
+					// Try to play the release animation and fire the arrow
+					if (PlayBowReleaseAnimation(rider, target))
 					{
-						data->state = RapidFireBowState::BetweenShots;
-						data->stateStartTime = currentTime;
+						data->shotsFired++;
+						_MESSAGE("ArrowSystem: RAPID FIRE - Rider %08X shot %d/%d SUCCESS", 
+							rider->formID, data->shotsFired, RapidFireShotCount);
 					}
 					else
 					{
+						// Animation rejected - still count the shot but fire arrow directly
+						data->shotsFired++;
+						_MESSAGE("ArrowSystem: RAPID FIRE - Animation rejected, firing arrow directly for rider %08X (shot %d/%d)", 
+							rider->formID, data->shotsFired, RapidFireShotCount);
+						// Fire arrow directly without animation
+						ScheduleDelayedArrowFire(rider, target);
+					}
+				}
+				
+				// After brief release animation (0.3s), check if more shots needed
+				if (timeInState >= 0.3f)
+				{
+					if (data->shotsFired < RapidFireShotCount)
+					{
+						// More shots needed - go back to drawing immediately
+						_MESSAGE("ArrowSystem: RAPID FIRE - More shots needed, back to Drawing for rider %08X", rider->formID);
+						data->state = RapidFireBowState::Drawing;
+						data->stateStartTime = currentTime;
+						data->drewThisDraw = false;  // Reset for new draw state
+					}
+					else
+					{
+						// All shots fired
 						data->state = RapidFireBowState::Complete;
 						data->stateStartTime = currentTime;
 						
 						_MESSAGE("ArrowSystem: RAPID FIRE - Rider %08X completed %d shots", 
-							rider->formID, RAPID_FIRE_SHOT_COUNT);
+							rider->formID, RapidFireShotCount);
 					}
 				}
 				return true;
@@ -935,11 +1148,10 @@ namespace MountedNPCCombatVR
 			
 			case RapidFireBowState::BetweenShots:
 			{
-				if (timeInState >= RAPID_FIRE_BETWEEN_SHOTS)
-				{
-					data->state = RapidFireBowState::Drawing;
-					data->stateStartTime = currentTime;
-				}
+				// Skip this state entirely since between shots time is 0
+				data->state = RapidFireBowState::Drawing;
+				data->stateStartTime = currentTime;
+				data->drewThisDraw = false;  // Reset for new draw state
 				return true;
 			}
 			
@@ -999,6 +1211,9 @@ namespace MountedNPCCombatVR
 		
 		// Clear pending projectile aims and tracking
 		ClearPendingProjectileAims();
+		
+		// Clear delayed arrow fires
+		ClearDelayedArrowFires();
 		
 		// Reset regular bow attack data
 		for (int i = 0; i < 5; i++)

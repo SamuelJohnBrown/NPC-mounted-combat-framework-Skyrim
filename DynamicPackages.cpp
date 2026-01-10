@@ -274,6 +274,9 @@ namespace MountedNPCCombatVR
 	// NOTE: Single-argument overloads removed - they defaulted to player, causing targeting bugs
 	// Always use ForceHorseCombatWithTarget(horse, target) with explicit target
 	bool ForceHorseCombatWithTarget(Actor* horse, Actor* target);
+	
+	// Centralized weapon switching for ALL riders
+	bool UpdateRiderWeaponForDistance(Actor* rider, float distanceToTarget);
 
 	// ============================================
 	// INJECT FOLLOW PACKAGE
@@ -561,6 +564,61 @@ namespace MountedNPCCombatVR
 	}
 
 	// ============================================
+	// FORCE HORSE INTO COMBAT WITH TARGET (COMPANION VERSION)
+	// Uses CompanionMeleeRange from config for tighter engagement
+	// ============================================
+
+	bool ForceCompanionHorseCombatWithTarget(Actor* horse, Actor* target)
+	{
+		if (!horse || !target)
+		{
+			return false;
+		}
+		
+		// Safety checks - verify actors are in valid state
+		if (horse->IsDead(1) || target->IsDead(1))
+		{
+			return false;
+		}
+		
+		// Verify horse has required components for movement
+		if (!horse->processManager || !horse->processManager->middleProcess)
+		{
+			return false;
+		}
+
+		UInt32 targetHandle = target->CreateRefHandle();
+		if (targetHandle == 0 || targetHandle == *g_invalidRefHandle)
+		{
+			return false;
+		}
+
+		horse->currentCombatTarget = targetHandle;
+		horse->flags2 |= Actor::kFlag_kAttackOnSight;
+
+		// Companion melee follow - use config value for tighter engagement
+		NiPoint3 offset;
+		offset.x = 100.0f;   // Slight offset to approach from side
+		offset.y = -CompanionMeleeRange;  // Use config melee range
+		offset.z = 0;
+
+		NiPoint3 offsetAngle;
+		offsetAngle.x = 0;
+		offsetAngle.y = 0;
+		offsetAngle.z = 0;
+
+		// catchUpRadius slightly larger than melee range, followRadius = melee range
+		float catchUp = CompanionMeleeRange + 100.0f;
+		Actor_KeepOffsetFromActor(horse, targetHandle, offset, offsetAngle, catchUp, CompanionMeleeRange);
+		Actor_EvaluatePackage(horse, false, false);
+		
+		_MESSAGE("DynamicPackages: Companion horse %08X set to melee range %.0f from target %08X", 
+			horse->formID, CompanionMeleeRange, target->formID);
+
+		return true;
+	}
+
+	// ============================================
 	// FORCE HORSE INTO COMBAT WITH TARGET
 	// ============================================
 
@@ -653,12 +711,155 @@ namespace MountedNPCCombatVR
 		float angleToTarget = atan2(dx, dy);
 		float targetAngle = angleToTarget;
 		
-		float meleeRange = 150.0f;
+		// ============================================
+		// DETERMINE MELEE RANGE BASED ON TARGET TYPE
+		// - Player on foot: MeleeRangeOnFoot (195 default)
+		// - NPC on foot: MeleeRangeOnFootNPC (230 default) - larger because both moving
+		// - Mounted target: MeleeRangeMounted (300 default)
+		// ============================================
+		float meleeRange = MeleeRangeOnFoot;  // Default for player
 		
+		// Check if target is mounted
 		NiPointer<Actor> targetMount;
-		if (CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount)
+		bool targetIsMountedCheck = CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount;
+		
+		if (targetIsMountedCheck)
 		{
-			meleeRange = 300.0f;
+			meleeRange = MeleeRangeMounted;
+		}
+		else
+		{
+			// Target is on foot - check if it's the player or an NPC
+			bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
+			
+			if (targetIsPlayer)
+			{
+				meleeRange = MeleeRangeOnFoot;  // Player - use tight range
+			}
+			else
+			{
+				meleeRange = MeleeRangeOnFootNPC;  // NPC - use larger range (both moving toward each other)
+			}
+		}
+
+		// ============================================
+		// CHECK IF HORSE IS IN RAPID FIRE MODE (EARLY EXIT)
+		// If so, horse ROTATES to face target but does NOT move
+		// This prevents any travel packages from being injected
+		// ============================================
+		if (IsInRapidFire(horse->formID))
+		{
+			// Get rider for rapid fire update
+			NiPointer<Actor> riderForRapidFire;
+			if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForRapidFire) && riderForRapidFire)
+			{
+				// Update the rapid fire maneuver (handles bow firing)
+				UpdateRapidFireManeuver(horse, riderForRapidFire.get(), target);
+			}
+			
+			// ============================================
+			// FORCE HORSE TO STOP EVERY FRAME
+			// Clear all movement packages and offset tracking
+			// ============================================
+			Actor_ClearKeepOffsetFromActor(horse);
+			ClearInjectedPackages(horse);
+			StopHorseSprint(horse);
+			
+			// Horse ROTATES to face target but stays stationary
+			float currentAngle = horse->rot.z;
+			float angleDiff = angleToTarget - currentAngle;
+			while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+			while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+			
+			if (fabs(angleDiff) > 0.03f)  // Tighter threshold for smoother stop
+			{
+				float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
+				while (newAngle > 3.14159f) newAngle -= 6.28318f;
+				while (newAngle < -3.14159f) newAngle += 6.28318f;
+				horse->rot.z = newAngle;
+			}
+			
+			// Return 5 - horse stays stationery but rotates (rapid fire mode)
+			return 5;
+		}
+		
+		// ============================================
+		// CHECK IF HORSE IS IN STAND GROUND MODE (EARLY EXIT)
+		// If so, horse can still do 90-degree turns but doesn't chase
+		// OR if noRotation is set, just face target directly
+		// ============================================
+		if (IsInStandGround(horse->formID))
+		{
+			// Update the stand ground maneuver
+			if (!UpdateStandGroundManeuver(horse, target))
+			{
+				// Stand ground ended - continue to normal behavior
+			}
+			else
+			{
+				// ============================================
+				// FORCE HORSE TO STOP EVERY FRAME
+				// Clear all movement packages and offset tracking (same as rapid fire)
+				// ============================================
+				Actor_ClearKeepOffsetFromActor(horse);
+				ClearInjectedPackages(horse);
+				StopHorseSprint(horse);
+				
+				float targetAngleForStand;
+				bool noRotation = IsStandGroundNoRotation(horse->formID);
+				
+				if (noRotation)
+				{
+					// NO ROTATION - just face target directly
+					// Horse stays still and waits for target to come into attack range
+					targetAngleForStand = angleToTarget;
+				}
+				else
+				{
+					// Use 90-degree turn angle for attack positioning
+					targetAngleForStand = Get90DegreeTurnAngle(horse->formID, angleToTarget);
+				}
+				
+				float currentAngle = horse->rot.z;
+				float angleDiff = targetAngleForStand - currentAngle;
+				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+				
+				float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
+				while (newAngle > 3.14159f) newAngle -= 6.28318f;
+				while (newAngle < -3.14159f) newAngle += 6.28318f;
+				horse->rot.z = newAngle;
+				
+				// Check if in attack position and trigger attacks
+				// For noRotation mode, use a more lenient angle (target might approach from any side)
+				float attackAngleThreshold = noRotation ? AttackAngleNPC : 0.26f;
+				
+				if (fabs(angleDiff) < attackAngleThreshold)
+				{
+					float horseRightX = cos(horse->rot.z);
+					float horseRightY = -sin(horse->rot.z);
+					
+					float toTargetX = target->pos.x - horse->pos.x;
+					float toTargetY = target->pos.y - horse->pos.y;
+					
+					float dotRight = (toTargetX * horseRightX) + (toTargetY * horseRightY);
+					const char* targetSide = (dotRight > 0) ? "RIGHT" : "LEFT";
+					
+					NiPointer<Actor> riderForAttack;
+					if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
+					{
+						PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						
+						if (IsRiderAttacking(riderForAttack.get()))
+						{
+							UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+						}
+					}
+				}
+				
+				// Return 7 - horse standing ground
+				return 7;
+			}
 		}
 		
 		// ============================================
@@ -748,59 +949,29 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// CHECK FOR MULTI MOUNTED COMBAT MANEUVERS
+		// CHECK FOR MULTI MOUNTED COMBAT MANEUVER
 		// ============================================
 		
 		int mountedRiderCount = GetFollowingNPCCount();
 		
 		// ============================================
-		// WEAPON SWITCHING (for melee role riders only)
+		// WEAPON SWITCHING - ALL RIDERS USE CENTRALIZED SYSTEM
+		// Single/Multi, Melee/Ranged - everyone uses UpdateRiderWeaponForDistance
 		// ============================================
 		
-		// Re-get rider reference (already declared above, just reuse)
+		// Re-get rider reference
 		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
 		{
-			// Skip weapon switching for ranged role riders - they keep bow
-			if (!IsHorseRiderInRangedRole(horse->formID))
+			// Skip weapon switching during special maneuvers
+			if (!IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID))
 			{
-				if (!IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID))
+				// ALL riders use the same distance-based weapon switching
+				UpdateRiderWeaponForDistance(rider.get(), distanceToTarget);
+				
+				// If bow is equipped and at range, fire it
+				if (IsBowEquipped(rider.get()) && distanceToTarget > WeaponSwitchDistance)
 				{
-					bool hasMelee = HasMeleeWeaponInInventory(rider.get());
-					bool hasBow = HasBowInInventory(rider.get());
-					
-					if (distanceToTarget <= WeaponSwitchDistance)
-					{
-						if (hasMelee)
-						{
-							if (IsBowEquipped(rider.get()))
-							{
-								ResetBowAttackState(rider->formID);
-								EquipBestMeleeWeapon(rider.get());
-								rider->DrawSheatheWeapon(true);
-							}
-						}
-						else if (hasBow && !IsBowEquipped(rider.get()))
-						{
-							EquipBestBow(rider.get());
-							rider->DrawSheatheWeapon(true);
-						}
-					}
-					else
-					{
-						if (hasBow)
-						{
-							if (IsMeleeEquipped(rider.get()))
-							{
-								EquipBestBow(rider.get());
-								rider->DrawSheatheWeapon(true);
-							}
-						}
-					}
-					
-					if (IsBowEquipped(rider.get()) && distanceToTarget > WeaponSwitchDistance)
-					{
-						UpdateBowAttack(rider.get(), true, target);
-					}
+					UpdateBowAttack(rider.get(), true, target);
 				}
 			}
 		}
@@ -809,8 +980,9 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// CHECK IF TARGET IS MOUNTED
+		// (Already checked above for melee range - reuse the result)
 		// ============================================
-		bool targetIsMounted = IsTargetMounted(target);
+		bool targetIsMounted = targetIsMountedCheck;
 		
 		// ============================================
 		// CHARGE MANEUVER CHECK (700-1500 units away)
@@ -829,8 +1001,7 @@ namespace MountedNPCCombatVR
 					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 					
-					const float ROTATION_SPEED = 0.15f;
-					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 					horse->rot.z = newAngle;
 					
 					return 4;
@@ -847,8 +1018,7 @@ namespace MountedNPCCombatVR
 					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 					
-					const float ROTATION_SPEED = 0.15f;
-					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 					horse->rot.z = newAngle;
 					
 					return 4;
@@ -858,28 +1028,19 @@ namespace MountedNPCCombatVR
 			// ============================================
 			// RAPID FIRE MANEUVER CHECK
 			// ============================================
-			if (IsInRapidFire(horse->formID))
-			{
-				if (UpdateRapidFireManeuver(horse, riderForCharge.get(), target))
-				{
-					targetAngle = angleToTarget;
-					
-					float currentAngle = horse->rot.z;
-					float angleDiff = targetAngle - currentAngle;
-					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
-					
-					const float ROTATION_SPEED = 0.15f;
-					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
-					horse->rot.z = newAngle;
-					
-					return 5;
-				}
-			}
-			else if (distanceToTarget > meleeRange && GetCombatElapsedTime() >= 20.0f)
+			// Note: If already in rapid fire, we returned early above (line ~680)
+			// This is only for TRIGGERING new rapid fire
+			if (distanceToTarget > meleeRange && GetCombatElapsedTime() >= 20.0f)
 			{
 				if (TryRapidFireManeuver(horse, riderForCharge.get(), target, distanceToTarget, meleeRange))
 				{
+					// Rapid fire just triggered - stop horse movement immediately
+					Actor_ClearKeepOffsetFromActor(horse);
+					ClearInjectedPackages(horse);
+					Actor_EvaluatePackage(horse, false, false);
+					
+					_MESSAGE("DynamicPackages: RAPID FIRE TRIGGERED - Horse %08X movement STOPPED (rotation continues)", horse->formID);
+					
 					targetAngle = angleToTarget;
 					
 					float currentAngle = horse->rot.z;
@@ -887,8 +1048,7 @@ namespace MountedNPCCombatVR
 					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 					
-					const float ROTATION_SPEED = 0.15f;
-					float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
+					float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 					horse->rot.z = newAngle;
 					
 					return 5;
@@ -904,11 +1064,44 @@ namespace MountedNPCCombatVR
 		{
 			TryRearUpOnApproach(horse, target, distanceToTarget);
 			
+			// ============================================
+			// TRY STAND GROUND MANEUVER (vs non-player NPCs only)
+			// 25% chance when within 260 units of a mobile NPC target
+			// ============================================
+			bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
+			if (!targetIsPlayer && !IsInStandGround(horse->formID))
+			{
+				NiPointer<Actor> riderForStand;
+				if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForStand) && riderForStand)
+				{
+					TryStandGroundManeuver(horse, riderForStand.get(), target, distanceToTarget);
+				}
+			}
+			
+			// ============================================
+			// TRY PLAYER AGGRO SWITCH (vs non-player NPCs only)
+			// 15% chance every 20 seconds when player is within 1500 units
+			// Switches target to player and triggers a charge!
+			// ============================================
+			if (!targetIsPlayer && !IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID))
+			{
+				NiPointer<Actor> riderForAggro;
+				if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAggro) && riderForAggro)
+				{
+					if (TryPlayerAggroSwitch(horse, riderForAggro.get(), target))
+					{
+						// Successfully switched to player - charge maneuver started
+						// Return charging state
+						return 4;
+					}
+				}
+			}
+			
 			if (targetIsMounted)
 			{
 				// MOUNTED VS MOUNTED: Adjacent Riding
 				targetAngle = GetAdjacentRidingAngle(horse->formID, target->pos, horse->pos, target->rot.z);
-				
+
 				attackState = 1;
 				
 				float currentAngle = horse->rot.z;
@@ -916,7 +1109,8 @@ namespace MountedNPCCombatVR
 				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 				
-				if (fabs(angleDiff) < 0.35f)
+				// Use config value for attack angle threshold (mounted vs mounted)
+				if (fabs(angleDiff) < AttackAngleMounted)
 				{
 					attackState = 2;
 					
@@ -958,7 +1152,11 @@ namespace MountedNPCCombatVR
 				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 				
-				if (fabs(angleDiff) < 0.26f)
+				// Use config value for attack angle threshold
+				// More lenient for NPCs (AttackAngleNPC) vs Player (AttackAnglePlayer)
+				float attackAngleThreshold = targetIsPlayer ? AttackAnglePlayer : AttackAngleNPC;
+				
+				if (fabs(angleDiff) < attackAngleThreshold)
 				{
 					attackState = 2;
 					
@@ -984,19 +1182,32 @@ namespace MountedNPCCombatVR
 							}
 						}
 					}
-					
-					// Removed verbose attack position logs
 				}
 			}
 		}
 		else
 		{
 			NotifyHorseLeftMeleeRange(horse->formID);
+			NotifyHorseLeftMobileTargetRange(horse->formID);
 			if (targetIsMounted)
 			{
 				NotifyHorseLeftAdjacentRange(horse->formID);
 			}
-			targetAngle = angleToTarget;
+			
+			// ============================================
+			// APPROACHING TARGET - Use interception for mobile NPCs
+			// ============================================
+			if (IsTargetMobileNPC(target, horse->formID))
+			{
+				// Target is a moving NPC (not player) - use interception angle
+				// This prevents head-on collisions and circling
+				targetAngle = GetMobileTargetInterceptionAngle(horse->formID, horse, target);
+			}
+			else
+			{
+				// Target is player or stationary - approach directly
+				targetAngle = angleToTarget;
+			}
 		}
 		
 		// ============================================
@@ -1009,8 +1220,7 @@ namespace MountedNPCCombatVR
 		while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 		while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 		
-		const float rotationSpeed = 0.15f;
-		float newAngle = currentAngle + (angleDiff * rotationSpeed);
+		float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 		
 		while (newAngle > 3.14159f) newAngle -= 6.28318f;
 		while (newAngle < -3.14159f) newAngle += 6.28318f;
@@ -1019,9 +1229,8 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// MELEE RIDER COLLISION AVOIDANCE
-		// Check if another melee rider is too close and steer away
 		// ============================================
-		if (distanceToTarget < meleeRange * 2.0f)  // Only check when in combat range
+		if (distanceToTarget < meleeRange * 2.0f)
 		{
 			UpdateMeleeRiderCollisionAvoidance(horse, target);
 		}
@@ -1060,5 +1269,314 @@ namespace MountedNPCCombatVR
 		}
 		
 		return attackState;
+	}
+	
+	// ============================================
+	// CENTRALIZED WEAPON SWITCH SYSTEM
+	// ALL riders use this - single/multi, melee/ranged captains
+	// Uses distance-based switching with cooldown to prevent spam
+	// Now properly sheathes before switching to fix invisible weapons
+	// ============================================
+	
+	struct WeaponSwitchData
+	{
+		UInt32 actorFormID;
+		float lastSwitchTime;
+		float sheatheStartTime;     // When we started sheathing (0 if not sheathing)
+		bool lastWantedMelee;
+		bool isSheathing;  // True if currently in sheathe transition
+		bool pendingMelee;          // What weapon type to equip after sheathe
+		bool isValid;
+	};
+	
+	static WeaponSwitchData g_weaponSwitchData[10];
+	static int g_weaponSwitchCount = 0;
+	static bool g_weaponSwitchInitialized = false;
+	
+	// Note: WeaponSwitchCooldown and SheatheTransitionTime are now in config.h
+	// Default values: WeaponSwitchCooldown = 5.0f, SheatheTransitionTime = 0.8f
+	
+	static float GetWeaponSwitchTime()
+	{
+		static auto startTime = clock();
+		return (float)(clock() - startTime) / CLOCKS_PER_SEC;
+	}
+	
+	static void InitWeaponSwitchData()
+	{
+		if (g_weaponSwitchInitialized) return;
+		for (int i = 0; i < 10; i++)
+		{
+			g_weaponSwitchData[i].actorFormID = 0;
+			g_weaponSwitchData[i].lastSwitchTime = -WeaponSwitchCooldown;  // Use config value
+			g_weaponSwitchData[i].sheatheStartTime = 0;
+			g_weaponSwitchData[i].lastWantedMelee = false;
+			g_weaponSwitchData[i].isSheathing = false;
+			g_weaponSwitchData[i].pendingMelee = false;
+			g_weaponSwitchData[i].isValid = false;
+		}
+		g_weaponSwitchInitialized = true;
+	}
+	
+	static WeaponSwitchData* GetOrCreateWeaponSwitchData(UInt32 actorFormID)
+	{
+		InitWeaponSwitchData();
+		
+		for (int i = 0; i < 10; i++)
+		{
+			if (g_weaponSwitchData[i].isValid && g_weaponSwitchData[i].actorFormID == actorFormID)
+			{
+				return &g_weaponSwitchData[i];
+			}
+		}
+		
+		for (int i = 0; i < 10; i++)
+		{
+			if (!g_weaponSwitchData[i].isValid)
+			{
+				g_weaponSwitchData[i].actorFormID = actorFormID;
+				g_weaponSwitchData[i].lastSwitchTime = -WeaponSwitchCooldown;  // Use config value
+				g_weaponSwitchData[i].sheatheStartTime = 0;
+				g_weaponSwitchData[i].lastWantedMelee = false;
+				g_weaponSwitchData[i].isSheathing = false;
+				g_weaponSwitchData[i].pendingMelee = false;
+				g_weaponSwitchData[i].isValid = true;
+				return &g_weaponSwitchData[i];
+			}
+		}
+		
+		return nullptr;
+	}
+	
+	bool UpdateRiderWeaponForDistance(Actor* rider, float distanceToTarget)
+	{
+		if (!rider) return false;
+		
+		WeaponSwitchData* data = GetOrCreateWeaponSwitchData(rider->formID);
+		if (!data) return false;
+		
+		float currentTime = GetWeaponSwitchTime();
+		
+		// ============================================
+		// PHASE 2: Complete pending weapon equip after sheathe
+		// ============================================
+		if (data->isSheathing)
+		{
+			float timeSinceSheathe = currentTime - data->sheatheStartTime;
+			
+			if (timeSinceSheathe >= SheatheTransitionTime)  // Use config value
+			{
+				// Sheathe animation should be done - now equip the new weapon
+				data->isSheathing = false;
+				
+				if (data->pendingMelee)
+				{
+					// Equip melee
+					if (HasMeleeWeaponInInventory(rider))
+					{
+						EquipBestMeleeWeapon(rider);
+					}
+					else
+					{
+						GiveDefaultMountedWeapon(rider);
+					}
+					_MESSAGE("DynamicPackages: Rider %08X EQUIPPED MELEE after sheathe (dist: %.0f)", rider->formID, distanceToTarget);
+				}
+				else
+				{
+					// Equip bow
+					if (HasBowInInventory(rider))
+					{
+						EquipBestBow(rider);
+						EquipArrows(rider);
+					}
+					_MESSAGE("DynamicPackages: Rider %08X EQUIPPED BOW after sheathe (dist: %.0f)", rider->formID, distanceToTarget);
+				}
+				
+				// Draw the newly equipped weapon
+				rider->DrawSheatheWeapon(true);
+				
+				data->lastSwitchTime = currentTime;
+				data->lastWantedMelee = data->pendingMelee;
+				
+				return true;
+			}
+			
+			// Still waiting for sheathe - don't do anything else
+			return false;
+		}
+		
+		// ============================================
+		// Check cooldown - don't switch too frequently
+		// ============================================
+		if ((currentTime - data->lastSwitchTime) < WeaponSwitchCooldown)  // Use config value
+		{
+			return false;
+		}
+		
+		// ============================================
+		// Determine what weapon we want based on distance
+		// ============================================
+		bool hasMelee = HasMeleeWeaponInInventory(rider);
+		bool hasBow = HasBowInInventory(rider);
+		bool wantMelee = (distanceToTarget <= WeaponSwitchDistance);
+		
+		// Check if we already have what we want equipped
+		bool currentlyHasMelee = IsMeleeEquipped(rider);
+		bool currentlyHasBow = IsBowEquipped(rider);
+		
+		if (wantMelee && currentlyHasMelee)
+		{
+			// Already have melee - just make sure it's drawn
+			if (!IsWeaponDrawn(rider))
+			{
+				rider->DrawSheatheWeapon(true);
+			}
+			return false;
+		}
+		
+		if (!wantMelee && currentlyHasBow)
+		{
+			// Already have bow - just make sure it's drawn
+			if (!IsWeaponDrawn(rider))
+			{
+				rider->DrawSheatheWeapon(true);
+			}
+			return false;
+		}
+		
+		// ============================================
+		// PHASE 1: Start sheathe animation before switching
+		// ============================================
+		if (wantMelee && !currentlyHasMelee && hasMelee)
+		{
+			// Want melee, don't have it equipped, have it in inventory
+			// FIRST: Sheathe current weapon
+			if (IsWeaponDrawn(rider))
+			{
+				rider->DrawSheatheWeapon(false);  // Sheathe
+				data->isSheathing = true;
+				data->sheatheStartTime = currentTime;
+				data->pendingMelee = true;
+				_MESSAGE("DynamicPackages: Rider %08X SHEATHING to switch to MELEE (dist: %.0f)", rider->formID, distanceToTarget);
+				return false;  // Wait for sheathe to complete
+			}
+			else
+			{
+				// Weapon already sheathed - equip directly
+				EquipBestMeleeWeapon(rider);
+				rider->DrawSheatheWeapon(true);
+				data->lastSwitchTime = currentTime;
+				data->lastWantedMelee = true;
+				_MESSAGE("DynamicPackages: Rider %08X switched to MELEE (dist: %.0f)", rider->formID, distanceToTarget);
+				return true;
+			}
+		}
+		
+		if (!wantMelee && !currentlyHasBow && hasBow)
+		{
+			// Want bow, don't have it equipped, have it in inventory
+			// FIRST: Sheathe current weapon
+			if (IsWeaponDrawn(rider))
+			{
+				rider->DrawSheatheWeapon(false);  // Sheathe
+				data->isSheathing = true;
+				data->sheatheStartTime = currentTime;
+				data->pendingMelee = false;
+				_MESSAGE("DynamicPackages: Rider %08X SHEATHING to switch to BOW (dist: %.0f)", rider->formID, distanceToTarget);
+				return false;  // Wait for sheathe to complete
+			}
+			else
+			{
+				// Weapon already sheathed - equip directly
+				EquipBestBow(rider);
+				EquipArrows(rider);
+				rider->DrawSheatheWeapon(true);
+				data->lastSwitchTime = currentTime;
+				data->lastWantedMelee = false;
+				_MESSAGE("DynamicPackages: Rider %08X switched to BOW (dist: %.0f)", rider->formID, distanceToTarget);
+				return true;
+			}
+		}
+		
+		// No melee but want melee - give default
+		if (wantMelee && !hasMelee && !currentlyHasMelee)
+		{
+			if (IsWeaponDrawn(rider))
+			{
+				rider->DrawSheatheWeapon(false);
+				data->isSheathing = true;
+				data->sheatheStartTime = currentTime;
+				data->pendingMelee = true;
+				return false;
+			}
+			else
+			{
+				GiveDefaultMountedWeapon(rider);
+				rider->DrawSheatheWeapon(true);
+				data->lastSwitchTime = currentTime;
+				data->lastWantedMelee = true;
+				return true;
+			}
+		}
+		
+		// Make sure weapon is drawn
+		if (!IsWeaponDrawn(rider))
+		{
+			rider->DrawSheatheWeapon(true);
+		}
+		
+		return false;
+	}
+	
+	void ClearWeaponSwitchData(UInt32 actorFormID)
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			if (g_weaponSwitchData[i].isValid && g_weaponSwitchData[i].actorFormID == actorFormID)
+			{
+				g_weaponSwitchData[i].isValid = false;
+				g_weaponSwitchData[i].isSheathing = false;
+				return;
+			}
+		}
+	}
+	
+	void ClearAllWeaponSwitchData()
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			g_weaponSwitchData[i].isValid = false;
+			g_weaponSwitchData[i].actorFormID = 0;
+			g_weaponSwitchData[i].isSheathing = false;
+		}
+		g_weaponSwitchCount = 0;
+		// Don't reset g_weaponSwitchInitialized - the arrays are still valid
+	}
+	
+	// ============================================
+	// RESET ALL DYNAMIC PACKAGE STATE
+	// Called on game load/reload to clear stale pointers
+	// ============================================
+	
+	void ResetDynamicPackageState()
+	{
+		_MESSAGE("DynamicPackages: === RESETTING ALL STATE ===");
+		
+		// Clear weapon switch tracking
+		ClearAllWeaponSwitchData();
+		
+		// Clear horse movement tracking
+		for (int i = 0; i < 5; i++)
+		{
+			g_horseMovement[i].isValid = false;
+			g_horseMovement[i].horseFormID = 0;
+		}
+		g_horseMovementCount = 0;
+		
+		// Reset initialization flag so system can re-init
+		g_dynamicPackageSystemInitialized = false;
+		
+		_MESSAGE("DynamicPackages: State reset complete");
 	}
 }

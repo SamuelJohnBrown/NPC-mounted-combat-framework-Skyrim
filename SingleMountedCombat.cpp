@@ -119,7 +119,13 @@ namespace MountedNPCCombatVR
 	
 	void StartHorseSprint(Actor* horse)
 	{
-		if (!horse) return;
+		if (!horse)
+		{
+			_MESSAGE("SingleMountedCombat: StartHorseSprint - horse is null!");
+			return;
+		}
+		
+		_MESSAGE("SingleMountedCombat: StartHorseSprint called for horse %08X", horse->formID);
 		
 		InitSprintIdles();
 		
@@ -128,11 +134,24 @@ namespace MountedNPCCombatVR
 			const char* eventName = g_horseSprintStart->animationEvent.c_str();
 			if (eventName && strlen(eventName) > 0)
 			{
+				_MESSAGE("SingleMountedCombat: Sending sprint event '%s' to horse %08X", eventName, horse->formID);
 				if (SendHorseAnimationEvent(horse, eventName))
 				{
-					_MESSAGE("SingleMountedCombat: Horse %08X started sprint", horse->formID);
+					_MESSAGE("SingleMountedCombat: Horse %08X sprint animation ACCEPTED", horse->formID);
+				}
+				else
+				{
+					_MESSAGE("SingleMountedCombat: Horse %08X sprint animation REJECTED (graph busy?)", horse->formID);
 				}
 			}
+			else
+			{
+				_MESSAGE("SingleMountedCombat: ERROR - Sprint idle has empty animation event name!");
+			}
+		}
+		else
+		{
+			_MESSAGE("SingleMountedCombat: ERROR - g_horseSprintStart is null!");
 		}
 	}
 	

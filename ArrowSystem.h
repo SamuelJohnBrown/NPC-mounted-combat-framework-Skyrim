@@ -19,6 +19,20 @@ namespace MountedNPCCombatVR
 	void ResetArrowSystem();
 	
 	// ============================================
+	// Delayed Arrow Fire System
+	// Handles 200ms delay between release animation and actual arrow
+	// ============================================
+	
+	// Schedule an arrow to fire after 200ms delay
+	void ScheduleDelayedArrowFire(Actor* shooter, Actor* target);
+	
+	// Update delayed arrow fires - call every frame
+	void UpdateDelayedArrowFires();
+	
+	// Clear all pending delayed arrow fires
+	void ClearDelayedArrowFires();
+	
+	// ============================================
 	// Projectile Hook Control
 	// ============================================
 	

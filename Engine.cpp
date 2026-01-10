@@ -7,7 +7,6 @@ namespace MountedNPCCombatVR
 	SKSETrampolineInterface* g_trampolineInterface = nullptr;
 
 	HiggsPluginAPI::IHiggsInterface001* higgsInterface;
-	vrikPluginApi::IVrikInterface001* vrikInterface;
 
 	SkyrimVRESLPluginAPI::ISkyrimVRESLInterface001* skyrimVRESLInterface;
 
