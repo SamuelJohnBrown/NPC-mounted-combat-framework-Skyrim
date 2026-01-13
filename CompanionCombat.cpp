@@ -5,6 +5,11 @@
 #include "WeaponDetection.h"
 #include "NPCProtection.h"
 #include "CombatStyles.h"  // For ClearNPCFollowTarget
+#include "MultiMountedCombat.h"  // For RegisterMultiRider
+#include "ArrowSystem.h"  // For ResetBowAttackState
+#include "SpecialMovesets.h"  // For ClearAllMovesetData
+
+#include "Helper.h"  // For GetGameTime
 #include "config.h"
 #include "skse64/GameRTTI.h"
 #include <cmath>
@@ -18,6 +23,10 @@ namespace MountedNPCCombatVR
 	static bool g_companionCombatInitialized = false;
 	static MountedCompanionData g_trackedCompanions[MAX_TRACKED_COMPANIONS];
 	static int g_trackedCompanionCount = 0;
+	
+	// Scan interval tracking - declared early so ResetCompanionCombat can use it
+	static float g_lastCompanionScanTime = 0;
+	const float COMPANION_SCAN_INTERVAL = 2.0f;  // Scan every 2 seconds
 	
 	// ============================================
 	// INITIALIZATION
@@ -53,6 +62,9 @@ namespace MountedNPCCombatVR
 	void ResetCompanionCombat()
 	{
 		_MESSAGE("CompanionCombat: Resetting all companion tracking...");
+		
+		// Reset scan timer so companions are detected fresh
+		g_lastCompanionScanTime = 0;
 		
 		for (int i = 0; i < MAX_TRACKED_COMPANIONS; i++)
 		{
@@ -222,13 +234,36 @@ namespace MountedNPCCombatVR
 						RemoveMountedProtection(companion);
 						ClearNPCFollowTarget(companion);
 						
+						// ============================================
+						// RESET ALL COMBAT STATE ON DISMOUNT
+						// This prevents stuck animations and invalid states
+						// SKIP if companion is dead or in bleedout to prevent CTD
+						// ============================================
+						
+						// Only reset combat state if companion is alive and not in bleedout
+						bool companionAlive = !companion->IsDead(1);
+						bool safeToModify = companionAlive && companion->loadedState;
+						
+						if (safeToModify)
+						{
+							// Reset bow attack state (fixes stuck bow draw animation)
+							ResetBowAttackState(companion->formID);
+							
+							// Clear weapon switch tracking (allows clean re-equip)
+							ClearWeaponSwitchData(companion->formID);
+							
+							// NOTE: Removed Actor_IdleStop and DrawSheatheWeapon calls
+							// These can cause CTD if actor is in bleedout or invalid state
+						}
+						
 						const char* name = CALL_MEMBER_FN(companion, GetReferenceName)();
-						_MESSAGE("CompanionCombat: Unregistered companion '%s' (%08X)", 
-							name ? name : "Unknown", companionFormID);
+						_MESSAGE("CompanionCombat: Unregistered companion '%s' (%08X) - %s", 
+							name ? name : "Unknown", companionFormID,
+							safeToModify ? "reset combat state" : "skipped reset (dead/bleedout)");
 					}
 				}
 				
-				// Clear mount packages
+				// Clear mount packages and special movesets
 				if (g_trackedCompanions[i].mountFormID != 0)
 				{
 					TESForm* mountForm = LookupFormByID(g_trackedCompanions[i].mountFormID);
@@ -237,10 +272,17 @@ namespace MountedNPCCombatVR
 						Actor* mount = DYNAMIC_CAST(mountForm, TESForm, Actor);
 						if (mount)
 						{
+							// Clear all special moveset data for the mount
+							ClearAllMovesetData(mount->formID);
+							
 							Actor_ClearKeepOffsetFromActor(mount);
+							Actor_EvaluatePackage(mount, false, false);
 						}
 					}
 				}
+				
+				// Also unregister from MultiMountedCombat
+				UnregisterMultiRider(companionFormID);
 				
 				g_trackedCompanions[i].Reset();
 				g_trackedCompanionCount--;
@@ -325,11 +367,125 @@ namespace MountedNPCCombatVR
 	// COMPANION COMBAT UPDATE
 	// ============================================
 	
+	// Scan for new mounted companions to register
+	static void ScanForMountedCompanions()
+	{
+		if (!g_thePlayer || !(*g_thePlayer)) return;
+		
+		Actor* player = *g_thePlayer;
+		TESObjectCELL* cell = player->parentCell;
+		if (!cell) return;
+		
+		// Only scan if player is in combat
+		if (!player->IsInCombat()) return;
+		
+		for (UInt32 i = 0; i < cell->objectList.count; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			if (ref->formType != kFormType_Character) continue;
+			
+			Actor* actor = static_cast<Actor*>(ref);
+			
+			// Skip player
+			if (actor->formID == player->formID) continue;
+			
+			// Skip dead
+			if (actor->IsDead(1)) continue;
+			
+			// Check if it's a mounted companion
+			if (!IsMountedCompanion(actor)) continue;
+			
+			// Check if already tracked
+			if (GetCompanionData(actor->formID) != nullptr) continue;
+			
+			// Get their mount
+			Actor* mount = GetCompanionMount(actor);
+			if (!mount) continue;
+			
+			// Check distance
+			float dx = actor->pos.x - player->pos.x;
+			float dy = actor->pos.y - player->pos.y;
+			float dz = actor->pos.z - player->pos.z;
+			float dist = sqrt(dx * dx + dy * dy + dz * dz);
+			
+			if (dist > CompanionScanRange) continue;
+			
+			// Register this companion!
+			_MESSAGE("CompanionCombat: SCAN DETECTED new mounted companion near player in combat");
+			MountedCompanionData* data = RegisterMountedCompanion(actor, mount);
+			
+			if (data)
+			{
+				// Also register with MultiMountedCombat for combat behavior
+				// Find their combat target (usually whoever is attacking the player)
+				Actor* target = nullptr;
+				
+				// First check if companion is already in combat with a target
+				UInt32 companionCombatHandle = actor->currentCombatTarget;
+				if (companionCombatHandle != 0)
+				{
+					NiPointer<TESObjectREFR> targetRef;
+					LookupREFRByHandle(companionCombatHandle, targetRef);
+					if (targetRef)
+					{
+						target = DYNAMIC_CAST(targetRef.get(), TESObjectREFR, Actor);
+					}
+				}
+				
+				// If no target, use player's combat target
+				if (!target && player->IsInCombat())
+				{
+					UInt32 playerCombatHandle = player->currentCombatTarget;
+					if (playerCombatHandle != 0)
+					{
+						NiPointer<TESObjectREFR> targetRef;
+						LookupREFRByHandle(playerCombatHandle, targetRef);
+						if (targetRef)
+						{
+							target = DYNAMIC_CAST(targetRef.get(), TESObjectREFR, Actor);
+						}
+					}
+				}
+				
+				// CRITICAL: Never let companions target the player!
+				bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
+				if (targetIsPlayer)
+				{
+					_MESSAGE("CompanionCombat: WARNING - Blocked companion from targeting PLAYER!");
+					target = nullptr;  // Clear invalid target
+				}
+				
+				if (target && !target->IsDead(1))
+				{
+					// Register with multi-combat system
+					RegisterMultiRider(actor, mount, target);
+					
+					const char* companionName = CALL_MEMBER_FN(actor, GetReferenceName)();
+					const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
+					_MESSAGE("CompanionCombat: Companion '%s' registered for combat vs '%s'",
+						companionName ? companionName : "Unknown",
+						targetName ? targetName : "Unknown");
+				}
+			}
+		}
+	}
+	
 	void UpdateMountedCompanionCombat()
 	{
 		if (!g_companionCombatInitialized) return;
 		if (!CompanionCombatEnabled) return;
 		if (g_playerIsDead || !g_playerInExterior) return;
+		
+		// Periodic scan for new mounted companions when player is in combat
+		float currentTime = GetGameTime();
+		if ((currentTime - g_lastCompanionScanTime) >= COMPANION_SCAN_INTERVAL)
+		{
+			g_lastCompanionScanTime = currentTime;
+			ScanForMountedCompanions();
+		}
 		
 		// Monitor each tracked companion for state changes (death, dismount)
 		for (int i = 0; i < MAX_TRACKED_COMPANIONS; i++)

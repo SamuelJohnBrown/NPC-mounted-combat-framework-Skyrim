@@ -1,6 +1,7 @@
 #include "AILogging.h"
 #include "MountedCombat.h"
 #include "DynamicPackages.h"
+#include "SpecialMovesets.h"  // For IsInStandGround, IsInRapidFire
 
 namespace MountedNPCCombatVR
 {
@@ -406,10 +407,10 @@ namespace MountedNPCCombatVR
 	static HorseSheerInfo g_horseSheerData[MAX_OBSTRUCTION_TRACKED];
 	static int g_horseSheerCount =0;
 	
+	// Use shared GetGameTime() from Helper.h instead of local function
 	static float GetObstructionTime()
 	{
-		static auto startTime = clock();
-		return (float)(clock() - startTime) / CLOCKS_PER_SEC;
+		return GetGameTime();
 	}
 	
 	HorseObstructionInfo* GetHorseObstructionInfo(UInt32 horseFormID)
@@ -722,6 +723,24 @@ namespace MountedNPCCombatVR
 	ObstructionType CheckAndLogHorseObstruction(Actor* horse, Actor* target, float distanceToTarget)
 	{
 		if (!horse) return ObstructionType::None;
+		
+		// ============================================
+		// SKIP OBSTRUCTION CHECK IF IN NORMAL COMBAT POSITIONING
+		// Being stationary at close range is EXPECTED behavior, not an obstruction
+		// ============================================
+		const float CLOSE_COMBAT_DISTANCE = 250.0f;  // If within this range, being still is normal
+		
+		if (distanceToTarget < CLOSE_COMBAT_DISTANCE)
+		{
+			// Horse is close to target - this is normal combat, not an obstruction
+			return ObstructionType::None;
+		}
+		
+		// Also skip if in special maneuvers where stationary is expected
+		if (IsInStandGround(horse->formID) || IsInRapidFire(horse->formID))
+		{
+			return ObstructionType::None;
+		}
 		
 		float currentTime = GetObstructionTime();
 		

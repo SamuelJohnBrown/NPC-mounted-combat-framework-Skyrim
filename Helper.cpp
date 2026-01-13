@@ -14,6 +14,33 @@
 namespace MountedNPCCombatVR
 {
 	// ============================================
+	// Shared Utility Functions
+	// ============================================
+	
+	// Shared time function - returns seconds since mod initialized
+	// All files should use this instead of their own static time functions
+	float GetGameTime()
+	{
+		static auto startTime = clock();
+		return (float)(clock() - startTime) / CLOCKS_PER_SEC;
+	}
+	
+	// Shared random seeding function - ensures srand() is called once
+	// All files should use this instead of their own EnsureRandomSeeded functions
+	static bool g_sharedRandomSeeded = false;
+	
+	void EnsureRandomSeeded()
+	{
+		if (!g_sharedRandomSeeded)
+		{
+			unsigned int seed = (unsigned int)time(nullptr) ^ (unsigned int)clock();
+			srand(seed);
+			rand(); rand(); rand();  // Discard first few values for better randomness
+			g_sharedRandomSeeded = true;
+		}
+	}
+	
+	// ============================================
 	// Mod State Control
 	// ============================================
 	
@@ -398,8 +425,14 @@ namespace MountedNPCCombatVR
 						Actor* mountActor = mount.get();
 						if (mountActor)
 						{
-							_MESSAGE("DismountHook: BLOCKING COMPANION '%s' (FormID: %08X) - SAME AS GUARD", 
-								actorName ? actorName : "Unknown", actor->formID);
+							// Rate limit logging - only log first block per NPC
+							static UInt32 lastLoggedCompanion = 0;
+							if (lastLoggedCompanion != actor->formID)
+							{
+								lastLoggedCompanion = actor->formID;
+								_MESSAGE("DismountHook: BLOCKING COMPANION '%s' (FormID: %08X) - SAME AS GUARD", 
+									actorName ? actorName : "Unknown", actor->formID);
+							}
 							
 							// Register with companion tracking system (for friendly fire prevention)
 							RegisterMountedCompanion(actor, mountActor);
@@ -427,8 +460,14 @@ namespace MountedNPCCombatVR
 					else
 					{
 						// Regular NPC - use standard MountedCombat system
-						_MESSAGE("DismountHook: BLOCKING '%s' (FormID: %08X) - in combat, preventing dismount", 
-							actorName ? actorName : "Unknown", actor->formID);
+						// Rate limit logging - only log first block per NPC
+						static UInt32 lastLoggedNPC = 0;
+						if (lastLoggedNPC != actor->formID)
+						{
+							lastLoggedNPC = actor->formID;
+							_MESSAGE("DismountHook: BLOCKING '%s' (FormID: %08X) - in combat, preventing dismount", 
+								actorName ? actorName : "Unknown", actor->formID);
+						}
 						
 						OnDismountBlocked(actor, mount);
 					}
@@ -664,7 +703,7 @@ namespace MountedNPCCombatVR
 		}
 		
 		// Allocate trampoline memory
-		void* trampMem = g_localTrampoline.Allocate(prologSize + 14);
+		void* trampMem = g_localTrampoline.Alocate(prologSize + 14);
 		unsigned char* tramp = (unsigned char*)trampMem;
 		
 		// Copy the original prolog bytes

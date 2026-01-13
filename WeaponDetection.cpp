@@ -1,5 +1,7 @@
 #include "WeaponDetection.h"
 #include "DynamicPackages.h"  // For get_vfunc
+#include "Helper.h" // For GetGameTime
+#include "config.h"    // For WeaponSwitchDistance, SheatheTransitionTime
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
 #include <ctime>
@@ -8,6 +10,495 @@
 
 namespace MountedNPCCombatVR
 {
+	// ============================================
+	// CENTRALIZED WEAPON STATE MACHINE
+	// ============================================
+	
+	// Animation timing - SHEATHE uses config value, others are hardcoded
+	// SheatheTransitionTime from config.h controls sheathe animation wait
+	const float WEAPON_EQUIP_DURATION = 0.4f; // Time to wait after equipping
+	const float WEAPON_DRAW_DURATION = 0.6f;   // Time to wait for draw animation
+	// WeaponSwitchCooldown from config.h controls minimum time between weapon switches
+	
+	struct WeaponStateData
+	{
+		UInt32 actorFormID;
+		WeaponState state;
+		WeaponRequest pendingRequest;
+		float stateStartTime;
+		float lastSwitchTime;
+		bool isValid;
+	};
+	
+	static WeaponStateData g_weaponStateData[10];
+	static int g_weaponStateCount = 0;
+	static bool g_weaponStateInitialized = false;
+	
+	// ============================================
+	// Internal Helpers
+	// ============================================
+	
+	static WeaponStateData* GetOrCreateWeaponStateData(UInt32 actorFormID)
+	{
+		// Find existing
+		for (int i = 0; i < g_weaponStateCount; i++)
+		{
+			if (g_weaponStateData[i].isValid && g_weaponStateData[i].actorFormID == actorFormID)
+			{
+				return &g_weaponStateData[i];
+			}
+		}
+		
+		// Create new
+		if (g_weaponStateCount < 10)
+		{
+			WeaponStateData* data = &g_weaponStateData[g_weaponStateCount];
+			data->actorFormID = actorFormID;
+			data->state = WeaponState::Idle;
+			data->pendingRequest = WeaponRequest::None;
+			data->stateStartTime = 0;
+			data->lastSwitchTime = -WeaponSwitchCooldown;  // Use config value
+			data->isValid = true;
+			g_weaponStateCount++;
+			return data;
+		}
+		
+		return nullptr;
+	}
+	
+	static Actor* GetActorFromFormID(UInt32 formID)
+	{
+		TESForm* form = LookupFormByID(formID);
+		if (!form || form->formType != kFormType_Character) return nullptr;
+		return static_cast<Actor*>(form);
+	}
+	
+	// ============================================
+	// State Machine Operations (internal)
+	// ============================================
+	
+	static void DoSheatheWeapon(Actor* actor)
+	{
+		if (!actor) return;
+		if (IsWeaponDrawn(actor))
+		{
+			actor->DrawSheatheWeapon(false);
+		}
+	}
+	
+	static void DoEquipWeapon(Actor* actor, WeaponRequest request)
+	{
+		if (!actor) return;
+		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		
+		if (request == WeaponRequest::Melee)
+		{
+			TESObjectWEAP* melee = FindBestMeleeInInventory(actor);
+			if (melee)
+			{
+				EquipManager* equipManager = EquipManager::GetSingleton();
+				if (equipManager)
+				{
+					BGSEquipSlot* rightSlot = GetRightHandSlot();
+					CALL_MEMBER_FN(equipManager, EquipItem)(actor, melee, nullptr, 1, rightSlot, false, false, false, nullptr);
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED melee", actor->formID, actorName ? actorName : "Unknown");
+				}
+			}
+			else
+			{
+				// Give default Iron Mace
+				TESForm* maceForm = LookupFormByID(0x00013982);
+				if (maceForm)
+				{
+					TESObjectWEAP* mace = DYNAMIC_CAST(maceForm, TESForm, TESObjectWEAP);
+					if (mace)
+					{
+						AddItem_Native(nullptr, 0, actor, maceForm, 1, true);
+						EquipManager* equipManager = EquipManager::GetSingleton();
+						if (equipManager)
+						{
+							BGSEquipSlot* rightSlot = GetRightHandSlot();
+							CALL_MEMBER_FN(equipManager, EquipItem)(actor, mace, nullptr, 1, rightSlot, false, false, false, nullptr);
+							_MESSAGE("WeaponState: Actor %08X '%s' GIVEN default melee", actor->formID, actorName ? actorName : "Unknown");
+						}
+					}
+				}
+			}
+		}
+		else if (request == WeaponRequest::Bow)
+		{
+			TESObjectWEAP* bow = FindBestBowInInventory(actor);
+			if (bow)
+			{
+				EquipManager* equipManager = EquipManager::GetSingleton();
+				if (equipManager)
+				{
+					BGSEquipSlot* rightSlot = GetRightHandSlot();
+					CALL_MEMBER_FN(equipManager, EquipItem)(actor, bow, nullptr, 1, rightSlot, false, false, false, nullptr);
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED bow", actor->formID, actorName ? actorName : "Unknown");
+				}
+				EquipArrows(actor);
+			}
+			else
+			{
+				// No bow - fall back to melee
+				_MESSAGE("WeaponState: Actor %08X '%s' has no bow - falling back to melee", actor->formID, actorName ? actorName : "Unknown");
+				DoEquipWeapon(actor, WeaponRequest::Melee);
+			}
+		}
+	}
+	
+	static void DoDrawWeapon(Actor* actor)
+	{
+		if (!actor) return;
+		if (!IsWeaponDrawn(actor))
+		{
+			actor->DrawSheatheWeapon(true);
+		}
+	}
+	
+	static void ProcessWeaponState(WeaponStateData* data)
+	{
+		if (!data || !data->isValid) return;
+		
+		Actor* actor = GetActorFromFormID(data->actorFormID);
+		if (!actor || actor->IsDead(1))
+		{
+			data->isValid = false;
+			return;
+		}
+		
+		float currentTime = GetGameTime();
+		float timeInState = currentTime - data->stateStartTime;
+		
+		switch (data->state)
+		{
+			case WeaponState::Idle:
+				// Nothing to do
+				break;
+				
+			case WeaponState::Sheathing:
+				// Use SheatheTransitionTime from config for sheathe animation wait
+				if (timeInState >= SheatheTransitionTime)
+				{
+					data->state = WeaponState::Equipping;
+					data->stateStartTime = currentTime;
+					DoEquipWeapon(actor, data->pendingRequest);
+				}
+				break;
+				
+			case WeaponState::Equipping:
+				if (timeInState >= WEAPON_EQUIP_DURATION)
+				{
+					data->state = WeaponState::Drawing;
+					data->stateStartTime = currentTime;
+					DoDrawWeapon(actor);
+				}
+				break;
+				
+			case WeaponState::Drawing:
+				if (timeInState >= WEAPON_DRAW_DURATION)
+				{
+					data->state = WeaponState::Ready;
+					data->stateStartTime = currentTime;
+					data->lastSwitchTime = currentTime;
+					data->pendingRequest = WeaponRequest::None;
+					_MESSAGE("WeaponState: Actor %08X weapon READY", actor->formID);
+				}
+				break;
+				
+			case WeaponState::Ready:
+				// Ensure weapon stays drawn
+				if (!IsWeaponDrawn(actor))
+				{
+					DoDrawWeapon(actor);
+				}
+				break;
+		}
+	}
+	
+	// ============================================
+	// Public API Implementation
+	// ============================================
+	
+	void InitWeaponStateSystem()
+	{
+		if (g_weaponStateInitialized) return;
+		
+		_MESSAGE("WeaponState: Initializing...");
+		_MESSAGE("WeaponState: WeaponSwitchDistance=%.1f, WeaponSwitchDistanceMounted=%.1f", 
+			WeaponSwitchDistance, WeaponSwitchDistanceMounted);
+		_MESSAGE("WeaponState: WeaponSwitchCooldown=%.1f, SheatheTransitionTime=%.1f", 
+			WeaponSwitchCooldown, SheatheTransitionTime);
+		
+		for (int i = 0; i < 10; i++)
+		{
+			g_weaponStateData[i].isValid = false;
+			g_weaponStateData[i].actorFormID = 0;
+		}
+		g_weaponStateCount = 0;
+		g_weaponStateInitialized = true;
+		_MESSAGE("WeaponState: Initialized");
+	}
+	
+	void ResetWeaponStateSystem()
+	{
+		_MESSAGE("WeaponState: Resetting...");
+		for (int i = 0; i < 10; i++)
+		{
+			g_weaponStateData[i].isValid = false;
+			g_weaponStateData[i].actorFormID = 0;
+		}
+		g_weaponStateCount = 0;
+		_MESSAGE("WeaponState: Reset complete");
+	}
+	
+	void UpdateWeaponStates()
+	{
+		if (!g_weaponStateInitialized) return;
+		
+		for (int i = 0; i < g_weaponStateCount; i++)
+		{
+			if (g_weaponStateData[i].isValid)
+			{
+				ProcessWeaponState(&g_weaponStateData[i]);
+			}
+		}
+	}
+	
+	bool RequestWeaponSwitch(Actor* actor, WeaponRequest request)
+	{
+		if (!actor || request == WeaponRequest::None) return false;
+		
+		WeaponStateData* data = GetOrCreateWeaponStateData(actor->formID);
+		if (!data) return false;
+		
+		// Don't interrupt ongoing transitions
+		if (data->state != WeaponState::Idle && data->state != WeaponState::Ready)
+		{
+			return false;
+		}
+		
+		// Check cooldown using config value
+		float currentTime = GetGameTime();
+		if ((currentTime - data->lastSwitchTime) < WeaponSwitchCooldown)
+		{
+			return false;
+		}
+		
+		// Check if we already have what's requested
+		if (request == WeaponRequest::Melee && IsMeleeEquipped(actor))
+		{
+			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
+			data->state = WeaponState::Ready;
+			return true;
+		}
+		if (request == WeaponRequest::Bow && IsBowEquipped(actor))
+		{
+			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
+			data->state = WeaponState::Ready;
+			return true;
+		}
+		
+		// Start weapon switch sequence
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		const char* reqStr = (request == WeaponRequest::Melee) ? "MELEE" : "BOW";
+		_MESSAGE("WeaponState: Actor %08X '%s' requesting %s switch", actor->formID, actorName ? actorName : "Unknown", reqStr);
+		
+		data->pendingRequest = request;
+		data->state = WeaponState::Sheathing;
+		data->stateStartTime = currentTime;
+		DoSheatheWeapon(actor);
+		
+		return true;
+	}
+	
+	bool RequestWeaponForDistance(Actor* actor, float distanceToTarget, bool targetIsMounted)
+	{
+		if (!actor) return false;
+		
+		// Use WeaponSwitchDistance for on-foot targets, WeaponSwitchDistanceMounted for mounted targets
+		// These values come from config.h and are loaded from INI
+		float switchDist = targetIsMounted ? WeaponSwitchDistanceMounted : WeaponSwitchDistance;
+		bool hasBow = HasBowInInventory(actor);
+		
+		WeaponRequest request;
+		bool forceMelee = false;  // Flag to bypass cooldown for critical melee switch
+		
+		if (distanceToTarget <= switchDist)
+		{
+			// Within melee range - ALWAYS use melee weapon
+			request = WeaponRequest::Melee;
+			
+			// CRITICAL: If bow is currently equipped and we're in melee range, FORCE the switch
+			// This bypasses cooldown because being stuck with a bow in melee is deadly
+			if (IsBowEquipped(actor))
+			{
+				forceMelee = true;
+				_MESSAGE("WeaponState: FORCE MELEE - %08X has bow but is at melee range (%.0f <= %.0f)", 
+					actor->formID, distanceToTarget, switchDist);
+			}
+		}
+		else if (hasBow)
+		{
+			// Beyond switch distance and has bow - use bow
+			request = WeaponRequest::Bow;
+		}
+		else
+		{
+			// Beyond switch distance but no bow - use melee anyway
+			request = WeaponRequest::Melee;
+		}
+		
+		// If forcing melee, bypass the normal request and directly switch
+		if (forceMelee)
+		{
+			return ForceWeaponSwitch(actor, WeaponRequest::Melee);
+		}
+		
+		return RequestWeaponSwitch(actor, request);
+	}
+	
+	// ============================================
+	// FORCE WEAPON SWITCH - Bypasses cooldown
+	// Used when actor MUST switch (e.g., bow in melee range)
+	// ============================================
+	bool ForceWeaponSwitch(Actor* actor, WeaponRequest request)
+	{
+		if (!actor || request == WeaponRequest::None) return false;
+		
+		WeaponStateData* data = GetOrCreateWeaponStateData(actor->formID);
+		if (!data) return false;
+		
+		// Don't interrupt ongoing transitions (animation would look bad)
+		if (data->state == WeaponState::Sheathing || data->state == WeaponState::Equipping || data->state == WeaponState::Drawing)
+		{
+			return false;
+		}
+		
+		// Check if we already have what's requested
+		if (request == WeaponRequest::Melee && IsMeleeEquipped(actor))
+		{
+			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
+			data->state = WeaponState::Ready;
+			return true;
+		}
+		if (request == WeaponRequest::Bow && IsBowEquipped(actor))
+		{
+			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
+			data->state = WeaponState::Ready;
+			return true;
+		}
+		
+		// FORCE the switch - NO COOLDOWN CHECK
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		const char* reqStr = (request == WeaponRequest::Melee) ? "MELEE" : "BOW";
+		_MESSAGE("WeaponState: Actor %08X '%s' FORCING %s switch (bypassing cooldown)", 
+			actor->formID, actorName ? actorName : "Unknown", reqStr);
+		
+		float currentTime = GetGameTime();
+		data->pendingRequest = request;
+		data->state = WeaponState::Sheathing;
+		data->stateStartTime = currentTime;
+		DoSheatheWeapon(actor);
+		
+		return true;
+	}
+	
+	bool RequestWeaponDraw(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		WeaponStateData* data = GetOrCreateWeaponStateData(actor->formID);
+		if (!data) return false;
+		
+		if (data->state != WeaponState::Idle && data->state != WeaponState::Ready)
+		{
+			return false;
+		}
+		
+		if (!IsWeaponDrawn(actor))
+		{
+			DoDrawWeapon(actor);
+		}
+		data->state = WeaponState::Ready;
+		return true;
+	}
+	
+	bool RequestWeaponSheathe(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		WeaponStateData* data = GetOrCreateWeaponStateData(actor->formID);
+		if (!data) return false;
+		
+		DoSheatheWeapon(actor);
+		data->state = WeaponState::Idle;
+		data->pendingRequest = WeaponRequest::None;
+		return true;
+	}
+	
+	WeaponState GetWeaponState(UInt32 actorFormID)
+	{
+		for (int i = 0; i < g_weaponStateCount; i++)
+		{
+			if (g_weaponStateData[i].isValid && g_weaponStateData[i].actorFormID == actorFormID)
+			{
+				return g_weaponStateData[i].state;
+			}
+		}
+		return WeaponState::Idle;
+	}
+	
+	bool IsWeaponReady(Actor* actor)
+	{
+		if (!actor) return false;
+		return GetWeaponState(actor->formID) == WeaponState::Ready;
+	}
+	
+	bool IsWeaponTransitioning(Actor* actor)
+	{
+		if (!actor) return false;
+		WeaponState state = GetWeaponState(actor->formID);
+		return (state == WeaponState::Sheathing || state == WeaponState::Equipping || state == WeaponState::Drawing);
+	}
+	
+	bool CanSwitchWeapon(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		for (int i = 0; i < g_weaponStateCount; i++)
+		{
+			if (g_weaponStateData[i].isValid && g_weaponStateData[i].actorFormID == actor->formID)
+			{
+				if (g_weaponStateData[i].state != WeaponState::Idle && g_weaponStateData[i].state != WeaponState::Ready)
+					return false;
+				
+				float currentTime = GetGameTime();
+				return (currentTime - g_weaponStateData[i].lastSwitchTime) >= WeaponSwitchCooldown;
+			}
+		}
+		return true;
+	}
+	
+	void ClearWeaponStateData(UInt32 actorFormID)
+	{
+		for (int i = 0; i < g_weaponStateCount; i++)
+		{
+			if (g_weaponStateData[i].isValid && g_weaponStateData[i].actorFormID == actorFormID)
+			{
+				g_weaponStateData[i].isValid = false;
+				_MESSAGE("WeaponState: Cleared data for actor %08X", actorFormID);
+				return;
+			}
+		}
+	}
+	
+	// ============================================
+	// ORIGINAL WEAPON DETECTION CODE BELOW
+	// ============================================
+
 	// Iron Arrow FormID from Skyrim.esm
 	const UInt32 IRON_ARROW_FORMID = 0x0001397D;
 	
@@ -16,337 +507,6 @@ namespace MountedNPCCombatVR
 	
 	// Hunting Bow FormID from Skyrim.esm
 	const UInt32 HUNTING_BOW_FORMID = 0x00013985;
-	
-	// ============================================
-	// WEAPON COLLISION SYSTEM
-	// Based on WeaponCollisionVR's approach
-	// Uses line segment collision for accurate hit detection
-	// ============================================
-	
-	// Collision configuration - INCREASED for mounted combat (longer range)
-	const float WEAPON_COLLISION_DIST_THRESHOLD = 100.0f;  // Distance threshold for collision (was 50)
-	const float BODY_CAPSULE_RADIUS = 50.0f;        // Approximate body collision radius (was 30)
-	const float MOUNTED_HIT_RANGE_BONUS = 80.0f;           // Extra range for mounted combat
-	
-	// Weapon bone names to search for
-	static const char* WEAPON_BONE_RIGHT[] = {
-		"WEAPON", "Weapon", "NPC R Hand [RHnd]", "NPC R Forearm [RLar]"
-	};
-	
-	static const char* WEAPON_BONE_LEFT[] = {
-		"SHIELD", "Shield", "NPC L Hand [LHnd]", "NPC L Forearm [LLar]"
-	};
-	
-	// Math helper: Lerp between two points
-	static NiPoint3 Lerp(const NiPoint3& A, const NiPoint3& B, float k)
-	{
-		return NiPoint3(
-			A.x + (B.x - A.x) * k,
-			A.y + (B.y - A.y) * k,
-			A.z + (B.z - A.z) * k
-		);
-	}
-	
-	// Math helper: Clamp value to 0-1 range
-	static float Clamp01(float t)
-	{
-		return (std::max)(0.0f, (std::min)(1.0f, t));
-	}
-	
-	// Math helper: Dot product
-	static float DotProduct(const NiPoint3& A, const NiPoint3& B)
-	{
-		return A.x * B.x + A.y * B.y + A.z * B.z;
-	}
-	
-	// Math helper: Get distance between two points
-	static float GetPointDistance(const NiPoint3& A, const NiPoint3& B)
-	{
-		float dx = B.x - A.x;
-		float dy = B.y - A.y;
-		float dz = B.z - A.z;
-		return sqrt(dx * dx + dy * dy + dz * dz);
-	}
-	
-	// Math helper: Find closest point on a line segment to a given point
-	// Same algorithm as WeaponCollisionVR
-	static NiPoint3 ConstrainToSegment(const NiPoint3& position, const NiPoint3& segStart, const NiPoint3& segEnd)
-	{
-		NiPoint3 ba(segEnd.x - segStart.x, segEnd.y - segStart.y, segEnd.z - segStart.z);
-		NiPoint3 pa(position.x - segStart.x, position.y - segStart.y, position.z - segStart.z);
-		
-		float baDotBa = DotProduct(ba, ba);
-		if (baDotBa < 0.0001f) return segStart;  // Degenerate segment
-		
-		float t = DotProduct(ba, pa) / baDotBa;
-		return Lerp(segStart, segEnd, Clamp01(t));
-	}
-	
-	// Distance from a point to a line segment
-	static float DistPointToSegment(const NiPoint3& point, const NiPoint3& segStart, const NiPoint3& segEnd)
-	{
-		NiPoint3 closestPoint = ConstrainToSegment(point, segStart, segEnd);
-		return GetPointDistance(point, closestPoint);
-	}
-	
-	// Closest distance between two line segments
-	// Returns the distance and optionally the contact point
-	static float DistSegmentToSegment(
-		const NiPoint3& seg1Start, const NiPoint3& seg1End,
-		const NiPoint3& seg2Start, const NiPoint3& seg2End,
-		NiPoint3* outContactPoint)
-	{
-		// Sample points along segment 1 and find closest to segment 2
-		float minDist = 999999.0f;
-		NiPoint3 closestPoint;
-		
-		const int SAMPLES = 10;
-		for (int i = 0; i <= SAMPLES; i++)
-		{
-			float t = (float)i / (float)SAMPLES;
-			NiPoint3 p1 = Lerp(seg1Start, seg1End, t);
-			
-			NiPoint3 closestOnSeg2 = ConstrainToSegment(p1, seg2Start, seg2End);
-			float dist = GetPointDistance(p1, closestOnSeg2);
-			
-			if (dist < minDist)
-			{
-				minDist = dist;
-				closestPoint = Lerp(p1, closestOnSeg2, 0.5f);  // Midpoint as contact
-			}
-		}
-		
-		// Also sample from segment 2 to segment 1
-		for (int i = 0; i <= SAMPLES; i++)
-		{
-			float t = (float)i / (float)SAMPLES;
-			NiPoint3 p2 = Lerp(seg2Start, seg2End, t);
-			
-			NiPoint3 closestOnSeg1 = ConstrainToSegment(p2, seg1Start, seg1End);
-			float dist = GetPointDistance(p2, closestOnSeg1);
-			
-			if (dist < minDist)
-			{
-				minDist = dist;
-				closestPoint = Lerp(p2, closestOnSeg1, 0.5f);
-			}
-		}
-		
-		if (outContactPoint) *outContactPoint = closestPoint;
-		return minDist;
-	}
-	
-	// Get weapon segment (hand position to weapon tip) for an actor
-	bool GetWeaponSegment(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop, bool leftHand)
-	{
-		if (!actor) return false;
-		
-		NiNode* root = actor->GetNiNode();
-		if (!root) 
-		{
-			_MESSAGE("WeaponDetection: GetWeaponSegment - No root node for actor %08X", actor->formID);
-			return false;
-		}
-		
-		// Find weapon bone
-		NiAVObject* weaponNode = nullptr;
-		const char** boneNames = leftHand ? WEAPON_BONE_LEFT : WEAPON_BONE_RIGHT;
-		int boneCount = 4;
-		const char* foundBoneName = nullptr;
-		
-		for (int i = 0; i < boneCount; i++)
-		{
-			const char* boneName = boneNames[i];
-			weaponNode = root->GetObjectByName(&boneName);
-			if (weaponNode) 
-			{
-				foundBoneName = boneName;
-				break;
-			}
-		}
-		
-		if (!weaponNode)
-		{
-			// Debug: Log that we couldn't find weapon bone
-			static int logCount = 0;
-			if (++logCount % 60 == 1)  // Only log occasionally
-			{
-				_MESSAGE("WeaponDetection: GetWeaponSegment - No weapon bone found for actor %08X (tried WEAPON, NPC R Hand, etc.)", actor->formID);
-			}
-			
-			// Fallback: use actor position
-			outBottom.x = actor->pos.x;
-			outBottom.y = actor->pos.y;
-			outBottom.z = actor->pos.z + 100.0f;
-			outTop = outBottom;
-			return false;
-		}
-		
-		// Get hand position (weapon bottom)
-		outBottom.x = weaponNode->m_worldTransform.pos.x;
-		outBottom.y = weaponNode->m_worldTransform.pos.y;
-		outBottom.z = weaponNode->m_worldTransform.pos.z;
-		
-		// Calculate weapon tip using rotation matrix and reach
-		float reach = GetWeaponReach(actor);
-		if (reach < 50.0f) reach = 70.0f;  // Minimum reach for melee
-		
-		// Get weapon direction from rotation matrix (Y-axis in bone space typically)
-		// WeaponCollisionVR uses: rotate.entry[0][1], rotate.entry[1][1], rotate.entry[2][1]
-		NiMatrix33& rot = weaponNode->m_worldTransform.rot;
-		NiPoint3 weaponDir(rot.data[0][1], rot.data[1][1], rot.data[2][1]);
-		
-		// Normalize
-		float len = sqrt(weaponDir.x * weaponDir.x + weaponDir.y * weaponDir.y + weaponDir.z * weaponDir.z);
-		if (len > 0.001f)
-		{
-			weaponDir.x /= len;
-			weaponDir.y /= len;
-			weaponDir.z /= len;
-		}
-		
-		// Calculate weapon tip
-		outTop.x = outBottom.x + weaponDir.x * reach;
-		outTop.y = outBottom.y + weaponDir.y * reach;
-		outTop.z = outBottom.z + weaponDir.z * reach;
-		
-		// Debug: Log successful weapon segment (occasionally)
-		static int successLog = 0;
-		if (++successLog % 120 == 1)
-		{
-			_MESSAGE("WeaponDetection: Got weapon segment for %08X - bone '%s', bottom(%.0f,%.0f,%.0f) top(%.0f,%.0f,%.0f)", 
-				actor->formID, foundBoneName,
-				outBottom.x, outBottom.y, outBottom.z,
-				outTop.x, outTop.y, outTop.z);
-		}
-		
-		return true;
-	}
-	
-	// Get body capsule (vertical line segment representing actor's body)
-	void GetBodyCapsule(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop)
-	{
-		if (!actor)
-		{
-			outBottom = NiPoint3(0, 0, 0);
-			outTop = NiPoint3(0, 0, 0);
-			return;
-		}
-		
-		// Body capsule from feet to head
-		outBottom.x = actor->pos.x;
-		outBottom.y = actor->pos.y;
-		outBottom.z = actor->pos.z + 20.0f;  // Slightly above ground
-		
-		outTop.x = actor->pos.x;
-		outTop.y = actor->pos.y;
-		outTop.z = actor->pos.z + 150.0f;// Approximate head height
-	}
-	
-	// ============================================
-	// Main Weapon Collision Check
-	// Checks if rider's weapon collides with target's body or weapon
-	// Note: WeaponCollisionResult struct is defined in WeaponDetection.h
-	// ============================================
-	
-	WeaponCollisionResult CheckWeaponCollision(Actor* attacker, Actor* target)
-	{
-		WeaponCollisionResult result;
-		result.hasCollision = false;
-		result.distance = 999999.0f;
-		result.contactPoint = NiPoint3(0, 0, 0);
-		result.hitWeapon = false;
-		
-		if (!attacker || !target) return result;
-		
-		// Get attacker's weapon segment
-		NiPoint3 attackWeapBottom, attackWeapTop;
-		bool gotAttackerWeapon = GetWeaponSegment(attacker, attackWeapBottom, attackWeapTop, false);
-		
-		if (!gotAttackerWeapon)
-		{
-			// Debug log - weapon segment failed
-			static int failLog = 0;
-			if (++failLog % 30 == 1)
-			{
-				_MESSAGE("WeaponDetection: CheckWeaponCollision - Failed to get attacker weapon segment");
-			}
-			return result;
-		}
-		
-		// Get target's body capsule
-		NiPoint3 bodyBottom, bodyTop;
-		GetBodyCapsule(target, bodyBottom, bodyTop);
-		
-		// Check collision with body
-		NiPoint3 bodyContactPoint;
-		float bodyDist = DistSegmentToSegment(attackWeapBottom, attackWeapTop, bodyBottom, bodyTop, &bodyContactPoint);
-		
-		// Add body radius to threshold
-		float bodyThreshold = WEAPON_COLLISION_DIST_THRESHOLD + BODY_CAPSULE_RADIUS;
-		
-		// Debug: Log collision distances occasionally
-		static int distLog = 0;
-		if (++distLog % 30 == 1)
-		{
-			_MESSAGE("WeaponDetection: Collision dist=%.1f, threshold=%.1f (weap: %.0f,%.0f,%.0f -> %.0f,%.0f,%.0f)",
-				bodyDist, bodyThreshold,
-				attackWeapBottom.x, attackWeapBottom.y, attackWeapBottom.z,
-				attackWeapTop.x, attackWeapTop.y, attackWeapTop.z);
-		}
-		
-		if (bodyDist < bodyThreshold)
-		{
-			result.hasCollision = true;
-			result.distance = bodyDist;
-			result.contactPoint = bodyContactPoint;
-			result.hitWeapon = false;
-		}
-		
-		// Check if target is blocking with weapon
-		NiPoint3 targetWeapBottom, targetWeapTop;
-		if (GetWeaponSegment(target, targetWeapBottom, targetWeapTop, false))
-		{
-			NiPoint3 weapContactPoint;
-			float weapDist = DistSegmentToSegment(attackWeapBottom, attackWeapTop, targetWeapBottom, targetWeapTop, &weapContactPoint);
-			
-			// Weapon-to-weapon collision has tighter threshold
-			float weapThreshold = WEAPON_COLLISION_DIST_THRESHOLD * 0.7f;
-			
-			if (weapDist < weapThreshold && weapDist < bodyDist)
-			{
-				result.hasCollision = true;
-				result.distance = weapDist;
-				result.contactPoint = weapContactPoint;
-				result.hitWeapon = true;  // Hit their weapon (potential parry)
-			}
-		}
-		
-		// Also check shield if target has one
-		TESForm* leftHandItem = target->GetEquippedObject(true);
-		if (leftHandItem && leftHandItem->formType == kFormType_Armor)
-		{
-			NiPoint3 shieldBottom, shieldTop;
-			if (GetWeaponSegment(target, shieldBottom, shieldTop, true))
-			{
-				NiPoint3 shieldContactPoint;
-				float shieldDist = DistSegmentToSegment(attackWeapBottom, attackWeapTop, shieldBottom, shieldTop, &shieldContactPoint);
-				
-				// Shield has larger collision area
-				float shieldThreshold = WEAPON_COLLISION_DIST_THRESHOLD * 1.5f;
-				
-				if (shieldDist < shieldThreshold && shieldDist < result.distance)
-				{
-					result.hasCollision = true;
-					result.distance = shieldDist;
-					result.contactPoint = shieldContactPoint;
-					result.hitWeapon = true;  // Shield counts as blocking
-				}
-			}
-		}
-		
-		return result;
-	}
 	
 	// ============================================
 	// Inventory Add Functions
@@ -1050,22 +1210,6 @@ namespace MountedNPCCombatVR
 		float baseThreshold = targetIsPlayer ? HIT_THRESHOLD_PLAYER : HIT_THRESHOLD_NPC;
 		
 		float effectiveThreshold = baseThreshold + (weaponReach * 0.5f) + MOUNTED_REACH_BONUS;
-		
-		// Log hit checks for debugging NPC vs NPC combat
-		if (!targetIsPlayer)
-		{
-			static int hitCheckLogCounter = 0;
-			hitCheckLogCounter++;
-			// Log every 30th check to avoid spam
-			if (hitCheckLogCounter % 30 == 0)
-			{
-				const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-				_MESSAGE("WeaponDetection: Hit check vs NPC '%s' - dist: %.0f, threshold: %.0f, inRange: %s",
-					targetName ? targetName : "Unknown",
-					distance, effectiveThreshold,
-					(distance <= effectiveThreshold) ? "YES" : "NO");
-			}
-		}
 		
 		return (distance <= effectiveThreshold);
 	}

@@ -68,6 +68,9 @@ namespace MountedNPCCombatVR
 		// Clear all tracking data
 		ResetAllMountedNPCs();
 		
+		// Initialize weapon state system
+		InitWeaponStateSystem();
+		
 		// Initialize companion combat system
 		InitCompanionCombat();
 		
@@ -149,6 +152,9 @@ namespace MountedNPCCombatVR
 		
 		// Clear any remaining protection tracking
 		ClearAllMountedProtection();
+		
+		// Reset weapon state system
+		ResetWeaponStateSystem();
 		
 		// Reset companion combat tracking
 		ResetCompanionCombat();
@@ -256,23 +262,29 @@ namespace MountedNPCCombatVR
 			data->combatClass = DetermineCombatClass(actor);
 		}
 		
-		// Log compact summary
-		_MESSAGE("MountedCombat: Detected '%s' (%08X) on horse %08X - Class: %s", 
-			actorName ? actorName : "Unknown", actor->formID, mount->formID,
-			GetCombatClassName(data->combatClass));
-		
+		// Rate limit logging - only log first detection per NPC
+		static UInt32 lastDetectedNPC = 0;
+		if (lastDetectedNPC != actor->formID)
+		{
+			lastDetectedNPC = actor->formID;
+			_MESSAGE("MountedCombat: Detected '%s' (%08X) on horse %08X - Class: %s", 
+				actorName ? actorName : "Unknown", actor->formID, mount->formID,
+				GetCombatClassName(data->combatClass));
+		}
+
 		// ============================================
-		// PRE-ASSIGN CAPTAIN TO RANGED ROLE
+		// PRE-ASSIGN CAPTAIN OR LEADER TO RANGED ROLE
+		// Use centralized weapon system
 		// ============================================
-		if (actorName && strstr(actorName, "Captain") != nullptr)
+		if (actorName && (strstr(actorName, "Captain") != nullptr || strstr(actorName, "Leader") != nullptr))
 		{
 			if (!HasBowInInventory(actor))
 			{
 				GiveDefaultBow(actor);
 			}
-			EquipArrows(actor);
-			EquipBestBow(actor);
-			actor->DrawSheatheWeapon(true);
+			
+			// Use centralized weapon system to switch to bow
+			RequestWeaponSwitch(actor, WeaponRequest::Bow);
 			
 			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED", actorName);
 			
@@ -1219,15 +1231,14 @@ namespace MountedNPCCombatVR
 				
 				ClearAllMountedProtection();
 				
-				// Reset all state
+				// Reset combat state but NOT the dead tracking!
 				g_playerInMountedCombat = false;
 				g_playerTriggeredMountedCombat = false;
 				g_playerWasMountedWhenCombatStarted = false;
 				g_playerInExterior = true;  // Assume exterior until checked
-				g_playerIsDead = false;     // Assume alive until checked
 				g_lastPlayerMountedCombatState = false;
 				g_lastExteriorState = true;
-				g_lastPlayerDeadState = false;
+				// DON'T reset g_playerIsDead or g_lastPlayerDeadState here!
 			}
 			else
 			{

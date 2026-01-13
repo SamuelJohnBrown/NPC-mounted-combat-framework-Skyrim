@@ -29,8 +29,12 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	// Start/stop horse sprint animation
+	// StartHorseSprint includes cooldown check - won't spam if already sprinting
 	void StartHorseSprint(Actor* horse);
 	void StopHorseSprint(Actor* horse);
+	
+	// Check if horse is currently sprinting
+	bool IsHorseSprinting(Actor* horse);
 	
 	// ============================================
 	// Horse Rear Up Animation

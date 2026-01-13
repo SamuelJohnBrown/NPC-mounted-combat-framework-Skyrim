@@ -16,17 +16,18 @@ namespace MountedNPCCombatVR {
 	// COMBAT RANGE SETTINGS
 	// ============================================
 	
-	float WeaponSwitchDistance = 230.0f;
-	float MeleeRangeOnFoot = 150.0f;
+	float WeaponSwitchDistance = 250.0f;  // Should be > MeleeRangeOnFoot so weapon switches BEFORE entering melee
+	float WeaponSwitchDistanceMounted = 325.0f;  // Mounted vs mounted NPC combat
+	float MeleeRangeOnFoot = 190.0f;
 	float MeleeRangeOnFootNPC = 230.0f;
-	float MeleeRangeMounted = 300.0f;
-	
+	float MeleeRangeMounted = 250.0f;
+
 	// ============================================
 	// WEAPON SWITCH SETTINGS
 	// ============================================
 	
-	float WeaponSwitchCooldown = 5.0f;
-	float SheatheTransitionTime = 0.8f;
+	float WeaponSwitchCooldown = 1.0f;  // Reduced to 1 second for responsive switching
+	float SheatheTransitionTime = 0.5f;  // Time to wait for sheathe animation
 
 	// ============================================
 	// MOUNT ROTATION SETTINGS
@@ -118,6 +119,13 @@ namespace MountedNPCCombatVR {
 	bool MountedAttackStaggerEnabled = true;    // Enable stagger on unblocked hits vs NPCs
 	int MountedAttackStaggerChance = 20;        // 20% chance to stagger
 	float MountedAttackStaggerForce = 0.5f;     // Knockback force (gentle to avoid flying)
+	
+	// ============================================
+	// MOUNTED ATTACK DAMAGE MULTIPLIER SETTINGS
+	// ============================================
+	
+	float HostileRiderDamageMultiplier = 3.0f;     // 3x damage for hostile riders vs NPCs
+	float CompanionRiderDamageMultiplier = 2.0f;   // 2x damage for companion riders vs NPCs
 
 	// ============================================
 	// HOSTILE DETECTION SETTINGS
@@ -229,6 +237,7 @@ namespace MountedNPCCombatVR {
 				else if (variableName == "EnableRemounting") EnableRemounting = (std::stoi(variableValueStr) != 0);
 				// Combat Range
 				else if (variableName == "WeaponSwitchDistance") WeaponSwitchDistance = std::stof(variableValueStr);
+				else if (variableName == "WeaponSwitchDistanceMounted") WeaponSwitchDistanceMounted = std::stof(variableValueStr);
 				else if (variableName == "MeleeRangeOnFoot") MeleeRangeOnFoot = std::stof(variableValueStr);
 				else if (variableName == "MeleeRangeOnFootNPC") MeleeRangeOnFootNPC = std::stof(variableValueStr);
 				else if (variableName == "MeleeRangeMounted") MeleeRangeMounted = std::stof(variableValueStr);
@@ -291,6 +300,9 @@ namespace MountedNPCCombatVR {
 				else if (variableName == "MountedAttackStaggerEnabled") MountedAttackStaggerEnabled = (std::stoi(variableValueStr) != 0);
 				else if (variableName == "MountedAttackStaggerChance") MountedAttackStaggerChance = std::stoi(variableValueStr);
 				else if (variableName == "MountedAttackStaggerForce") MountedAttackStaggerForce = std::stof(variableValueStr);
+				// Damage Multipliers
+				else if (variableName == "HostileRiderDamageMultiplier") HostileRiderDamageMultiplier = std::stof(variableValueStr);
+				else if (variableName == "CompanionRiderDamageMultiplier") CompanionRiderDamageMultiplier = std::stof(variableValueStr);
 				// Hostile Detection
 				else if (variableName == "HostileDetectionRange") HostileDetectionRange = std::stof(variableValueStr);
 				else if (variableName == "HostileScanInterval") HostileScanInterval = std::stof(variableValueStr);
@@ -329,12 +341,12 @@ namespace MountedNPCCombatVR {
 						}
 					}
 				}
-			}  
-		} 
+			}
+		}
 	
 		file.close();
 		_MESSAGE("loadConfig: INI loaded successfully");
-    }
+	}
 
 	void Log(const int msgLogLevel, const char* fmt, ...)
 	{

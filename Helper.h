@@ -35,6 +35,18 @@
 namespace MountedNPCCombatVR
 {
 	// ============================================
+	// Shared Utility Functions
+	// ============================================
+	
+	// Get elapsed time in seconds since mod started
+	// Use this instead of creating separate static time functions per file
+	float GetGameTime();
+	
+	// Ensure random number generator is seeded (call before using rand())
+	// Use this instead of creating separate EnsureRandomSeeded functions per file
+	void EnsureRandomSeeded();
+	
+	// ============================================
 	// Mod State Control
 	// ============================================
 	extern bool g_modActive;

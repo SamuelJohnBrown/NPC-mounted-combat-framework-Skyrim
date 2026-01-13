@@ -65,6 +65,13 @@ namespace MountedNPCCombatVR
 	// angleToTarget: current angle from horse to target
 	float Get90DegreeTurnAngle(UInt32 horseFormID, float angleToTarget);
 	
+	// Get 90-degree turn angle with cooldown for mounted vs mounted combat
+	// Prevents constant snap-turning when two mounted NPCs fight at close range
+	// horseFormID: the NPC's horse
+	// angleToTarget: current angle from horse to target
+	// distanceToTarget: distance to the target for close-range detection
+	float Get90DegreeTurnAngleForMountedTarget(UInt32 horseFormID, float angleToTarget, float distanceToTarget);
+
 	// Called when horse leaves melee range - will pick new random direction on next approach
 	void NotifyHorseLeftMeleeRange(UInt32 horseFormID);
 	
@@ -142,10 +149,9 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// When horse is obstructed on one side, turn away from
 	// the obstruction using trot turn animations.
-	// - Obstruction on LEFT -> Trot turn RIGHT
-	// - Obstruction on RIGHT -> Trot turn LEFT
 	
-	// Try to play trot turn animation based on obstruction side
+	// Try to play trot turn animation based on direction
+	// turnRight: true = trot right, false = trot left
 	// Returns true if turn was triggered
 	bool TryHorseTrotTurnToAvoid(Actor* horse, bool turnRight);
 	
@@ -153,6 +159,40 @@ namespace MountedNPCCombatVR
 	// Returns true if turn was triggered
 	bool TryHorseTrotTurnFromObstruction(Actor* horse);
 	
+	// ============================================
+	// Elevated Target Detection & Combat Dismount
+	// ============================================
+	// When rider is stuck below target (e.g., target in fort wall),
+	// and has tried jumping twice without success, allow dismount
+	// to continue fighting on foot. Can remount after 45 seconds.
+	
+	// Check if target is significantly above the horse (150+ units)
+	bool IsTargetElevatedAboveHorse(Actor* horse, Actor* target);
+	
+	// Track a jump attempt for elevated target detection
+	void TrackJumpAttemptForElevatedTarget(Actor* horse, Actor* target);
+	
+	// Check if rider should dismount due to elevated target
+	bool ShouldDismountForElevatedTarget(Actor* horse, Actor* target);
+	
+	// Check if rider should dismount due to being generally stuck (3 jumps in 20 seconds)
+	bool ShouldDismountForGeneralStuck(Actor* horse);
+	
+	// Execute combat dismount - rider gets off horse to pursue target on foot
+	bool ExecuteCombatDismount(Actor* rider, Actor* horse);
+	
+	// Check if rider can remount their horse after combat dismount
+	bool CanRemountAfterCombatDismount(Actor* rider, Actor* horse);
+	
+	// Execute remount after combat dismount
+	bool ExecuteCombatRemount(Actor* rider, Actor* horse);
+	
+	// Clear combat dismount data for a rider
+	void ClearCombatDismountData(UInt32 riderFormID);
+	
+	// Update combat dismount status - call periodically to check for remount
+	void UpdateCombatDismountStatus(Actor* rider);
+
 	// ============================================
 	// Horse Charge Maneuver (Long Distance Charge)
 	// ============================================
@@ -216,6 +256,7 @@ namespace MountedNPCCombatVR
 	// This allows the rider to land attacks instead of constantly chasing.
 	// Only used against non-player targets (both are moving toward each other).
 	// 25% chance to trigger when conditions are met.
+	// NOTE: Only for mounted vs on-foot combat (not mounted vs mounted)
 	
 	// Check and trigger stand ground maneuver
 	// Returns true if stand ground was initiated
@@ -226,6 +267,19 @@ namespace MountedNPCCombatVR
 	
 	// Check if horse in stand ground has noRotation flag (50% chance - faces target directly)
 	bool IsStandGroundNoRotation(UInt32 horseFormID);
+	
+	// Check if stand ground rotation is LOCKED (90-degree turn complete)
+	bool IsStandGroundRotationLocked(UInt32 horseFormID);
+	
+	// Get the locked angle for a stand ground horse
+	float GetStandGroundLockedAngle(UInt32 horseFormID);
+	
+	// Lock the rotation for a stand ground horse at a specific angle
+	void LockStandGroundRotation(UInt32 horseFormID, float angle);
+	
+	// Get the target 90-degree angle for stand ground (calculated ONCE at start)
+	// Returns the stored angle to prevent jitter from recalculating as target moves
+	float GetStandGroundTarget90DegreeAngle(UInt32 horseFormID, float angleToTarget);
 	
 	// Update stand ground state - call every frame while standing ground
 	// Returns true if still standing ground, false if completed
@@ -240,9 +294,9 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// Player Aggro Switch (vs Non-Player Target)
 	// ============================================
-	// When fighting a non-player NPC and player is within 1500 units,
-	// there's a 15% chance every 20 seconds to switch targets to the
-	// player and trigger a charge maneuver for variety.
+	// When fighting a non-player NPC and player is within 900 units,
+	// there's a distance-scaled chance (15% close, 2% at max range) 
+	// every 20 seconds to switch targets to the player and trigger a charge.
 	
 	// Check and trigger player aggro switch
 	// Returns true if switch was initiated (also triggers charge)
@@ -250,29 +304,6 @@ namespace MountedNPCCombatVR
 	
 	// Clear player aggro switch data for a horse
 	void ClearPlayerAggroSwitchData(UInt32 horseFormID);
-
-	// ============================================
-	// Melee Rider Collision Avoidance
-	// ============================================
-	// Prevents melee riders from bunching up on top of each other.
-	// When two melee riders get too close (130 units or less),
-	// they use trot animations to steer away from each other.
-	
-	// Check if another melee rider is too close and on which side
-	// Returns: 0 = no collision, 1 = collision on LEFT, 2 = collision on RIGHT
-	int CheckMeleeRiderCollision(Actor* horse, Actor* otherHorse);
-	
-	// Try to avoid collision with another melee rider
-	// Returns true if avoidance maneuver was triggered
-	bool TryMeleeRiderAvoidance(Actor* horse, Actor* otherHorse);
-	
-	// Check all nearby melee riders and avoid if needed
-	// Call this from the melee rider update loop
-	// Returns true if avoidance was triggered
-	bool UpdateMeleeRiderCollisionAvoidance(Actor* horse, Actor* target);
-	
-	// Clear melee avoidance data for a horse
-	void ClearMeleeAvoidanceData(UInt32 horseFormID);
 
 	// ============================================
 	// Clear All Moveset Data for a Horse

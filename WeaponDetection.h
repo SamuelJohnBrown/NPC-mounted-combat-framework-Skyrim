@@ -8,6 +8,67 @@
 namespace MountedNPCCombatVR
 {
 	// ============================================
+	// CENTRALIZED WEAPON STATE MACHINE
+	// ============================================
+	// ALL weapon equip/sheathe/draw operations MUST go through this system.
+	// This prevents invisible weapons caused by:
+	// - Race conditions between multiple equip calls
+	// - Not waiting for sheathe animation before equipping new weapon
+	// - Not waiting for equip to complete before drawing
+	// ============================================
+	
+	enum class WeaponState
+	{
+		Idle,     // No operation in progress
+		Sheathing,         // Waiting for sheathe animation
+		Equipping,         // Equipping new weapon
+		Drawing, // Waiting for draw animation
+		Ready     // Weapon is equipped and drawn
+	};
+	
+	enum class WeaponRequest
+	{
+		None,
+		Melee,
+		Bow
+	};
+	
+	// ============================================
+	// Weapon State Machine API
+	// ============================================
+	
+	// Initialize/Reset the weapon state system
+	void InitWeaponStateSystem();
+	void ResetWeaponStateSystem();
+	
+	// Update - MUST be called every frame from main update loop
+	void UpdateWeaponStates();
+	
+	// Request a weapon switch (the ONLY way to change weapons)
+	bool RequestWeaponSwitch(Actor* actor, WeaponRequest request);
+	
+	// Request weapon based on distance to target
+	bool RequestWeaponForDistance(Actor* actor, float distanceToTarget, bool targetIsMounted = false);
+	
+	// Force weapon switch - bypasses cooldown (for emergency situations like bow in melee)
+	bool ForceWeaponSwitch(Actor* actor, WeaponRequest request);
+	
+	// Force draw current weapon (if sheathed)
+	bool RequestWeaponDraw(Actor* actor);
+	
+	// Force sheathe current weapon
+	bool RequestWeaponSheathe(Actor* actor);
+	
+	// State queries
+	WeaponState GetWeaponState(UInt32 actorFormID);
+	bool IsWeaponReady(Actor* actor);
+	bool IsWeaponTransitioning(Actor* actor);
+	bool CanSwitchWeapon(Actor* actor);
+	
+	// Cleanup
+	void ClearWeaponStateData(UInt32 actorFormID);
+	
+	// ============================================
 	// Weapon Types
 	// ============================================
 	
@@ -45,19 +106,6 @@ namespace MountedNPCCombatVR
 	};
 	
 	// ============================================
-	// Weapon Collision Result
-	// Result from the collision detection system
-	// ============================================
-	
-	struct WeaponCollisionResult
-	{
-		bool hasCollision;       // True if collision detected
-		float distance;          // Distance between weapon and target
-		NiPoint3 contactPoint;   // Approximate point of contact
-		bool hitWeapon;      // True if hit target's weapon/shield (potential block)
-	};
-	
-	// ============================================
 	// Weapon Detection Functions
 	// ============================================
 	
@@ -91,51 +139,28 @@ namespace MountedNPCCombatVR
 	
 	// ============================================
 	// Weapon Equip/Switch Functions
+	// NOTE: These are now INTERNAL - use RequestWeaponSwitch() instead!
 	// ============================================
 	
 	bool HasBowInInventory(Actor* actor);
 	bool HasMeleeWeaponInInventory(Actor* actor);
-	bool EquipBestBow(Actor* actor);
-	bool EquipBestMeleeWeapon(Actor* actor);
 	bool IsBowEquipped(Actor* actor);
 	bool IsMeleeEquipped(Actor* actor);
 	
-	// Give an Iron Mace to NPCs without suitable melee weapons for mounted combat
-	// Only adds if they don't already have a 1H melee weapon in inventory
-	// Returns true if weapon was added and equipped
+	// Find best weapon in inventory (used internally)
+	TESObjectWEAP* FindBestBowInInventory(Actor* actor);
+	TESObjectWEAP* FindBestMeleeInInventory(Actor* actor);
+	
+	// Direct equip functions - INTERNAL USE ONLY
+	// External code should use RequestWeaponSwitch()
+	bool EquipBestBow(Actor* actor);
+	bool EquipBestMeleeWeapon(Actor* actor);
 	bool GiveDefaultMountedWeapon(Actor* actor);
-	
-	// Give a Hunting Bow to NPCs for ranged mounted combat
-	// Only adds if they don't already have a bow in inventory
-	// Returns true if weapon was added
 	bool GiveDefaultBow(Actor* actor);
-	
-	// Remove the default Hunting Bow from an actor's inventory
-	// Used when temporary ranged mode ends
-	// Returns true if bow was removed
 	bool RemoveDefaultBow(Actor* actor);
 	
 	// ============================================
-	// Weapon Collision System
-	// Based on WeaponCollisionVR's line segment collision
-	// ============================================
-	
-	// Get weapon segment (hand position to weapon tip) for an actor
-	// outBottom: weapon hand/base position
-	// outTop: weapon tip position
-	// leftHand: true for left hand (shield), false for right hand (weapon)
-	// Returns true if weapon bone was found
-	bool GetWeaponSegment(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop, bool leftHand = false);
-	
-	// Get body capsule (vertical line segment representing actor's body)
-	void GetBodyCapsule(Actor* actor, NiPoint3& outBottom, NiPoint3& outTop);
-	
-	// Full weapon collision check between attacker and target
-	// Checks attacker's weapon against target's body and weapon/shield
-	WeaponCollisionResult CheckWeaponCollision(Actor* attacker, Actor* target);
-	
-	// ============================================
-	// Weapon Node / Hitbox Detection (Legacy)
+	// Weapon Node / Hitbox Detection
 	// ============================================
 	
 	// Get the weapon bone node from actor's skeleton
@@ -153,11 +178,11 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	// Check if a mounted attack should hit the target
-	// Uses weapon collision system for accurate detection
-	// Returns true if weapon collides with target
+	// Uses simple distance-based check for reliable detection
+	// Returns true if target is within hit range
 	bool CheckMountedAttackHit(Actor* rider, Actor* target, float* outDistance = nullptr);
 	
-	// Check if target would block the hit (weapon/shield in collision path + blocking state)
+	// Check if target would block the hit (blocking state)
 	bool WouldTargetBlockHit(Actor* rider, Actor* target);
 	
 	// ============================================
@@ -175,8 +200,6 @@ namespace MountedNPCCombatVR
 	void LogEquippedSpells(Actor* actor, UInt32 formID);
 	void LogAvailableSpells(Actor* actor, UInt32 formID);
 	
-	// Sheathe weapons (if drawn) before equipping a different weapon type
-	// This prevents invisible weapon bugs when switching from bow to melee
-	// Returns true if weapons were sheathed
+	// Sheathe weapons - DEPRECATED, use RequestWeaponSheathe()
 	bool SheatheCurrentWeapon(Actor* actor);
 }

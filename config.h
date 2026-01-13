@@ -42,6 +42,9 @@ namespace MountedNPCCombatVR {
 	// Weapon switch distance - distance at which rider switches between melee and bow
 	extern float WeaponSwitchDistance;
 
+	// Weapon switch distance for mounted NPC vs mounted NPC combat (non-player)
+	extern float WeaponSwitchDistanceMounted;
+
 	// Melee Range (On Foot) - how close the rider gets to an on-foot target (player)
 	extern float MeleeRangeOnFoot;
 	
@@ -296,6 +299,16 @@ namespace MountedNPCCombatVR {
 	
 	extern bool MountedAttackStaggerEnabled;      // Enable stagger on unblocked hits vs NPCs
 	extern int MountedAttackStaggerChance;        // Chance to stagger (0-100)
-	extern float MountedAttackStaggerForce;       // Knockback force
+	extern float MountedAttackStaggerForce;    // Knockback force
+	
+	// ============================================
+	// MOUNTED ATTACK DAMAGE MULTIPLIER SETTINGS
+	// ============================================
+	
+	// Damage multiplier for hostile riders (guards, soldiers, bandits) vs NPCs
+	extern float HostileRiderDamageMultiplier;
+	
+	// Damage multiplier for companion riders vs NPCs
+	extern float CompanionRiderDamageMultiplier;
 
 }

@@ -27,6 +27,10 @@ namespace MountedNPCCombatVR
 	// Horse jump cooldown
 	const float HORSE_JUMP_COOLDOWN = 4.0f;  // Only attempt jump every 4 seconds
 	
+	// Horse sprint cooldown
+	const float HORSE_SPRINT_COOLDOWN = 3.0f;  // Only attempt sprint every 3 seconds
+	const float HORSE_SPRINT_DURATION = 5.0f;  // Sprint lasts 5 seconds before needing refresh
+	
 	// ============================================
 	// SYSTEM STATE
 	// ============================================
@@ -44,6 +48,18 @@ namespace MountedNPCCombatVR
 	static TESIdleForm* g_horseJump = nullptr;
 	static bool g_jumpIdleInitialized = false;
 	
+	// Horse sprint state tracking
+	struct HorseSprintData
+	{
+		UInt32 horseFormID;
+		float lastSprintStartTime;  // When sprint was last started
+		bool isSprinting;           // Currently sprinting
+		bool isValid;
+	};
+	
+	static HorseSprintData g_horseSprintData[10];
+	static int g_horseSprintCount = 0;
+	
 	// Horse jump cooldown tracking
 	struct HorseJumpData
 	{
@@ -59,10 +75,57 @@ namespace MountedNPCCombatVR
 	// UTILITY FUNCTIONS
 	// ============================================
 	
+	// Use shared GetGameTime() from Helper.h instead of local function
 	static float GetGameTimeSeconds()
 	{
-		static auto startTime = clock();
-		return (float)(clock() - startTime) / CLOCKS_PER_SEC;
+		return GetGameTime();
+	}
+	
+	// ============================================
+	// HORSE SPRINT TRACKING
+	// ============================================
+	
+	static HorseSprintData* GetOrCreateSprintData(UInt32 horseFormID)
+	{
+		// Find existing
+		for (int i = 0; i < g_horseSprintCount; i++)
+		{
+			if (g_horseSprintData[i].isValid && g_horseSprintData[i].horseFormID == horseFormID)
+			{
+				return &g_horseSprintData[i];
+			}
+		}
+		
+		// Create new
+		if (g_horseSprintCount < 10)
+		{
+			HorseSprintData* data = &g_horseSprintData[g_horseSprintCount];
+			data->horseFormID = horseFormID;
+			data->lastSprintStartTime = -HORSE_SPRINT_COOLDOWN;  // Allow immediate first sprint
+			data->isSprinting = false;
+			data->isValid = true;
+			g_horseSprintCount++;
+			return data;
+		}
+		
+		return nullptr;
+	}
+	
+	bool IsHorseSprinting(Actor* horse)
+	{
+		if (!horse) return false;
+		
+		HorseSprintData* data = GetOrCreateSprintData(horse->formID);
+		if (!data) return false;
+		
+		// Check if sprint has expired (after duration, consider it no longer sprinting)
+		float currentTime = GetGameTimeSeconds();
+		if (data->isSprinting && (currentTime - data->lastSprintStartTime) > HORSE_SPRINT_DURATION)
+		{
+			data->isSprinting = false;
+		}
+		
+		return data->isSprinting;
 	}
 	
 	// ============================================
@@ -121,11 +184,33 @@ namespace MountedNPCCombatVR
 	{
 		if (!horse)
 		{
-			_MESSAGE("SingleMountedCombat: StartHorseSprint - horse is null!");
 			return;
 		}
 		
-		_MESSAGE("SingleMountedCombat: StartHorseSprint called for horse %08X", horse->formID);
+		HorseSprintData* sprintData = GetOrCreateSprintData(horse->formID);
+		if (!sprintData) return;
+		
+		float currentTime = GetGameTimeSeconds();
+		
+		// Check if already sprinting
+		if (sprintData->isSprinting)
+		{
+			// Check if sprint is still valid (within duration)
+			if ((currentTime - sprintData->lastSprintStartTime) < HORSE_SPRINT_DURATION)
+			{
+				// Still sprinting - don't spam the animation
+				return;
+			}
+			// Sprint expired - allow refresh
+		}
+		
+		// Check cooldown - prevent rapid sprint spam
+		float timeSinceLastSprint = currentTime - sprintData->lastSprintStartTime;
+		if (timeSinceLastSprint < HORSE_SPRINT_COOLDOWN)
+		{
+			// On cooldown - don't spam
+			return;
+		}
 		
 		InitSprintIdles();
 		
@@ -134,30 +219,26 @@ namespace MountedNPCCombatVR
 			const char* eventName = g_horseSprintStart->animationEvent.c_str();
 			if (eventName && strlen(eventName) > 0)
 			{
-				_MESSAGE("SingleMountedCombat: Sending sprint event '%s' to horse %08X", eventName, horse->formID);
 				if (SendHorseAnimationEvent(horse, eventName))
 				{
-					_MESSAGE("SingleMountedCombat: Horse %08X sprint animation ACCEPTED", horse->formID);
+					sprintData->isSprinting = true;
+					sprintData->lastSprintStartTime = currentTime;
+					_MESSAGE("SingleMountedCombat: Horse %08X sprint STARTED", horse->formID);
 				}
-				else
-				{
-					_MESSAGE("SingleMountedCombat: Horse %08X sprint animation REJECTED (graph busy?)", horse->formID);
-				}
+				// Removed rejected log - too spammy
 			}
-			else
-			{
-				_MESSAGE("SingleMountedCombat: ERROR - Sprint idle has empty animation event name!");
-			}
-		}
-		else
-		{
-			_MESSAGE("SingleMountedCombat: ERROR - g_horseSprintStart is null!");
 		}
 	}
 	
 	void StopHorseSprint(Actor* horse)
 	{
 		if (!horse) return;
+		
+		HorseSprintData* sprintData = GetOrCreateSprintData(horse->formID);
+		if (sprintData)
+		{
+			sprintData->isSprinting = false;
+		}
 		
 		InitSprintIdles();
 		
@@ -215,6 +296,15 @@ namespace MountedNPCCombatVR
 		g_jumpIdleInitialized = false;
 		
 		ResetArrowSystemCache();
+		
+		// Reset sprint tracking
+		g_horseSprintCount = 0;
+		for (int i = 0; i < 10; i++)
+		{
+			g_horseSprintData[i].isValid = false;
+			g_horseSprintData[i].horseFormID = 0;
+			g_horseSprintData[i].isSprinting = false;
+		}
 		
 		g_horseJumpCount = 0;
 		for (int i = 0; i < 5; i++)

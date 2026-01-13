@@ -1,4 +1,5 @@
 #include "NPCProtection.h"
+#include "Helper.h"
 #include <set>
 #include <map>
 #include <mutex>
@@ -30,11 +31,10 @@ namespace MountedNPCCombatVR
 	// Protected mass (prevents stagger)
 	static const float PROTECTED_MASS = 1000.0f;
 	
-	// Get current time in seconds
+	// Use shared GetGameTime() from Helper.h instead of local function
 	static float GetCurrentTimeSeconds()
 	{
-		static auto startTime = clock();
-		return (float)(clock() - startTime) / CLOCKS_PER_SEC;
+		return GetGameTime();
 	}
 	
 	// Safe actor validation before modifying (uses SEH, no C++ objects)
@@ -58,18 +58,28 @@ namespace MountedNPCCombatVR
 		}
 	}
 	
+	// Track which NPCs we've already logged protection for to reduce spam
+	static UInt32 g_lastProtectionAppliedNPC = 0;
+	static UInt32 g_lastProtectionRemovedNPC = 0;
+	
 	// Internal function to do the actual work (uses SEH, no C++ objects)
 	static bool DoApplyProtection(Actor* actor, UInt32 formID)
 	{
 		__try
 		{
-			actor->flags2 |= Actor::kFlag_kNoBleedoutRecovery;
+			// NOTE: Removed kFlag_kNoBleedoutRecovery - was causing CTD
+			// Just set mass for stagger resistance
 			float originalMass = actor->actorValueOwner.GetBase(AV_Mass);
 			actor->actorValueOwner.SetBase(AV_Mass, PROTECTED_MASS);
 			
-			const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-			_MESSAGE("MountedCombat: Applied mounted protection to '%s' (FormID: %08X) - Original mass: %.1f", 
-				actorName ? actorName : "Unknown", formID, originalMass);
+			// Rate limit logging - only log first apply per NPC
+			if (g_lastProtectionAppliedNPC != formID)
+			{
+				g_lastProtectionAppliedNPC = formID;
+				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+				_MESSAGE("MountedCombat: Applied mounted protection to '%s' (FormID: %08X) - Original mass: %.1f", 
+					actorName ? actorName : "Unknown", formID, originalMass);
+			}
 			return true;
 		}
 		__except(EXCEPTION_EXECUTE_HANDLER)
@@ -84,12 +94,18 @@ namespace MountedNPCCombatVR
 	{
 		__try
 		{
-			actor->flags2 &= ~Actor::kFlag_kNoBleedoutRecovery;
+			// NOTE: Removed kFlag_kNoBleedoutRecovery - was causing CTD
+			// Just reset mass
 			actor->actorValueOwner.SetBase(AV_Mass, DEFAULT_MASS);
 			
-			const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-			_MESSAGE("MountedCombat: Removed mounted protection from '%s' (FormID: %08X)", 
-				actorName ? actorName : "Unknown", formID);
+			// Rate limit logging - only log first remove per NPC
+			if (g_lastProtectionRemovedNPC != formID)
+			{
+				g_lastProtectionRemovedNPC = formID;
+				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+				_MESSAGE("MountedCombat: Removed mounted protection from '%s' (FormID: %08X)", 
+					actorName ? actorName : "Unknown", formID);
+			}
 			return true;
 		}
 		__except(EXCEPTION_EXECUTE_HANDLER)

@@ -27,7 +27,7 @@ namespace MountedNPCCombatVR
 	// - RangedFireMaxDistance (2800.0f default) - Maximum distance to fire bow
 	// - RoleCheckInterval (2.0f default) - Time in seconds to re-check roles
 	
-	const int MAX_MULTI_RIDERS = 5;           // Maximum number of multi riders supported
+	const int MAX_MULTI_RIDERS = 4;           // Maximum number of multi riders supported
 	
 	// Horse Animation FormIDs (from Skyrim.esm)
 	const UInt32 HORSE_MOVE_FORWARD = 0x000E0FA1;
@@ -136,10 +136,10 @@ namespace MountedNPCCombatVR
 	// UTILITY FUNCTIONS
 	// ============================================
 	
+	// Use shared GetGameTime() from Helper.h instead of local function
 	static float GetMultiCombatTime()
 	{
-		static auto startTime = clock();
-		return (float)(clock() - startTime) / CLOCKS_PER_SEC;
+		return GetGameTime();
 	}
 	
 	static float CalculateDistance(Actor* a, Actor* b)
@@ -325,6 +325,9 @@ namespace MountedNPCCombatVR
 		// Don't allow if already in temp ranged
 		if (IsInTempRangedMode(rider->formID)) return false;
 		
+		// Don't allow if weapon is transitioning
+		if (IsWeaponTransitioning(rider)) return false;
+		
 		// Find empty slot for temp ranged data
 		int emptySlot = -1;
 		for (int i = 0; i < MAX_MULTI_RIDERS; i++)
@@ -350,10 +353,8 @@ namespace MountedNPCCombatVR
 			_MESSAGE("MultiMountedCombat: Gave Hunting Bow to '%s'", riderName ? riderName : "Unknown");
 		}
 		
-		// Give arrows and equip bow
-		EquipArrows(rider);
-		EquipBestBow(rider);
-		rider->DrawSheatheWeapon(true);
+		// Use centralized weapon system to switch to bow
+		RequestWeaponSwitch(rider, WeaponRequest::Bow);
 		
 		// Change role to ranged
 		data->role = MultiCombatRole::Ranged;
@@ -382,8 +383,8 @@ namespace MountedNPCCombatVR
 		g_tempRangedData[emptySlot].gaveBow = gaveBow;
 		g_tempRangedData[emptySlot].isValid = true;
 		
-		// Clear weapon switch cooldown
-		ClearWeaponSwitchData(rider->formID);
+		// Clear weapon state data for fresh start
+		ClearWeaponStateData(rider->formID);
 		
 		_MESSAGE("MultiMountedCombat: '%s' now TEMP RANGED for %.0f seconds (gaveBow: %s)",
 			riderName ? riderName : "Unknown", duration, gaveBow ? "YES" : "NO");
@@ -423,19 +424,11 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		// Equip melee weapon
-		if (HasMeleeWeaponInInventory(rider))
-		{
-			EquipBestMeleeWeapon(rider);
-		}
-		else
-		{
-			GiveDefaultMountedWeapon(rider);
-		}
-		rider->DrawSheatheWeapon(true);
+		// Use centralized weapon system to switch to melee
+		RequestWeaponSwitch(rider, WeaponRequest::Melee);
 		
-		// Clear weapon switch cooldown
-		ClearWeaponSwitchData(rider->formID);
+		// Clear weapon state data for fresh start
+		ClearWeaponStateData(rider->formID);
 		
 		// Re-inject follow package for melee combat
 		Actor* target = nullptr;
@@ -506,6 +499,78 @@ namespace MountedNPCCombatVR
 				// End temp ranged mode
 				EndTempRangedMode(data, rider, horse, tempData);
 			}
+		}
+	}
+	
+	// ============================================
+	// CALCULATE DESIRED RANGED COUNT BASED ON HOSTILE RIDER COUNT
+	// - 1-3 hostile riders: 1 ranged (Captain/Leader or promoted)
+	// - 4+ hostile riders: 2 ranged (Captain/Leader + 1 promoted)
+	// This ensures half melee, half ranged for larger groups
+	// ============================================
+	
+	static int GetDesiredRangedCount(int hostileCount)
+	{
+		if (hostileCount >= 4)
+		{
+			return 2;  // 4 riders = 2 ranged, 2 melee
+		}
+		else if (hostileCount >= 2)
+		{
+			return 1;  // 2-3 riders = 1 ranged, rest melee
+		}
+		return 0;  // Single rider stays melee
+	}
+	
+	// Check and promote first registered rider if no captain/leader and 2+ HOSTILE riders ON SAME SIDE
+	// With 4+ riders, promote a second rider to ranged role
+	// Companions should NOT count toward promotion - they're allies!
+	// Riders fighting different targets (e.g., guards vs bandits) are on different sides
+	static void CheckAndPromoteToRanged()
+	{
+		int hostileCount = GetHostileRiderCount();
+		int currentRangedCount = GetRangedRiderCount();
+		int desiredRangedCount = GetDesiredRangedCount(hostileCount);
+		
+		// Already have enough ranged riders
+		if (currentRangedCount >= desiredRangedCount) return;
+		
+		// Need at least 2 hostile riders for any ranged promotion
+		if (hostileCount < 2) return;
+		
+		_MESSAGE("MultiMountedCombat: Ranged check - hostile: %d, current ranged: %d, desired: %d",
+			hostileCount, currentRangedCount, desiredRangedCount);
+		
+		// Find the first valid HOSTILE melee rider to promote
+		for (int i = 0; i < MAX_MULTI_RIDERS; i++)
+		{
+			if (!g_multiRiders[i].isValid) continue;
+			if (g_multiRiders[i].role != MultiCombatRole::Melee) continue;
+			if (g_multiRiders[i].isCompanion) continue;  // Skip companions
+			
+			// Count how many hostile riders are fighting the SAME target
+			int sameTeamCount = GetHostileRidersOnSameSide(g_multiRiders[i].targetFormID);
+			
+			// Need at least 2 riders on the same side for promotion
+			if (sameTeamCount < 2) continue;
+			
+			TESForm* riderForm = LookupFormByID(g_multiRiders[i].riderFormID);
+			TESForm* horseForm = LookupFormByID(g_multiRiders[i].horseFormID);
+			if (!riderForm || !horseForm) continue;
+			
+			Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
+			Actor* horse = DYNAMIC_CAST(horseForm, TESForm, Actor);
+			if (!rider || !horse) continue;
+			
+			// Promote this rider
+			PromoteMeleeToRanged(&g_multiRiders[i], rider, horse);
+			
+			// Check if we've reached desired count
+			if (GetRangedRiderCount() >= desiredRangedCount)
+			{
+				return;
+			}
+			// Otherwise continue loop to promote another
 		}
 	}
 	
@@ -648,8 +713,8 @@ namespace MountedNPCCombatVR
 		return furthestRider;
 	}
 	
-	// Check if any registered rider is a Captain
-	static bool HasCaptainRegistered()
+	// Check if any registered rider is a Captain or Leader
+	static bool HasCaptainOrLeaderRegistered()
 	{
 		for (int i = 0; i < MAX_MULTI_RIDERS; i++)
 		{
@@ -662,7 +727,7 @@ namespace MountedNPCCombatVR
 			if (!rider) continue;
 			
 			const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-			if (riderName && strstr(riderName, "Captain") != nullptr)
+			if (riderName && (strstr(riderName, "Captain") != nullptr || strstr(riderName, "Leader") != nullptr))
 			{
 				return true;
 			}
@@ -687,11 +752,6 @@ namespace MountedNPCCombatVR
 		data->role = MultiCombatRole::Ranged;
 		data->hasBow = true;
 		
-		// ============================================
-		// FULL RANGED SETUP - SAME AS CAPTAIN
-		// Give bow, arrows, equip, draw weapon
-		// ============================================
-		
 		// Give bow if they don't have one
 		if (!HasBowInInventory(rider))
 		{
@@ -699,14 +759,10 @@ namespace MountedNPCCombatVR
 			_MESSAGE("MultiMountedCombat: Gave Hunting Bow to promoted '%s'", riderName ? riderName : "Unknown");
 		}
 		
-		// Give arrows and equip bow
-		EquipArrows(rider);
-		EquipBestBow(rider);
+		// Use centralized weapon system to switch to bow
+		RequestWeaponSwitch(rider, WeaponRequest::Bow);
 		
-		// Draw weapon so they're ready to fire
-		rider->DrawSheatheWeapon(true);
-		
-		_MESSAGE("MultiMountedCombat: Promoted '%s' bow equipped and drawn", riderName ? riderName : "Unknown");
+		_MESSAGE("MultiMountedCombat: Promoted '%s' bow switch requested", riderName ? riderName : "Unknown");
 		
 		// Initialize ranged horse data
 		RangedHorseData* horseData = GetOrCreateRangedHorseData(horse->formID);
@@ -721,45 +777,34 @@ namespace MountedNPCCombatVR
 		StopHorseSprint(horse);
 		Actor_ClearKeepOffsetFromActor(horse);
 		
-		// Clear weapon switch cooldown so future switches work correctly
-		ClearWeaponSwitchData(rider->formID);
+		// Clear weapon state data for fresh start
+		ClearWeaponStateData(rider->formID);
 		
 		_MESSAGE("MultiMountedCombat: '%s' now has FULL RANGED capabilities (same as Captain)",
 			riderName ? riderName : "Unknown");
 	}
 	
-	// Check and promote first registered rider if no captain and 2+ riders
-	static void CheckAndPromoteToRanged()
+	// ============================================
+	// COUNT HOSTILE RIDERS BY FACTION/SIDE
+	// Groups riders by their combat target to determine which "team" they're on
+	// Returns the count of hostile riders fighting the SAME target
+	// ============================================
+	
+	static int GetHostileRidersOnSameSide(UInt32 targetFormID)
 	{
-		// Skip if already have a ranged rider (captain or promoted)
-		if (GetRangedRiderCount() > 0) return;
-		
-		// Need at least 2 riders for promotion (1 stays melee, 1 becomes ranged)
-		if (g_multiRiderCount < 2) return;
-		
-		// Check if a captain exists
-		if (HasCaptainRegistered()) return;
-		
-		// Find the first valid melee rider to promote
+		int count = 0;
 		for (int i = 0; i < MAX_MULTI_RIDERS; i++)
 		{
-			if (!g_multiRiders[i].isValid) continue;
-			if (g_multiRiders[i].role != MultiCombatRole::Melee) continue;
-			
-			TESForm* riderForm = LookupFormByID(g_multiRiders[i].riderFormID);
-			TESForm* horseForm = LookupFormByID(g_multiRiders[i].horseFormID);
-			if (!riderForm || !horseForm) continue;
-			
-			Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
-			Actor* horse = DYNAMIC_CAST(horseForm, TESForm, Actor);
-			if (!rider || !horse) continue;
-			
-			// Promote this rider
-			PromoteMeleeToRanged(&g_multiRiders[i], rider, horse);
-			return;  // Only promote one
+			if (g_multiRiders[i].isValid && 
+				!g_multiRiders[i].isCompanion &&
+				g_multiRiders[i].targetFormID == targetFormID)
+			{
+				count++;
+			}
 		}
+		return count;
 	}
-
+	
 	// ============================================
 	// ROLE ASSIGNMENT
 	// ============================================
@@ -809,24 +854,21 @@ namespace MountedNPCCombatVR
 		}
 		
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-		bool isCaptain = false;
+		bool isCaptainOrLeader = false;
 		bool isCompanion = IsCompanion(rider);
 		
 		if (riderName && strlen(riderName) > 0)
 		{
-			if (strstr(riderName, "Captain") != nullptr)
+			if (strstr(riderName, "Captain") != nullptr || strstr(riderName, "Leader") != nullptr)
 			{
-				isCaptain = true;
+				isCaptainOrLeader = true;
 			}
 		}
 		
 		// ============================================
 		// CHECK SLOT AVAILABILITY
-		// Companions get special treatment - they should always be able to register
-		// Only hostile NPCs are limited by MAX_MULTI_RIDERS
 		// ============================================
 		
-		// Count how many hostile (non-companion) riders are registered
 		int hostileRiderCount = 0;
 		for (int i = 0; i < MAX_MULTI_RIDERS; i++)
 		{
@@ -836,7 +878,6 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		// Find empty slot
 		int emptySlot = -1;
 		for (int i = 0; i < MAX_MULTI_RIDERS; i++)
 		{
@@ -849,7 +890,6 @@ namespace MountedNPCCombatVR
 		
 		if (emptySlot < 0)
 		{
-			// No empty slots at all
 			if (isCompanion)
 			{
 				_MESSAGE("MultiMountedCombat: WARNING - No slots for companion '%s' (all %d slots full)",
@@ -858,7 +898,6 @@ namespace MountedNPCCombatVR
 			return MultiCombatRole::None;
 		}
 		
-		// If this is a hostile NPC (not companion), check the hostile limit
 		if (!isCompanion && hostileRiderCount >= MAX_MULTI_RIDERS)
 		{
 			_MESSAGE("MultiMountedCombat: WARNING - Hostile rider limit reached (%d), cannot register '%s'",
@@ -866,39 +905,35 @@ namespace MountedNPCCombatVR
 			return MultiCombatRole::None;
 		}
 		
-		// Calculate distance
 		float distance = CalculateDistance(rider, target);
 		bool hasBow = HasBowInInventory(rider);
 		
 		MultiCombatRole role = MultiCombatRole::Melee;
 		
 		// ============================================
-		// COMPANIONS AND CAPTAINS GET RANGED ROLE
-		// They favor ranged combat, keeping distance, but switch to melee if target gets close
+		// COMPANIONS, CAPTAINS, AND LEADERS GET RANGED ROLE
 		// ============================================
-		if (isCaptain || isCompanion)
+		if (isCaptainOrLeader || isCompanion)
 		{
-			const char* roleReason = isCaptain ? "CAPTAIN" : "COMPANION";
+			const char* roleReason = isCaptainOrLeader ? "CAPTAIN/LEADER" : "COMPANION";
 			
 			_MESSAGE("MultiMountedCombat: *** %s DETECTED: '%s' (%08X) - FORCING RANGED ***", 
 				roleReason, riderName ? riderName : "Unknown", rider->formID);
 			
 			role = MultiCombatRole::Ranged;
-			hasBow = true;  // Mark as having bow - centralized system will equip
+			hasBow = true;
 			
-			// Give bow if they don't have one (companions especially may not have one)
+			// Give bow if they don't have one
 			if (!HasBowInInventory(rider))
 			{
 				GiveDefaultBow(rider);
 				_MESSAGE("MultiMountedCombat: Gave Hunting Bow to %s '%s'", roleReason, riderName ? riderName : "Unknown");
 			}
 			
-			// Give arrows and equip bow
-			EquipArrows(rider);
-			EquipBestBow(rider);
-			rider->DrawSheatheWeapon(true);
+			// Use centralized weapon system to switch to bow
+			RequestWeaponSwitch(rider, WeaponRequest::Bow);
 			
-			_MESSAGE("MultiMountedCombat: %s '%s' RANGED setup complete", roleReason, riderName ? riderName : "Unknown");
+			_MESSAGE("MultiMountedCombat: %s '%s' RANGED setup requested", roleReason, riderName ? riderName : "Unknown");
 			
 			// Initialize ranged horse data
 			RangedHorseData* horseData = GetOrCreateRangedHorseData(horse->formID);
@@ -922,7 +957,7 @@ namespace MountedNPCCombatVR
 		g_multiRiders[emptySlot].lastRoleCheckTime = GetMultiCombatTime();
 		g_multiRiders[emptySlot].lastRangedSetupTime = 0.0f;
 		g_multiRiders[emptySlot].hasBow = hasBow;
-		g_multiRiders[emptySlot].isCompanion = isCompanion;  // Track if this is a companion
+		g_multiRiders[emptySlot].isCompanion = isCompanion;
 		g_multiRiders[emptySlot].isValid = true;
 		g_multiRiderCount++;
 		
@@ -938,9 +973,21 @@ namespace MountedNPCCombatVR
 	// SWITCH CAPTAIN TO MELEE (player got too close)
 	// ============================================
 	
+	// Cooldown for role switching to prevent spam
+	static float g_lastRoleSwitchTime = 0.0f;
+	const float ROLE_SWITCH_COOLDOWN = 5.0f;  // 5 seconds between role switches
+	
 	static void SwitchCaptainToMelee(MultiRiderData* data, Actor* rider, Actor* horse)
 	{
 		if (!data || !rider || !horse) return;
+		
+		// Check cooldown to prevent rapid switching
+		float currentTime = GetMultiCombatTime();
+		if ((currentTime - g_lastRoleSwitchTime) < ROLE_SWITCH_COOLDOWN)
+		{
+			return;  // On cooldown, don't switch
+		}
+		g_lastRoleSwitchTime = currentTime;
 		
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 		_MESSAGE("MultiMountedCombat: CAPTAIN '%s' SWITCHING TO MELEE (target too close)", 
@@ -962,32 +1009,18 @@ namespace MountedNPCCombatVR
 		// Clear any keep-offset so patrol package can take over
 		Actor_ClearKeepOffsetFromActor(horse);
 		
-		// ============================================
-		// FORCE IMMEDIATE WEAPON SWITCH TO MELEE
-		// Bypass cooldown - Captain needs melee weapon NOW to attack
-		// ============================================
+		// Reset bow attack state
 		ResetBowAttackState(rider->formID);
 		
-		if (HasMeleeWeaponInInventory(rider))
-		{
-			EquipBestMeleeWeapon(rider);
-			_MESSAGE("MultiMountedCombat: Captain '%s' equipped MELEE weapon", riderName ? riderName : "Unknown");
-		}
-		else
-		{
-			// Give default melee weapon if Captain has none
-			GiveDefaultMountedWeapon(rider);
-			_MESSAGE("MultiMountedCombat: Captain '%s' given default MELEE weapon", riderName ? riderName : "Unknown");
-		}
-		rider->DrawSheatheWeapon(true);
+		// Use centralized weapon system to switch to melee
+		RequestWeaponSwitch(rider, WeaponRequest::Melee);
 		
-		// Clear weapon switch cooldown so future switches work immediately
-		ClearWeaponSwitchData(rider->formID);
+		// Clear weapon state data for fresh start
+		ClearWeaponStateData(rider->formID);
 		
-		// ============================================
-		// RE-INJECT FOLLOW PACKAGE TO ENABLE MELEE ATTACKS
-		// This ensures InjectTravelPackageToHorse runs with melee attack logic
-		// ============================================
+		_MESSAGE("MultiMountedCombat: Captain '%s' melee switch requested", riderName ? riderName : "Unknown");
+		
+		// Re-inject follow package
 		Actor* target = nullptr;
 		TESForm* targetForm = LookupFormByID(data->targetFormID);
 		if (targetForm)
@@ -997,12 +1030,8 @@ namespace MountedNPCCombatVR
 		
 		if (target)
 		{
-			// Force horse combat with target - this sets up follow package
 			ForceHorseCombatWithTarget(horse, target);
-			
-			// Also set NPC to follow target
 			SetNPCFollowTarget(rider, target);
-			
 			_MESSAGE("MultiMountedCombat: Captain '%s' re-injected follow package for MELEE combat", 
 				riderName ? riderName : "Unknown");
 		}
@@ -1018,6 +1047,14 @@ namespace MountedNPCCombatVR
 	static void SwitchCaptainToRanged(MultiRiderData* data, Actor* rider, Actor* horse)
 	{
 		if (!data || !rider || !horse) return;
+		
+		// Check cooldown to prevent rapid switching
+		float currentTime = GetMultiCombatTime();
+		if ((currentTime - g_lastRoleSwitchTime) < ROLE_SWITCH_COOLDOWN)
+		{
+			return;  // On cooldown, don't switch
+		}
+		g_lastRoleSwitchTime = currentTime;
 		
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 		_MESSAGE("MultiMountedCombat: CAPTAIN '%s' RETURNING TO RANGED (target retreated)", 
@@ -1041,7 +1078,10 @@ namespace MountedNPCCombatVR
 		// Clear any existing follow offset so Captain stays stationary
 		Actor_ClearKeepOffsetFromActor(horse);
 		
-		// NOTE: Weapon switching handled by centralized system in DynamicPackages
+		// Use centralized weapon system - bow will be equipped based on distance
+		RequestWeaponSwitch(rider, WeaponRequest::Bow);
+		
+		_MESSAGE("MultiMountedCombat: Captain '%s' ranged switch requested", riderName ? riderName : "Unknown");
 	}
 	
 	// ============================================
@@ -1052,6 +1092,9 @@ namespace MountedNPCCombatVR
 	{
 		if (!data || !rider || !horse || !target) return;
 		
+		// Safety check: if somehow called when not in ranged role, exit immediately
+		if (data->role != MultiCombatRole::Ranged) return;
+		
 		float currentTime = GetMultiCombatTime();
 		float distance = data->distanceToTarget;
 		
@@ -1060,45 +1103,44 @@ namespace MountedNPCCombatVR
 		if (!horseData) return;
 		
 		// ============================================
-		// CHECK IF IN RAPID FIRE - Let SpecialMovesets handle everything
+		// CHECK IF IN RAPID FIRE - DynamicPackages handles this
+		// Just return early and let DynamicPackages manage the rapid fire
 		// ============================================
 		if (IsInRapidFire(horse->formID))
 		{
-			// Update rapid fire - horse stays still, rider fires bow
-			if (UpdateRapidFireManeuver(horse, rider, target))
-			{
-				// Still in rapid fire - just rotate to face target
-				float dx = target->pos.x - horse->pos.x;
-				float dy = target->pos.y - horse->pos.y;
-				float angleToTarget = atan2(dx, dy);
-				
-				float currentAngle = horse->rot.z;
-				float angleDiff = angleToTarget - currentAngle;
-				
-				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
-				
-				const float ROTATION_SPEED = 0.25f;
-				float newAngle = currentAngle + (angleDiff * ROTATION_SPEED);
-				
-				while (newAngle > 3.14159f) newAngle -= 6.28318f;
-				while (newAngle < -3.14159f) newAngle += 6.28318f;
-				
-				horse->rot.z = newAngle;
-				return;
-			}
-			// Rapid fire completed - continue to normal behavior
+			// Rapid fire is managed by DynamicPackages.cpp in InjectTravelPackageToHorse
+			// Don't call UpdateRapidFireManeuver here - it causes duplicate processing
+			return;
 		}
 		
 		// ============================================
 		// CHECK IF TARGET IS TOO CLOSE - SWITCH TO MELEE
+		// Only attempt switch once, then let the role system handle it
 		// ============================================
 		if (distance < RangedRoleMinDistance)
 		{
+			// If already attempted to switch to melee recently, just return
+			// The role will change once cooldown expires
+			static UInt32 lastSwitchAttemptRider = 0;
+			static float lastSwitchAttemptTime = 0;
+			float currentTime = GetGameTime();
+			
+			// Only attempt switch every 5 seconds per rider (matches ROLE_SWITCH_COOLDOWN)
+			if (data->riderFormID == lastSwitchAttemptRider && 
+				(currentTime - lastSwitchAttemptTime) < 5.0f)
+			{
+				// Already attempted switch recently, just return without spamming
+				return;
+			}
+			
+			lastSwitchAttemptRider = data->riderFormID;
+		 lastSwitchAttemptTime = currentTime;
+			
 			_MESSAGE("MultiMountedCombat: Ranged rider %08X too close (%.0f < %.0f) - switching to MELEE",
 				data->riderFormID, distance, RangedRoleMinDistance);
+			
 			SwitchCaptainToMelee(data, rider, horse);
-			return;  // Exit - now in melee mode
+			return;  // Exit - now in melee mode (or will be after cooldown)
 		}
 		
 		// NOTE: Bow equipping handled by centralized system in DynamicPackages
@@ -1266,34 +1308,46 @@ namespace MountedNPCCombatVR
 		if (!data || !rider || !horse || !target) return;
 		
 		// ============================================
-		// CHECK IF CAPTAIN OR COMPANION SHOULD SWITCH BACK TO RANGED
-		// If this is a Captain/Companion (was ranged, now melee) and target is far enough,
+		// CHECK IF CAPTAIN/LEADER OR COMPANION SHOULD SWITCH BACK TO RANGED
+		// If this is a Captain/Leader/Companion (was ranged, now melee) and target is far enough,
 		// switch back to ranged mode
+		// Relies on weapon distance system to determine when to switch
 		// ============================================
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-		bool isCaptain = false;
+		bool isCaptainOrLeader = false;
 		bool isCompanion = IsCompanion(rider);
 		
 		if (riderName && strlen(riderName) > 0)
 		{
-			if (strstr(riderName, "Captain") != nullptr)
+			if (strstr(riderName, "Captain") != nullptr || strstr(riderName, "Leader") != nullptr)
 			{
-				isCaptain = true;
+				isCaptainOrLeader = true;
 			}
 		}
 		
-		// Captains and Companions switch back to ranged when target is far enough away
-		if ((isCaptain || isCompanion) && data->distanceToTarget >= RangedRoleMinDistance)
+		// Captains, Leaders and Companions switch back to ranged when target is far enough away
+		if ((isCaptainOrLeader || isCompanion) && data->distanceToTarget >= RangedRoleMinDistance)
 		{
-			const char* roleType = isCaptain ? "Captain" : "Companion";
+			const char* roleType = isCaptainOrLeader ? "Captain/Leader" : "Companion";
 			_MESSAGE("MultiMountedCombat: %s '%s' at %.0f units - returning to ranged", 
 				roleType, riderName ? riderName : "Unknown", data->distanceToTarget);
 			SwitchCaptainToRanged(data, rider, horse);
 			return;  // Exit - now in ranged mode, will be handled next frame
 		}
 		
+		// ============================================
+		// COMPANIONS IN MELEE USE STANDARD GUARD/SOLDIER BEHAVIOR
+		// Companions when in melee role should use the EXACT same behavior as guards:
+		// - 90-degree turns
+		// - Stand ground maneuvers  
+		// - All special movesets
+		// This is handled by DynamicPackages::InjectTravelPackageToHorse
+		// We just need to NOT interfere - let it flow through
+		// ============================================
+		
 		// NOTE: Weapon switching handled by centralized system in DynamicPackages
 		// No equip calls here - DynamicPackages::UpdateRiderWeaponForDistance handles everything
+		// Melee movement/rotation/attacks handled by DynamicPackages::InjectTravelPackageToHorse
 	}
 	
 	// ============================================
@@ -1342,12 +1396,15 @@ namespace MountedNPCCombatVR
 			else
 			{
 				// Check conditions: Need ranged rider (Captain or promoted) + at least 2 melee riders
+				// AND must be multi-mounted combat (2+ hostile riders on same side)
 				int meleeCount = GetMeleeRiderCount();
 				int rangedCount = GetRangedRiderCount();
+				int hostileCount = GetHostileRiderCount();
 				
 				// Need: 1 ranged rider + at least 2 melee riders (so 1 can switch and 1 stays melee)
-				// This ensures single mounted combat (1 rider) is never affected
-				if (rangedCount >= 1 && meleeCount >= 2)
+				// AND at least 2 hostile (non-companion) riders total
+				// This ensures single mounted combat (1 rider) or companion-only scenarios are never affected
+				if (rangedCount >= 1 && meleeCount >= 2 && hostileCount >= 2)
 				{
 					// 25% chance
 					int roll = rand() % 100;
@@ -1364,23 +1421,10 @@ namespace MountedNPCCombatVR
 						{
 							if (g_multiRiders[i].isValid && 
 								g_multiRiders[i].role == MultiCombatRole::Melee &&
+								!g_multiRiders[i].isCompanion &&  // Only hostile riders can temp switch
 								!IsInTempRangedMode(g_multiRiders[i].riderFormID))
 							{
-								// Check this isn't a Captain
-								TESForm* riderForm = LookupFormByID(g_multiRiders[i].riderFormID);
-								if (riderForm)
-								{
-									Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
-									if (rider)
-									{
-										const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-										bool isCaptain = (riderName && strstr(riderName, "Captain") != nullptr);
-										if (!isCaptain)
-										{
-											meleeIndices[meleeIndexCount++] = i;
-										}
-									}
-								}
+								meleeIndices[meleeIndexCount++] = i;
 							}
 						}
 						
@@ -1466,19 +1510,77 @@ namespace MountedNPCCombatVR
 				Actor* combatTarget = static_cast<Actor*>(combatTargetRef.get());
 				if (combatTarget && !combatTarget->IsDead(1))
 				{
-					// Update to actual combat target if different
-					if (combatTarget->formID != data->targetFormID)
+					// CRITICAL: If this is a companion, NEVER let them target the player!
+					bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && combatTarget == (*g_thePlayer));
+					if (data->isCompanion && targetIsPlayer)
 					{
-						const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-						const char* newTargetName = CALL_MEMBER_FN(combatTarget, GetReferenceName)();
-						_MESSAGE("MultiMountedCombat: %s target updated: %08X -> %08X ('%s')",
-							riderName ? riderName : "Rider",
-							data->targetFormID,
-							combatTarget->formID,
-							newTargetName ? newTargetName : "Unknown");
-						data->targetFormID = combatTarget->formID;
+						// ============================================
+						// REDIRECT COMPANION TO PLAYER'S TARGET
+						// Instead of just blocking, find what the player is fighting
+						// and assign that as the companion's target
+						// ============================================
+						Actor* player = *g_thePlayer;
+						Actor* playerTarget = nullptr;
+						
+						if (player->IsInCombat())
+						{
+							UInt32 playerCombatHandle = player->currentCombatTarget;
+							if (playerCombatHandle != 0)
+							{
+								NiPointer<TESObjectREFR> playerTargetRef;
+								LookupREFRByHandle(playerCombatHandle, playerTargetRef);
+								if (playerTargetRef && playerTargetRef->formType == kFormType_Character)
+								{
+									Actor* potentialTarget = static_cast<Actor*>(playerTargetRef.get());
+									if (potentialTarget && !potentialTarget->IsDead(1) && potentialTarget != player)
+									{
+										playerTarget = potentialTarget;
+									}
+								}
+							}
+						}
+						
+						if (playerTarget)
+						{
+							// Redirect companion to player's target
+							data->targetFormID = playerTarget->formID;
+							target = playerTarget;
+							
+							UInt32 newTargetHandle = playerTarget->CreateRefHandle();
+							if (newTargetHandle != 0 && newTargetHandle != *g_invalidRefHandle)
+							{
+								rider->currentCombatTarget = newTargetHandle;
+							}
+							
+							const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
+							const char* targetName = CALL_MEMBER_FN(playerTarget, GetReferenceName)();
+							_MESSAGE("MultiMountedCombat: COMPANION '%s' redirected to player's target '%s' (%08X)",
+								riderName ? riderName : "Companion",
+								targetName ? targetName : "Unknown",
+								playerTarget->formID);
+						}
+						else
+						{
+							// No valid player target - keep searching
+							_MESSAGE("MultiMountedCombat: COMPANION targeting player but no valid player target found - will search");
+						}
 					}
-					target = combatTarget;
+					else
+					{
+						// Update to actual combat target if different
+						if (combatTarget->formID != data->targetFormID)
+						{
+							const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
+							const char* newTargetName = CALL_MEMBER_FN(combatTarget, GetReferenceName)();
+							_MESSAGE("MultiMountedCombat: %s target updated: %08X -> %08X ('%s')",
+								riderName ? riderName : "Rider",
+								data->targetFormID,
+								combatTarget->formID,
+								newTargetName ? newTargetName : "Unknown");
+							data->targetFormID = combatTarget->formID;
+						}
+						target = combatTarget;
+					}
 				}
 			}
 		}
@@ -1502,6 +1604,9 @@ namespace MountedNPCCombatVR
 			_MESSAGE("MultiMountedCombat: %s's target died - looking for new target",
 				riderName ? riderName : "Rider");
 			
+			// CRITICAL: Clear weapon state when target dies - allows fresh equip for new target
+			ClearWeaponStateData(rider->formID);
+			
 			// Try to find a new combat target
 			combatTargetHandle = rider->currentCombatTarget;
 			if (combatTargetHandle != 0)
@@ -1513,20 +1618,58 @@ namespace MountedNPCCombatVR
 					Actor* newTarget = static_cast<Actor*>(newTargetRef.get());
 					if (newTarget && !newTarget->IsDead(1))
 					{
-						data->targetFormID = newTarget->formID;
-						target = newTarget;
-						_MESSAGE("MultiMountedCombat: Found new target: %08X", newTarget->formID);
+						// CRITICAL: If this is a companion, NEVER let them target the player!
+						bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && newTarget == (*g_thePlayer));
+						if (data->isCompanion && targetIsPlayer)
+						{
+							// ============================================
+							// REDIRECT COMPANION TO PLAYER'S TARGET
+							// ============================================
+							Actor* player = *g_thePlayer;
+							Actor* playerTarget = nullptr;
+							
+							if (player->IsInCombat())
+							{
+								UInt32 playerCombatHandle = player->currentCombatTarget;
+								if (playerCombatHandle != 0)
+								{
+									NiPointer<TESObjectREFR> playerTargetRef;
+									LookupREFRByHandle(playerCombatHandle, playerTargetRef);
+									if (playerTargetRef && playerTargetRef->formType == kFormType_Character)
+									{
+										Actor* potentialTarget = static_cast<Actor*>(playerTargetRef.get());
+										if (potentialTarget && !potentialTarget->IsDead(1) && potentialTarget != player)
+										{
+											playerTarget = potentialTarget;
+										}
+									}
+								}
+							}
+							
+							if (playerTarget)
+							{
+								data->targetFormID = playerTarget->formID;
+								target = playerTarget;
+								_MESSAGE("MultiMountedCombat: Redirected companion to player's new target: %08X", playerTarget->formID);
+							}
+						}
+						else
+						{
+							data->targetFormID = newTarget->formID;
+							target = newTarget;
+							_MESSAGE("MultiMountedCombat: Found new target: %08X", newTarget->formID);
+						}
 					}
 				}
-			}
-			
-			// If still no valid target, remove this rider
-			if (!target || target->IsDead(1))
-			{
-				_MESSAGE("MultiMountedCombat: No valid target found - removing rider");
-				data->Reset();
-				g_multiRiderCount--;
-				continue;
+				
+				// If still no valid target, remove this rider
+				if (!target || target->IsDead(1))
+				{
+					_MESSAGE("MultiMountedCombat: No valid target found - removing rider");
+					data->Reset();
+					g_multiRiderCount--;
+					continue;
+				}
 			}
 		}
 		
@@ -1536,6 +1679,9 @@ namespace MountedNPCCombatVR
 			const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 			_MESSAGE("MultiMountedCombat: Rider '%s' (%08X) DIED - removing from tracking",
 				riderName ? riderName : "Unknown", data->riderFormID);
+			
+			// CRITICAL: Clear weapon state for dead rider
+			ClearWeaponStateData(rider->formID);
 			
 			// Clear ranged horse data if this was a ranged rider
 			if (data->role == MultiCombatRole::Ranged)
@@ -1588,6 +1734,9 @@ namespace MountedNPCCombatVR
 			const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 			_MESSAGE("MultiMountedCombat: Rider '%s' (%08X) DISMOUNTED - removing from tracking",
 				riderName ? riderName : "Unknown", data->riderFormID);
+			
+			// CRITICAL: Clear weapon state for dismounted rider
+			ClearWeaponStateData(rider->formID);
 			
 			// Clear ranged horse data if this was a ranged rider
 			if (data->role == MultiCombatRole::Ranged)
@@ -1664,7 +1813,7 @@ namespace MountedNPCCombatVR
 				data->role = MultiCombatRole::Melee;
 				
 				// Clear ranged horse state
-				for (int j = 0; j < MAX_MULTI_RIDERS; j++)
+				for (int j =  0; j < MAX_MULTI_RIDERS; j++)
 				{
 					if (g_rangedHorseData[j].isValid && g_rangedHorseData[j].horseFormID == data->horseFormID)
 					{
@@ -1685,7 +1834,7 @@ namespace MountedNPCCombatVR
 	
 	int UpdateMultiRiderBehavior(Actor* horse, Actor* target)
 	{
-		if (!horse || !target) return 0;
+		if (!horse || !target) return  0;
 		
 		MultiRiderData* data = GetMultiRiderDataByHorse(horse->formID);
 		if (!data) return 0;

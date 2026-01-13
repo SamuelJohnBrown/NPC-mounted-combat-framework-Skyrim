@@ -80,6 +80,14 @@ namespace MountedNPCCombatVR
 	// Reset bow attack state (call when bow is unequipped)
 	void ResetBowAttackState(UInt32 riderFormID);
 	
+	// Check if rider has bow drawn and ready to fire (in Drawing or Holding state)
+	// Used to decide whether to fire before switching weapons
+	bool IsBowDrawnAndReady(UInt32 riderFormID);
+	
+	// Force release the drawn bow and fire at target
+	// Returns true if release was successful
+	bool ForceReleaseBowAtTarget(Actor* rider, Actor* target);
+	
 	// ============================================
 	// Rapid Fire Bow Attack System
 	// Special fast bow attack cycle for rapid fire maneuver

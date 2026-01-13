@@ -5,6 +5,8 @@
 #include "AILogging.h"
 #include "Helper.h"
 #include "config.h"
+#include "FactionData.h"
+#include "CompanionCombat.h"  // For IsCompanion
 #include "skse64/GameReferences.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -40,7 +42,7 @@ namespace MountedNPCCombatVR
 	
 	const float HORSE_SCAN_RANGE = 2000.0f;
 	const float SCAN_UPDATE_INTERVAL = 3.0f;
-	const float ACTIVATION_DELAY_SECONDS = 2.0f;
+	const float ACTIVATION_DELAY_SECONDS = 1.0f;
 	const float COMBAT_CHECK_INTERVAL = 2.0f;
 	const int MAX_DISMOUNTED_NPCS = 10;
 	const int MAX_AVAILABLE_HORSES = 10;
@@ -130,6 +132,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// TRIGGER AGGRO ON REMOUNTED NPC
 	// Uses the same method as SpecialDismount to trigger aggression
+	// FOR COMPANIONS: Don't use assault alarm - directly set them to target player's target
 	// ============================================
 	
 	static void TriggerRemountAggro(Actor* npc)
@@ -143,21 +146,69 @@ namespace MountedNPCCombatVR
 		_MESSAGE("HorseMountScanner: *** TRIGGERING REMOUNT AGGRO ***");
 		_MESSAGE("HorseMountScanner:   NPC: '%s' (%08X)", name ? name : "Unknown", npc->formID);
 		
-		// Use the SAME method as SpecialDismount::TriggerAggressionOnPulledRider
-		// BUT don't call EvaluatePackage - NPC is already mounted and we don't want to disrupt that
+		// ============================================
+		// CHECK IF THIS IS A COMPANION
+		// Companions should NOT be sent assault alarms - they should target the player's target
+		// ============================================
+		bool isCompanion = IsCompanion(npc);
 		
-		// 1. Send assault alarm - this triggers crime/aggression response
-		_MESSAGE("HorseMountScanner:   Sending assault alarm...");
-		Actor_SendAssaultAlarm_HMS(0, 0, npc);
-		
-		// 2. Set attack on sight flag
-		npc->flags2 |= Actor::kFlag_kAttackOnSight;
-		_MESSAGE("HorseMountScanner:   Set kAttackOnSight flag");
-		
-		// NOTE: We do NOT call Actor_EvaluatePackage here because:
-		// - The NPC is already mounted on their horse
-		// - Forcing AI evaluation might cause them to dismount or behave erratically
-		// - The assault alarm + attack flag should be enough to make them hostile
+		if (isCompanion)
+		{
+			_MESSAGE("HorseMountScanner:   COMPANION detected - redirecting to player's target");
+			
+			// Find the player's combat target
+			Actor* playerTarget = nullptr;
+			if (player->IsInCombat())
+			{
+				UInt32 playerCombatHandle = player->currentCombatTarget;
+				if (playerCombatHandle != 0)
+				{
+					NiPointer<TESObjectREFR> playerTargetRef;
+					LookupREFRByHandle(playerCombatHandle, playerTargetRef);
+					if (playerTargetRef && playerTargetRef->formType == kFormType_Character)
+					{
+						Actor* potentialTarget = static_cast<Actor*>(playerTargetRef.get());
+						if (potentialTarget && !potentialTarget->IsDead(1) && potentialTarget != player)
+						{
+							playerTarget = potentialTarget;
+						}
+					}
+				}
+			}
+			
+			if (playerTarget)
+			{
+				// Set companion to target the player's target
+				UInt32 targetHandle = playerTarget->CreateRefHandle();
+				if (targetHandle != 0 && targetHandle != *g_invalidRefHandle)
+				{
+					npc->currentCombatTarget = targetHandle;
+				}
+				
+				// Set attack on sight flag
+				npc->flags2 |= Actor::kFlag_kAttackOnSight;
+				
+				const char* targetName = CALL_MEMBER_FN(playerTarget, GetReferenceName)();
+				_MESSAGE("HorseMountScanner:   COMPANION set to target '%s' (%08X)",
+					targetName ? targetName : "Unknown", playerTarget->formID);
+			}
+			else
+			{
+				// No valid player target - just set attack flag, don't send assault alarm
+				npc->flags2 |= Actor::kFlag_kAttackOnSight;
+				_MESSAGE("HorseMountScanner:   COMPANION - no valid player target, just set attack flag");
+			}
+		}
+		else
+		{
+			// Non-companion: Use assault alarm to trigger aggression against player
+			_MESSAGE("HorseMountScanner:   Sending assault alarm...");
+			Actor_SendAssaultAlarm_HMS(0, 0, npc);
+			
+			// Set attack on sight flag
+			npc->flags2 |= Actor::kFlag_kAttackOnSight;
+			_MESSAGE("HorseMountScanner:   Set kAttackOnSight flag");
+		}
 		
 		// Check result
 		bool isNowInCombat = npc->IsInCombat();
@@ -215,7 +266,7 @@ namespace MountedNPCCombatVR
 	// UTILITY FUNCTIONS
 	// ============================================
 	
-	static float GetScannerTime()
+	static float GetGameTime()
 	{
 		static auto startTime = std::chrono::steady_clock::now();
 		auto now = std::chrono::steady_clock::now();
@@ -328,7 +379,7 @@ namespace MountedNPCCombatVR
 	{
 		if (npcFormID == 0) return;
 		
-		float currentTime = GetScannerTime();
+		float currentTime = GetGameTime();
 		
 		// Check if already registered
 		for (int i = 0; i < MAX_DISMOUNTED_NPCS; i++)
@@ -496,7 +547,7 @@ namespace MountedNPCCombatVR
 		TESObjectCELL* cell = player->parentCell;
 		if (!cell) return;
 		
-		float currentTime = GetScannerTime();
+		float currentTime = GetGameTime();
 		
 		// First, update ignore range flags for existing entries
 		for (int i = 0; i < MAX_DISMOUNTED_NPCS; i++)
@@ -654,7 +705,7 @@ namespace MountedNPCCombatVR
 	{
 		if (!g_thePlayer || !(*g_thePlayer)) return;
 		
-		float currentTime = GetScannerTime();
+		float currentTime = GetGameTime();
 		
 		// ============================================
 		// FIRST: Check for NPCs that have successfully remounted
@@ -942,7 +993,7 @@ namespace MountedNPCCombatVR
 	{
 		if (!npc || !horse) return false;
 		
-		float currentTime = GetScannerTime();
+		float currentTime = GetGameTime();
 		
 		// Check cooldown and dismount delay
 		if (npcSlotIndex >= 0 && npcSlotIndex < MAX_DISMOUNTED_NPCS)
@@ -1190,12 +1241,17 @@ namespace MountedNPCCombatVR
 		g_lastScanHorseCount = horseCount;
 		g_scanAttempts++;
 		
-		// Only log if we have something to report
+		// Only log if we have something to report AND at reasonable intervals
 		if (npcCount == 0 && horseCount == 0)
 		{
-			_MESSAGE("HorseMountScanner: Scan %d/%d - No unmounted NPCs or available horses", 
-				g_scanAttempts, MAX_SCAN_ATTEMPTS);
+			// Don't log "No unmounted NPCs" every scan - too verbose
 			return;
+		}
+		
+		// Only log detailed scan info every 5th scan to reduce spam
+		if (g_scanAttempts % 5 != 1)
+		{
+			return;  // Skip detailed logging for most scans
 		}
 		
 		_MESSAGE("HorseMountScanner: ========== SCAN %d/%d ==========", g_scanAttempts, MAX_SCAN_ATTEMPTS);
@@ -1393,7 +1449,7 @@ namespace MountedNPCCombatVR
 		Actor* player = *g_thePlayer;
 		if (!player->parentCell) return false;
 		
-		float currentTime = GetScannerTime();
+		float currentTime = GetGameTime();
 		if ((currentTime - g_lastCombatCheckTime) < COMBAT_CHECK_INTERVAL) return g_scannerActive;
 		g_lastCombatCheckTime = currentTime;
 		
@@ -1474,3 +1530,4 @@ namespace MountedNPCCombatVR
 	int GetLastScanHorseCount() { return g_lastScanHorseCount; }
 	void InstallCombatStateHook() { _MESSAGE("HorseMountScanner: Poll-based (no hooks)"); }
 }
+
