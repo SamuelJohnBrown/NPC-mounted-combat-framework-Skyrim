@@ -218,4 +218,53 @@ namespace MountedNPCCombatVR
 	bool IsPathClear(Actor* mount, Actor* target);
 	float GetCurrentGameTime();
 	NiPoint3 GetFleeDirection(Actor* actor, Actor* threat);
+	
+	// ============================================
+	// Disengage Cooldown System
+	// ============================================
+	// Prevents NPCs from immediately re-engaging after distance disengage
+	// When an NPC disengages due to distance (> MaxCombatDistance), they
+	// are put on a cooldown to prevent immediate re-triggering of combat.
+	// ============================================
+	
+	// Check if an NPC is on disengage cooldown
+	bool IsNPCOnDisengageCooldown(UInt32 npcFormID);
+	
+	// Add an NPC to the disengage cooldown list
+	void AddNPCToDisengageCooldown(UInt32 npcFormID);
+	
+	// Clear all disengage cooldowns (called on system reset)
+	void ClearAllDisengageCooldowns();
+
+	// ============================================
+	// Horse Animation & Combat Time Functions
+	// (Previously in SingleMountedCombat)
+	// ============================================
+	
+	// Initialization
+	void InitSingleMountedCombat();
+	void NotifyCombatStarted();
+	float GetCombatElapsedTime();  // Returns seconds since combat started
+	
+	// Reset cached forms on game load (prevents stale pointers)
+	void ResetSingleMountedCombatCache();
+	
+	// Animation Event Helper
+	// Send an animation event to an actor's animation graph
+	// Returns true if the event was accepted
+	bool SendHorseAnimationEvent(Actor* actor, const char* eventName);
+	
+	// Horse Sprint Control
+	// Start/stop horse sprint animation
+	// StartHorseSprint includes cooldown check - won't spam if already sprinting
+	void StartHorseSprint(Actor* horse);
+	void StopHorseSprint(Actor* horse);
+	
+	// Check if horse is currently sprinting
+	bool IsHorseSprinting(Actor* horse);
+	
+	// Horse Rear Up Animation
+	// Play the rear up animation on a horse (no checks, just plays)
+	// Returns true if animation was triggered successfully
+	bool PlayHorseRearUpAnimation(Actor* horse);
 }

@@ -1,10 +1,13 @@
 #include "SpecialDismount.h"
-#include "Engine.h"
+#include "Helper.h"
 #include "NPCProtection.h"
 #include "MountedCombat.h"
 #include "DynamicPackages.h"
 #include "AILogging.h"
 #include "HorseMountScanner.h"
+#include "WeaponDetection.h"
+#include "ArrowSystem.h"
+#include "SpecialMovesets.h"
 #include "skse64/GameReferences.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -40,7 +43,7 @@ namespace MountedNPCCombatVR
 	// CRIME/AGGRESSION CONFIGURATION
 	// ============================================
 	static const float ALLY_ALERT_RADIUS = 2000.0f;  // How far nearby allies are alerted
-	static const int MAX_ALLIES_TO_ALERT = 5;     // Max allies to alert at once
+	static const int MAX_ALLIES_TO_ALERT = 3;     // Max allies to alert at once
 	
 	// Task delegate implementation - uses FormIDs for safety
 	taskPushActorAway::taskPushActorAway(UInt32 sourceFormID, UInt32 targetFormID, float afKnockbackForce)
@@ -462,6 +465,27 @@ namespace MountedNPCCombatVR
 		if (CALL_MEMBER_FN(target, GetMount)(mount) && mount)
 		{
 			horseFormID = mount->formID;
+		}
+		
+		// ============================================
+		// CRITICAL: Reset weapon state machine for pulled rider
+		// This clears any pending weapon switches or equip states
+		// ============================================
+		ClearWeaponStateData(target->formID);
+		
+		// ============================================
+		// CRITICAL: Clear any pending bow attack animations
+		// Prevents stuck bow draw state after dismount
+		// ============================================
+		ResetBowAttackState(target->formID);
+		
+		// ============================================
+		// CRITICAL: Clear horse's special movesets
+		// Clears charge, stand ground, rapid fire, 90-deg turns, etc.
+		// ============================================
+		if (horseFormID != 0)
+		{
+			ClearAllMovesetData(horseFormID);
 		}
 		
 		// Queue ragdoll on main thread

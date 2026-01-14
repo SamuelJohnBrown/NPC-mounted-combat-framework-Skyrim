@@ -5,14 +5,26 @@
 #include <xbyak/xbyak.h>
 
 #include "skse64/PluginAPI.h"	
-#include "Engine.h"
+#include "Helper.h"
 #include "SpecialDismount.h"
 #include "HorseMountScanner.h"
 
 #include "skse64_common/BranchTrampoline.h"
 
+#include <skse64/PapyrusActor.cpp>
+
 namespace MountedNPCCombatVR
 {
+	// ============================================
+	// GLOBAL INTERFACES (moved from Engine.cpp)
+	// ============================================
+	SKSETrampolineInterface* g_trampolineInterface = nullptr;
+	HiggsPluginAPI::IHiggsInterface001* higgsInterface;
+	SkyrimVRESLPluginAPI::ISkyrimVRESLInterface001* skyrimVRESLInterface;
+
+	// ============================================
+	// SKSE INTERFACES
+	// ============================================
 	static SKSEMessagingInterface* g_messaging = NULL;
 	static PluginHandle					g_pluginHandle = kPluginHandle_Invalid;
 	static SKSEPapyrusInterface* g_papyrus = NULL;
@@ -22,6 +34,25 @@ namespace MountedNPCCombatVR
 	static SKSEVRInterface* g_vrInterface = nullptr;
 
 	#pragma comment(lib, "Ws2_32.lib")
+
+	// ============================================
+	// START MOD (moved from Engine.cpp)
+	// ============================================
+	void StartMod()
+	{
+		LOG("========================================");
+		LOG("Mounted_NPC_Combat_VR: Initializing mod features...");
+		LOG("========================================");
+		
+		// Setup the NPC dismount prevention hook
+		LOG("Mounted_NPC_Combat_VR: Setting up NPC Dismount Prevention Hook...");
+		SetupDismountHook();
+		
+		LOG("========================================");
+		LOG("Mounted_NPC_Combat_VR: Mod initialization complete!");
+		LOG(" - NPC Dismount Prevention: %s", PreventNPCDismountOnAttack ? "ENABLED" : "DISABLED");
+		LOG("========================================");
+	}
 
 	void SetupReceptors()
 	{

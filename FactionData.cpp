@@ -555,6 +555,31 @@ namespace MountedNPCCombatVR
 		// Log faction info (only at INFO level)
 		LogActorFactions(actor);
 		
+		// ============================================
+		// CHECK NPC NAME FIRST - Highest Priority
+		// NPCs with "Mage" in their name should be MageCaster
+		// regardless of their faction membership
+		// ============================================
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		if (actorName && strlen(actorName) > 0)
+		{
+			std::string nameStr = actorName;
+			std::transform(nameStr.begin(), nameStr.end(), nameStr.begin(), ::tolower);
+			
+			// Check for mage-related names (highest priority)
+			if (nameStr.find("mage") != std::string::npos ||
+				nameStr.find("wizard") != std::string::npos ||
+				nameStr.find("warlock") != std::string::npos ||
+				nameStr.find("necromancer") != std::string::npos ||
+				nameStr.find("conjurer") != std::string::npos ||
+				nameStr.find("pyromancer") != std::string::npos ||
+				nameStr.find("cryomancer") != std::string::npos ||
+				nameStr.find("electromancer") != std::string::npos)
+			{
+				return MountedCombatClass::MageCaster;
+			}
+		}
+		
 		// Check factions in order of specificity
 		if (IsGuardFaction(actor))
 		{

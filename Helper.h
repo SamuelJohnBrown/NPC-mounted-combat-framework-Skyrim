@@ -31,9 +31,18 @@
 #include <skse64/PapyrusEvents.h>
 
 #include "config.h"
+#include "higgsinterface001.h"
+#include "SkyrimVRESLAPI.h"
 
 namespace MountedNPCCombatVR
 {
+	// ============================================
+	// Global Interfaces (defined in main.cpp)
+	// ============================================
+	extern SKSETrampolineInterface* g_trampolineInterface;
+	extern HiggsPluginAPI::IHiggsInterface001* higgsInterface;
+	extern SkyrimVRESLPluginAPI::ISkyrimVRESLInterface001* skyrimVRESLInterface;
+
 	// ============================================
 	// Shared Utility Functions
 	// ============================================

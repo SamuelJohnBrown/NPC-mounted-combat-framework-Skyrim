@@ -18,7 +18,7 @@ namespace MountedNPCCombatVR {
 	
 	float WeaponSwitchDistance = 250.0f;  // Should be > MeleeRangeOnFoot so weapon switches BEFORE entering melee
 	float WeaponSwitchDistanceMounted = 325.0f;  // Mounted vs mounted NPC combat
-	float MeleeRangeOnFoot = 190.0f;
+	float MeleeRangeOnFoot = 140.0f;
 	float MeleeRangeOnFootNPC = 230.0f;
 	float MeleeRangeMounted = 250.0f;
 
@@ -39,9 +39,18 @@ namespace MountedNPCCombatVR {
 	// MELEE ATTACK ANGLE SETTINGS
 	// ============================================
 	
-	float AttackAnglePlayer = 0.26f;
+	float AttackAnglePlayer = 0.52f;  // Increased from 0.26 to 0.52 (~30 degrees) for better close-range attacks
 	float AttackAngleNPC = 0.52f;
 	float AttackAngleMounted = 0.35f;
+	float CloseRangeAttackDistance = 120.0f;  // Skip angle check when closer than this distance
+
+	// ============================================
+	// CLOSE RANGE MELEE ASSAULT SETTINGS
+	// ============================================
+	
+	float CloseRangeMeleeAssaultDistance = 145.0f;  // Trigger when target within this distance of rider's side
+	float CloseRangeMeleeAssaultInterval = 1.0f;    // 1 second between attacks
+	float CloseRangeRotationLockDistance = 140.0f;  // Distance at which rotation lock applies
 
 	// ============================================
 	// CHARGE MANEUVER SETTINGS
@@ -109,7 +118,7 @@ namespace MountedNPCCombatVR {
 	float RangedRoleMaxDistance = 1400.0f;      // If further than this, move closer
 	float RangedPositionTolerance = 100.0f;     // How close to ideal is "close enough"
 	float RangedFireMinDistance = 300.0f;       // Minimum distance to fire bow
-	float RangedFireMaxDistance = 2800.0f;      // Maximum distance to fire bow
+	float RangedFireMaxDistance = 1900.0f;      // Maximum distance to fire bow
 	float RoleCheckInterval = 2.0f;             // Time in seconds to re-check roles
 
 	// ============================================
@@ -124,8 +133,21 @@ namespace MountedNPCCombatVR {
 	// MOUNTED ATTACK DAMAGE MULTIPLIER SETTINGS
 	// ============================================
 	
-	float HostileRiderDamageMultiplier = 3.0f;     // 3x damage for hostile riders vs NPCs
+	float HostileRiderDamageMultiplier = 3.0f;  // 3x damage for hostile riders vs NPCs
 	float CompanionRiderDamageMultiplier = 2.0f;   // 2x damage for companion riders vs NPCs
+
+	// ============================================
+	// MOUNTED WEAPON REACH SETTINGS
+	// ============================================
+	
+	float TwoHandedReachBonus = 80.0f;  // Additional reach for 2H weapons (greatswords, battleaxes)
+
+	// ============================================
+	// COMBAT DISTANCE SETTINGS
+	// ============================================
+	
+	float MaxCombatDistance = 2000.0f;   // Max distance before NPC disengages
+	float MaxCompanionCombatDistance = 1950.0f;    // Max distance for companions (slightly less)
 
 	// ============================================
 	// HOSTILE DETECTION SETTINGS
@@ -146,7 +168,7 @@ namespace MountedNPCCombatVR {
 	
 	bool CompanionCombatEnabled = true;
 	int MaxTrackedCompanions = 5;
-	float CompanionScanRange = 4000.0f;
+	float CompanionScanRange = 2000.0f;
 	float CompanionScanInterval = 1.0f;
 	float CompanionTargetRange = 2000.0f;
 	float CompanionEngageRange = 1500.0f;
@@ -303,6 +325,11 @@ namespace MountedNPCCombatVR {
 				// Damage Multipliers
 				else if (variableName == "HostileRiderDamageMultiplier") HostileRiderDamageMultiplier = std::stof(variableValueStr);
 				else if (variableName == "CompanionRiderDamageMultiplier") CompanionRiderDamageMultiplier = std::stof(variableValueStr);
+				// Weapon Reach
+				else if (variableName == "TwoHandedReachBonus") TwoHandedReachBonus = std::stof(variableValueStr);
+				// Combat Distance
+				else if (variableName == "MaxCombatDistance") MaxCombatDistance = std::stof(variableValueStr);
+				else if (variableName == "MaxCompanionCombatDistance") MaxCompanionCombatDistance = std::stof(variableValueStr);
 				// Hostile Detection
 				else if (variableName == "HostileDetectionRange") HostileDetectionRange = std::stof(variableValueStr);
 				else if (variableName == "HostileScanInterval") HostileScanInterval = std::stof(variableValueStr);

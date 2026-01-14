@@ -1,8 +1,10 @@
 #include "SpecialMovesets.h"
-#include "SingleMountedCombat.h"
+#include "MountedCombat.h"
 #include "WeaponDetection.h"
 #include "ArrowSystem.h"
 #include "DynamicPackages.h"
+#include "CombatStyles.h"
+#include "FleeingBehavior.h"
 #include "AILogging.h"
 #include "Helper.h"
 #include "config.h"
@@ -20,6 +22,12 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// CONFIGURATION (now loaded from INI where possible)
 	// ============================================
+	
+	// ============================================
+	// MAXIMUM DISTANCE FOR ALL SPECIAL MOVESET
+	// Don't trigger any special moveset if target is beyond this distance
+	// ============================================
+	const float SPECIAL_MOVESET_MAX_DISTANCE = 1800.0f;
 	
 	// Rear up on approach (facing target head-on)
 	// REAR_UP_APPROACH_CHANCE now uses RearUpApproachChance from config
@@ -265,10 +273,28 @@ namespace MountedNPCCombatVR
 	static int g_playerAggroSwitchCount = 0;
 	
 	// ============================================
+	// CLOSE RANGE MELEE ASSAULT (EMERGENCY CLOSE COMBAT)
+	// ============================================
+	// When target gets within 145 units of the rider's side,
+	// triggers rapid melee attacks (1 per second) until they move away.
+	// 100% trigger chance, 0 cooldown - purely distance-based.
+	
+	struct CloseRangeMeleeAssaultData
+	{
+		UInt32 horseFormID;
+		bool isActive;
+		float lastAttackTime;
+		bool isValid;
+	};
+	
+	static CloseRangeMeleeAssaultData g_closeRangeMeleeAssaultData[MAX_TRACKED_HORSES];
+	static int g_closeRangeMeleeAssaultCount = 0;
+	
+	// ============================================
 	// ELEVATED TARGET DETECTION CONSTANTS
 	// ============================================
-	const float ELEVATED_TARGET_HEIGHT_THRESHOLD = 150.0f;  // Target must be 150+ units above horse
-	const float STUCK_AREA_RADIUS = 100.0f;  // Consider "same area" if within 100 units
+	const float ELEVATED_TARGET_HEIGHT_THRESHOLD = 250.0f;  // Target must be 150+ units above horse
+	const float STUCK_AREA_RADIUS = 30.0f;  // Consider "same area" if within 100 units
 	const int MAX_JUMP_ATTEMPTS_BEFORE_DISMOUNT = 2;  // Dismount after 2 failed jumps (elevated target)
 	const int MAX_JUMP_ATTEMPTS_STUCK = 3;  // Dismount after 3 failed jumps (general stuck)
 	const float STUCK_JUMP_TIME_WINDOW = 20.0f;  // 3 jumps within 20 seconds = stuck
@@ -499,6 +525,16 @@ namespace MountedNPCCombatVR
 		}
 		g_playerAggroSwitchCount = 0;
 		
+		// Clear close range melee assault data
+		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
+		{
+			g_closeRangeMeleeAssaultData[i].isValid = false;
+			g_closeRangeMeleeAssaultData[i].horseFormID = 0;
+			g_closeRangeMeleeAssaultData[i].isActive = false;
+			g_closeRangeMeleeAssaultData[i].lastAttackTime = 0;
+		}
+		g_closeRangeMeleeAssaultCount = 0;
+		
 		// Note: g_mobileInterceptData is defined later in the file
 		// It will be cleared in InitSpecialMovesets or when first accessed
 		
@@ -509,7 +545,7 @@ namespace MountedNPCCombatVR
 		g_horseTrotLeftIdle = nullptr;
 		g_horseTrotRightIdle = nullptr;
 		
-		_MESSAGE("SpecialMovesets: System initialized");
+		_MESSAGE("SpecialMovesets: All state reset complete");
 	}
 	
 	void ShutdownSpecialMovesets()
@@ -777,7 +813,7 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
-		// Must still be in same area (haven't moved significantly)
+		// Must still be in the same area (haven't moved significantly)
 		if (!IsHorseInSameArea(data, horse->pos))
 		{
 			// Horse moved - reset tracking
@@ -963,6 +999,7 @@ namespace MountedNPCCombatVR
 		{
 			if (g_combatDismountData[i].isValid && g_combatDismountData[i].riderFormID == riderFormID)
 			{
+				// Shift remaining entries
 				for (int j = i; j < g_combatDismountCount - 1; j++)
 				{
 					g_combatDismountData[j] = g_combatDismountData[j + 1];
@@ -1030,6 +1067,9 @@ namespace MountedNPCCombatVR
 		
 		// Check if rear up is enabled
 		if (!RearUpEnabled) return false;
+		
+		// Block if rider is fleeing
+		if (IsHorseRiderFleeing(horse->formID)) return false;
 		
 		// Block if in stand ground
 		if (IsInStandGround(horse->formID)) return false;
@@ -1463,7 +1503,7 @@ namespace MountedNPCCombatVR
 	float GetAdjacentRidingAngle(UInt32 horseFormID, const NiPoint3& targetPos, const NiPoint3& horsePos, float targetHeading)
 	{
 		// Get which side to ride on
-		bool rideOnRight = GetAdjacentRidingSide(horseFormID);
+	 bool rideOnRight = GetAdjacentRidingSide(horseFormID);
 		
 		// Calculate angle from horse to target
 		float dx = targetPos.x - horsePos.x;
@@ -1871,7 +1911,7 @@ namespace MountedNPCCombatVR
 				g_mobileInterceptCount--;
 				return;
 			}
-			}
+		}
 	}
 	
 	// ============================================
@@ -1927,8 +1967,19 @@ namespace MountedNPCCombatVR
 		// Check if charge is enabled
 		if (!ChargeEnabled) return false;
 		
+		// Block if rider is fleeing
+		if (IsHorseRiderFleeing(horse->formID)) return false;
+		
 		// Block if in stand ground
 		if (IsInStandGround(horse->formID)) return false;
+		
+		// ============================================
+		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
+		// ============================================
+		if (distanceToTarget > SPECIAL_MOVESET_MAX_DISTANCE)
+		{
+			return false;
+		}
 		
 		// Check if distance is in charge range (using config values)
 		if (distanceToTarget < ChargeMinDistance || distanceToTarget > ChargeMaxDistance)
@@ -2179,7 +2230,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// RAPID FIRE MANEUVER
 	// ============================================
-
+	
 	static HorseRapidFireData* GetOrCreateRapidFireData(UInt32 horseFormID)
 	{
 		// Check if already tracked
@@ -2229,8 +2280,19 @@ namespace MountedNPCCombatVR
 		// Check if rapid fire is enabled
 		if (!RapidFireEnabled) return false;
 		
+		// Block if rider is fleeing
+		if (IsHorseRiderFleeing(horse->formID)) return false;
+		
 		// Block if in stand ground
 		if (IsInStandGround(horse->formID)) return false;
+		
+		// ============================================
+		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
+		// ============================================
+		if (distanceToTarget > SPECIAL_MOVESET_MAX_DISTANCE)
+		{
+			return false;
+		}
 		
 		// ============================================
 		// MUST HAVE BOW ALREADY EQUIPPED
@@ -2404,7 +2466,7 @@ namespace MountedNPCCombatVR
 			float dy = target->pos.y - horse->pos.y;
 			float distanceToTarget = sqrt(dx * dx + dy * dy);
 			
-			const float RAPID_FIRE_ABORT_DISTANCE = 5000.0f;
+			const float RAPID_FIRE_ABORT_DISTANCE = 1800.0f;
 			
 			if (distanceToTarget >= RAPID_FIRE_ABORT_DISTANCE)
 			{
@@ -2654,8 +2716,19 @@ namespace MountedNPCCombatVR
 		// Check if enabled in config
 		if (!StandGroundEnabled) return false;
 		
+		// Block if rider is fleeing
+		if (IsHorseRiderFleeing(horse->formID)) return false;
+		
 		// Only trigger when fighting a NON-PLAYER target
 		if (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer))
+		{
+			return false;
+		}
+		
+		// ============================================
+		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
+		// ============================================
+		if (distanceToTarget > SPECIAL_MOVESET_MAX_DISTANCE)
 		{
 			return false;
 		}
@@ -2906,6 +2979,14 @@ namespace MountedNPCCombatVR
 			return false;  // Player too far
 		}
 		
+		// ============================================
+		// MAXIMUM DISTANCE CHECK - Don't trigger if player beyond special moveset range
+		// ============================================
+		if (distanceToPlayer > SPECIAL_MOVESET_MAX_DISTANCE)
+		{
+			return false;
+		}
+		
 		// Check if player is alive
 		if (player->IsDead(1))
 		{
@@ -2977,6 +3058,10 @@ namespace MountedNPCCombatVR
 		return true;
 	}
 	
+	// ============================================
+	// CLEANUP FUNCTIONS
+	// ============================================
+	
 	void ClearPlayerAggroSwitchData(UInt32 horseFormID)
 	{
 		for (int i = 0; i < g_playerAggroSwitchCount; i++)
@@ -2995,6 +3080,206 @@ namespace MountedNPCCombatVR
 		}
 	}
 	
+	// ============================================
+	// CLOSE RANGE MELEE ASSAULT IMPLEMENTATION
+	// ============================================
+	
+	static CloseRangeMeleeAssaultData* GetOrCreateCloseRangeMeleeAssaultData(UInt32 horseFormID)
+	{
+		// Check if already tracked
+		for (int i = 0; i < g_closeRangeMeleeAssaultCount; i++)
+		{
+			if (g_closeRangeMeleeAssaultData[i].isValid && g_closeRangeMeleeAssaultData[i].horseFormID == horseFormID)
+			{
+				return &g_closeRangeMeleeAssaultData[i];
+			}
+		}
+		
+		// Create new entry
+		if (g_closeRangeMeleeAssaultCount < MAX_TRACKED_HORSES)
+		{
+			CloseRangeMeleeAssaultData* data = &g_closeRangeMeleeAssaultData[g_closeRangeMeleeAssaultCount];
+			data->horseFormID = horseFormID;
+			data->isActive = false;
+			data->lastAttackTime = 0;
+			data->isValid = true;
+			g_closeRangeMeleeAssaultCount++;
+			return data;
+		}
+		
+		return nullptr;
+	}
+	
+	bool IsInCloseRangeMeleeAssault(UInt32 horseFormID)
+	{
+		for (int i = 0; i < g_closeRangeMeleeAssaultCount; i++)
+		{
+			if (g_closeRangeMeleeAssaultData[i].isValid && g_closeRangeMeleeAssaultData[i].horseFormID == horseFormID)
+			{
+				return g_closeRangeMeleeAssaultData[i].isActive;
+			}
+		}
+		return false;
+	}
+	
+	bool TryCloseRangeMeleeAssault(Actor* horse, Actor* rider, Actor* target)
+	{
+		if (!horse || !rider || !target) return false;
+		
+		// Block if rider is fleeing
+		if (IsHorseRiderFleeing(horse->formID)) return false;
+		
+		// Calculate distance to target
+		float dx = target->pos.x - horse->pos.x;
+		float dy = target->pos.y - horse->pos.y;
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		
+		// Check if target is within close range melee assault distance
+		if (distanceToTarget > CloseRangeMeleeAssaultDistance)
+		{
+			// Target not close enough - check if we need to deactivate
+			CloseRangeMeleeAssaultData* data = GetOrCreateCloseRangeMeleeAssaultData(horse->formID);
+			if (data && data->isActive)
+			{
+				data->isActive = false;
+				_MESSAGE("SpecialMovesets: Horse %08X close range melee assault ENDED - target moved away (%.0f units)",
+					horse->formID, distanceToTarget);
+			}
+			return false;
+		}
+		
+		// ============================================
+		// TARGET IS WITHIN RANGE - FORCE MELEE WEAPON!
+		// This OVERRIDES any bow/ranged state
+		// ============================================
+		if (!IsMeleeEquipped(rider))
+		{
+			_MESSAGE("SpecialMovesets: Horse %08X - FORCING MELEE EQUIP for close range assault!",
+				horse->formID);
+			
+			// Sheathe any current weapon (bow)
+			if (IsBowEquipped(rider))
+			{
+				SheatheCurrentWeapon(rider);
+			}
+			
+			// Force equip melee weapon
+			EquipBestMeleeWeapon(rider);
+			rider->DrawSheatheWeapon(true);  // Force draw
+			
+			// Reset any bow attack state
+			ResetBowAttackState(rider->formID);
+		}
+		
+		// Target is within range - activate assault mode
+		CloseRangeMeleeAssaultData* data = GetOrCreateCloseRangeMeleeAssaultData(horse->formID);
+		if (!data) return false;
+		
+		// If not already active, log activation
+		if (!data->isActive)
+		{
+			data->isActive = true;
+			data->lastAttackTime = GetCurrentTime() - CloseRangeMeleeAssaultInterval; // Allow immediate first attack
+			_MESSAGE("SpecialMovesets: Horse %08X CLOSE RANGE MELEE ASSAULT activated! (target at %.0f units)",
+				horse->formID, distanceToTarget);
+		}
+		
+		return true;
+	}
+	
+	bool UpdateCloseRangeMeleeAssault(Actor* horse, Actor* rider, Actor* target)
+	{
+		if (!horse || !rider || !target) return false;
+		
+		CloseRangeMeleeAssaultData* data = GetOrCreateCloseRangeMeleeAssaultData(horse->formID);
+		if (!data || !data->isActive) return false;
+		
+		// Check distance again - target may have moved
+		float dx = target->pos.x - horse->pos.x;
+		float dy = target->pos.y - horse->pos.y;
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		
+		// If target moved out of range, deactivate
+		if (distanceToTarget > CloseRangeMeleeAssaultDistance)
+		{
+			data->isActive = false;
+			_MESSAGE("SpecialMovesets: Horse %08X close range melee assault ENDED - target escaped (%.0f units)",
+				horse->formID, distanceToTarget);
+			return false;
+		}
+		
+		// Check if enough time has passed for another attack
+		float currentTime = GetCurrentTime();
+		float timeSinceLastAttack = currentTime - data->lastAttackTime;
+		
+		if (timeSinceLastAttack < CloseRangeMeleeAssaultInterval)
+		{
+			return true; // Still in assault mode, waiting for next attack
+		}
+		
+		// Time for an attack! Determine which side the target is on
+		float horseAngle = horse->rot.z;
+		float horseRightX = cos(horseAngle);
+		float horseRightY = -sin(horseAngle);
+		
+		float toTargetX = target->pos.x - horse->pos.x;
+		float toTargetY = target->pos.y - horse->pos.y;
+		
+		float dotRight = (toTargetX * horseRightX) + (toTargetY * horseRightY);
+		const char* targetSide = (dotRight > 0) ? "RIGHT" : "LEFT";
+		
+		// Play the melee attack animation using existing function from CombatStyles
+		PlayMountedAttackAnimation(rider, targetSide);
+		
+		// Update hit detection if rider is attacking
+		if (IsRiderAttacking(rider))
+		{
+			UpdateMountedAttackHitDetection(rider, target);
+		}
+		
+		// Update last attack time
+		data->lastAttackTime = currentTime;
+		
+		_MESSAGE("SpecialMovesets: Horse %08X close range assault ATTACK (%s side, dist: %.0f)",
+			horse->formID, targetSide, distanceToTarget);
+		
+		return true;
+	}
+	
+	void StopCloseRangeMeleeAssault(UInt32 horseFormID)
+	{
+		for (int i = 0; i < g_closeRangeMeleeAssaultCount; i++)
+		{
+			if (g_closeRangeMeleeAssaultData[i].isValid && g_closeRangeMeleeAssaultData[i].horseFormID == horseFormID)
+			{
+				if (g_closeRangeMeleeAssaultData[i].isActive)
+				{
+				 g_closeRangeMeleeAssaultData[i].isActive = false;
+					_MESSAGE("SpecialMovesets: Stopped close range melee assault for horse %08X", horseFormID);
+				}
+				return;
+			}
+		}
+	}
+	
+	void ClearCloseRangeMeleeAssaultData(UInt32 horseFormID)
+	{
+		for (int i = 0; i < g_closeRangeMeleeAssaultCount; i++)
+		{
+			if (g_closeRangeMeleeAssaultData[i].isValid && g_closeRangeMeleeAssaultData[i].horseFormID == horseFormID)
+			{
+				// Shift remaining entries
+				for (int j = i; j < g_closeRangeMeleeAssaultCount - 1; j++)
+				{
+					g_closeRangeMeleeAssaultData[j] = g_closeRangeMeleeAssaultData[j + 1];
+				}
+				g_closeRangeMeleeAssaultCount--;
+				_MESSAGE("SpecialMovesets: Cleared close range melee assault data for horse %08X", horseFormID);
+				return;
+			}
+		}
+	}
+
 	void ClearAllMovesetData(UInt32 horseFormID)
 	{
 		_MESSAGE("SpecialMovesets: Clearing ALL moveset data for horse %08X", horseFormID);
@@ -3039,10 +3324,13 @@ namespace MountedNPCCombatVR
 		
 		// Clear player aggro switch data
 		ClearPlayerAggroSwitchData(horseFormID);
+		
+		// Clear close range melee assault data
+		ClearCloseRangeMeleeAssaultData(horseFormID);
 	}
 	
 	// ============================================
-	// RESET ALL SPECIAL MOVESETS
+	// RESET ALL SPECIAL MOVESET
 	// Called when game loads/reloads to reset all state
 	// ============================================
 	
@@ -3143,6 +3431,16 @@ namespace MountedNPCCombatVR
 			g_playerAggroSwitchData[i].isValid = false;
 		}
 		g_playerAggroSwitchCount = 0;
+		
+		// Clear close range melee assault data
+		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
+		{
+			g_closeRangeMeleeAssaultData[i].isValid = false;
+			g_closeRangeMeleeAssaultData[i].horseFormID = 0;
+			g_closeRangeMeleeAssaultData[i].isActive = false;
+			g_closeRangeMeleeAssaultData[i].lastAttackTime = 0;
+		}
+		g_closeRangeMeleeAssaultCount = 0;
 		
 		// Note: g_mobileInterceptData is defined later in the file
 		// It will be cleared in InitSpecialMovesets or when first accessed

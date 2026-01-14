@@ -30,7 +30,8 @@ namespace MountedNPCCombatVR
 	{
 		None,
 		Melee,
-		Bow
+		Bow,
+		Glaive  // Preferred weapon for mounted vs mounted combat
 	};
 	
 	// ============================================
@@ -146,6 +147,7 @@ namespace MountedNPCCombatVR
 	bool HasMeleeWeaponInInventory(Actor* actor);
 	bool IsBowEquipped(Actor* actor);
 	bool IsMeleeEquipped(Actor* actor);
+	bool IsTwoHandedWeaponEquipped(Actor* actor);
 	
 	// Find best weapon in inventory (used internally)
 	TESObjectWEAP* FindBestBowInInventory(Actor* actor);

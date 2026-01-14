@@ -12,17 +12,20 @@ namespace MountedNPCCombatVR
 	const char* GetPackageTypeName(UInt8 packageType);
 	bool IsDialogueOrCrimePackage(UInt8 packageType);
 	TESPackage* GetActorCurrentPackage(Actor* actor);
+	
+	// Detect and log dialogue/crime package issues (LOGGING ONLY - no handling)
 	bool DetectDialoguePackageIssue(Actor* actor);
-	
-	// Force-clear dialogue/crime packages and restore combat following
-	bool ClearDialoguePackageAndRestoreFollow(Actor* actor);
-	
-	// Stop combat alarm on actor - clears crime/alarm state
-	void StopActorCombatAlarm(Actor* actor);
 	
 	void LogCurrentAIPackage(Actor* actor, UInt32 formID);
 	void LogMountAIPackage(Actor* mount, UInt32 formID);
 	void LogMountedCombatAIState(Actor* rider, Actor* mount, UInt32 riderFormID);
+	
+	// ============================================
+	// Combat Alarm Control (for remounting feature)
+	// ============================================
+	
+	// Stop combat alarm on actor - clears crime/alarm state so NPC can remount
+	void StopActorCombatAlarm(Actor* actor);
 	
 	// ============================================
 	// Mount Obstruction Detection & Logging
@@ -53,11 +56,11 @@ namespace MountedNPCCombatVR
 		UInt32 horseFormID;
 		ObstructionType type;
 		ObstructionSide side;      // Which side is obstructed
-		float stuckDuration;          // How long has it been stuck
+		float stuckDuration;       // How long has it been stuck
 		float lastMovementTime;       // When it last moved significantly
 		NiPoint3 lastPosition;        // Last known good position
 		NiPoint3 intendedDirection;   // Where it's trying to go
-		int stuckCount;            // How many times stuck this session
+		int stuckCount;        // How many times stuck this session
 		bool isValid;
 	};
 	

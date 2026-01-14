@@ -40,13 +40,14 @@ namespace MountedNPCCombatVR
 		float lastRangedSetupTime;  // Rate limit ranged follow setup
 		bool hasBow;
 		bool isCompanion;  // True if this is a player's companion (not counted in hostile limit)
+		bool isMageCaster;       // True if this is a mage - NEVER switches to melee
 		bool isValid;
 		
 		MultiRiderData() :
 			riderFormID(0), horseFormID(0), targetFormID(0),
 			role(MultiCombatRole::None), distanceToTarget(0.0f),
 			lastRoleCheckTime(0.0f), lastRangedSetupTime(0.0f),
-			hasBow(false), isCompanion(false), isValid(false)
+			hasBow(false), isCompanion(false), isMageCaster(false), isValid(false)
 		{}
 		
 		void Reset()
@@ -60,6 +61,7 @@ namespace MountedNPCCombatVR
 			lastRangedSetupTime = 0.0f;
 			hasBow = false;
 			isCompanion = false;
+			isMageCaster = false;
 			isValid = false;
 		}
 	};
@@ -171,4 +173,7 @@ namespace MountedNPCCombatVR
 	
 	// Check if a horse's rider is in ranged role
 	bool IsHorseRiderInRangedRole(UInt32 horseFormID);
+	
+	// Check if rider is a mage (NEVER switches to melee - ranged only)
+	bool IsRiderMage(UInt32 riderFormID);
 }

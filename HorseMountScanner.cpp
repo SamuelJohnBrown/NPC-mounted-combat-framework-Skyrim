@@ -47,8 +47,8 @@ namespace MountedNPCCombatVR
 	const int MAX_DISMOUNTED_NPCS = 10;
 	const int MAX_AVAILABLE_HORSES = 10;
 	const int MAX_SCAN_ATTEMPTS = 25;
-	const float MAX_SCAN_DISTANCE = 3000.0f;
-	const float MOUNT_ACTIVATION_DISTANCE = 300.0f;  // NPC must be within this distance to mount
+	const float MAX_SCAN_DISTANCE = 2000.0f;
+	const float MOUNT_ACTIVATION_DISTANCE = 200.0f;  // NPC must be within this distance to mount
 	const float MOUNT_ATTEMPT_COOLDOWN = 5.0f; // Seconds between mount attempts for same NPC
 	const float POST_RAGDOLL_DELAY = 3.0f;           // Wait this long after ragdoll before allowing mount
 	const float IGNORE_RANGE_DURATION = 15.0f;       // After mount attempt, ignore range checks for this long (NPC may get flung)

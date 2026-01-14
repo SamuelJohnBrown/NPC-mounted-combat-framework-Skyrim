@@ -665,6 +665,37 @@ namespace MountedNPCCombatVR
 		{
 			if (g_riderBowData[i].isValid && g_riderBowData[i].riderFormID == riderFormID)
 			{
+				// ============================================
+				// IF IN DRAWING/HOLDING STATE, PLAY RELEASE ANIMATION
+				// This properly transitions the animation back to idle
+				// and prevents the rider from getting stuck in draw pose
+				// ============================================
+				if (g_riderBowData[i].state == BowAttackState::Drawing || 
+					g_riderBowData[i].state == BowAttackState::Holding)
+				{
+					TESForm* riderForm = LookupFormByID(riderFormID);
+					if (riderForm)
+					{
+						Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
+						if (rider && !rider->IsDead(1))
+						{
+							_MESSAGE("ArrowSystem: Forcing bow release for rider %08X (was in state %d) to fix animation", 
+								riderFormID, (int)g_riderBowData[i].state);
+							
+							// Play the release animation to properly exit the draw state
+							InitBowIdles();
+							if (g_bowAttackRelease)
+							{
+								const char* eventName = g_bowAttackRelease->animationEvent.c_str();
+								if (eventName && strlen(eventName) > 0)
+								{
+									SendBowAnimationEvent(rider, eventName);
+								}
+							}
+						}
+					}
+				}
+				
 				g_riderBowData[i].state = BowAttackState::None;
 				g_riderBowData[i].bowEquipTime = 0;
 				g_riderBowData[i].drawStartTime = 0;
@@ -1239,6 +1270,34 @@ namespace MountedNPCCombatVR
 		{
 			if (g_rapidFireBowData[i].isValid && g_rapidFireBowData[i].riderFormID == riderFormID)
 			{
+				// ============================================
+				// IF IN DRAWING STATE, PLAY RELEASE ANIMATION
+				// This properly transitions the animation back to idle
+				// ============================================
+				if (g_rapidFireBowData[i].state == RapidFireBowState::Drawing ||
+					g_rapidFireBowData[i].state == RapidFireBowState::Holding)
+				{
+					TESForm* riderForm = LookupFormByID(riderFormID);
+					if (riderForm)
+					{
+						Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
+						if (rider && !rider->IsDead(1))
+						{
+							_MESSAGE("ArrowSystem: Forcing bow release for rapid fire rider %08X to fix animation", riderFormID);
+							
+							InitBowIdles();
+							if (g_bowAttackRelease)
+							{
+								const char* eventName = g_bowAttackRelease->animationEvent.c_str();
+								if (eventName && strlen(eventName) > 0)
+								{
+									SendBowAnimationEvent(rider, eventName);
+								}
+							}
+						}
+					}
+				}
+				
 				g_rapidFireBowData[i].state = RapidFireBowState::None;
 				g_rapidFireBowData[i].shotsFired = 0;
 				g_rapidFireBowData[i].stateStartTime = 0;

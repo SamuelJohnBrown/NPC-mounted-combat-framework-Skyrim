@@ -1,7 +1,7 @@
 #include "CombatStyles.h"
 #include "DynamicPackages.h"
 #include "Helper.h"
-#include "SingleMountedCombat.h"
+#include "MountedCombat.h"
 #include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "WeaponDetection.h"
@@ -22,13 +22,11 @@ namespace MountedNPCCombatVR
 	// Configuration
 	// ============================================
 
-	const float MELEE_ATTACK_RANGE = 256.0f;
+	const float MELEE_ATTACK_RANGE = 200.0f;
 	const float MELEE_CHARGE_RANGE = 512.0f;
-	const float RANGED_MIN_RANGE = 384.0f;
-	const float RANGED_MAX_RANGE = 2048.0f;
+	const float RANGED_MIN_RANGE = 333.0f;
+	const float RANGED_MAX_RANGE = 2000.0f;
 	const float FOLLOW_UPDATE_INTERVAL = 0.1f;  // Update every 100ms for smooth rotation
-	const float MAX_COMBAT_DISTANCE = 3500.0f;  // If target gets this far, disengage combat
-	const float MAX_COMPANION_COMBAT_DISTANCE = 6000.0f;  // Extended range for companions engaged in mounted combat
 	const float TARGET_SWITCH_COOLDOWN = 10.0f;  // 10 seconds between target switches
 	
 	// ============================================
@@ -131,6 +129,14 @@ namespace MountedNPCCombatVR
 	static bool g_mountedStaggerIdleInitialized = false;
 	
 	// ============================================
+	// BLOOD IMPACT EFFECT (forward declaration for ResetCombatStylesCache)
+	// Full implementation below with sound effects
+	// ============================================
+	
+	static BGSImpactDataSet* g_bloodImpactDataSet = nullptr;
+	static bool g_bloodImpactInitialized = false;
+	
+	// ============================================
 	// Reset CombatStyles Cache
 	// Called on game load/reload to clear stale pointers
 	// ============================================
@@ -149,6 +155,10 @@ namespace MountedNPCCombatVR
 		// Reset cached mounted stagger animation
 		g_mountedStaggerIdle = nullptr;
 		g_mountedStaggerIdleInitialized = false;
+		
+		// Reset blood impact effect cache
+		g_bloodImpactDataSet = nullptr;
+		g_bloodImpactInitialized = false;
 		
 		// Reset combat styles initialization flag
 		g_combatStylesInitialized = false;
@@ -544,6 +554,49 @@ namespace MountedNPCCombatVR
 			target = *g_thePlayer;
 		}
 		
+		// ============================================
+		// CRITICAL: Validate both actors before proceeding
+		// Prevents CTD when actors are in invalid state
+		// ============================================
+		if (!actor->loadedState || !actor->GetNiNode())
+		{
+			_MESSAGE("CombatStyles: SetNPCFollowTarget - actor %08X invalid state, skipping", actor->formID);
+			return;
+		}
+		
+		if (!target->loadedState || !target->GetNiNode())
+		{
+			_MESSAGE("CombatStyles: SetNPCFollowTarget - target %08X invalid state, skipping", target->formID);
+			return;
+		}
+		
+		// Validate target is actually an Actor (formType check)
+		if (target->formType != kFormType_Character)
+		{
+			_MESSAGE("CombatStyles: SetNPCFollowTarget - target %08X is not an Actor (type: %d), skipping", 
+				target->formID, target->formType);
+			return;
+		}
+		
+		// ============================================
+		// EARLY DISTANCE CHECK - Don't set up follow if too far
+		// This prevents adding NPCs to tracking that will immediately be removed
+		// ============================================
+		float dx = target->pos.x - actor->pos.x;
+		float dy = target->pos.y - actor->pos.y;
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		
+		bool isCompanion = IsCompanion(actor);
+		float maxDistance = isCompanion ? MaxCompanionCombatDistance : MaxCombatDistance;
+		
+		if (distanceToTarget > maxDistance)
+		{
+			const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+			_MESSAGE("CombatStyles: SetNPCFollowTarget - '%s' (%08X) target too far (%.0f > %.0f), skipping",
+				actorName ? actorName : "Unknown", actor->formID, distanceToTarget, maxDistance);
+			return;
+		}
+		
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
 		
@@ -577,13 +630,8 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// INITIAL WEAPON EQUIP - USE CENTRALIZED SYSTEM
-		// Calculate distance to target and request appropriate weapon
+		// Use the distance already calculated above
 		// ============================================
-		float dx = target->pos.x - actor->pos.x;
-		float dy = target->pos.y - actor->pos.y;
-		float distanceToTarget = sqrt(dx * dx + dy * dy);
-		
-		// Use centralized weapon request
 		RequestWeaponForDistance(actor, distanceToTarget, false);
 		
 		// Ensure attack flags are set
@@ -829,6 +877,7 @@ namespace MountedNPCCombatVR
 								g_followingNPCs[i].targetFormID = combatTarget->formID;
 								g_followingNPCs[i].lastTargetSwitchTime = currentTime;
 								
+
 								// ============================================
 								// CLEAR WEAPON SWITCH DATA ON TARGET CHANGE
 								// This allows immediate weapon equip for new target
@@ -874,7 +923,18 @@ namespace MountedNPCCombatVR
 				{
 					target = static_cast<Actor*>(targetForm);
 					
-					if (target->IsDead(1))
+					// ============================================
+					// CRITICAL: Validate target has valid state before using
+					// This prevents CTD when target is in invalid/transitional state
+					// ============================================
+					if (!target->loadedState || !target->GetNiNode())
+					{
+						_MESSAGE("CombatStyles: Target %08X has invalid state - skipping", target->formID);
+						target = nullptr;
+						g_followingNPCs[i].targetFormID = 0;
+						ClearWeaponStateData(actor->formID);
+					}
+					else if (target->IsDead(1))
 					{
 						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 						_MESSAGE("CombatStyles: Target died - NPC '%s' switching to PLAYER",
@@ -934,6 +994,16 @@ namespace MountedNPCCombatVR
 			}
 			
 			// ============================================
+			// FINAL VALIDATION: Ensure target is still valid before distance calc
+			// This is the CRITICAL check that prevents the CTD at line 600
+			// ============================================
+			if (!target || !target->loadedState || !target->GetNiNode())
+			{
+				_MESSAGE("CombatStyles: Target became invalid before distance check - skipping NPC %08X", actor->formID);
+				continue;
+			}
+			
+			// ============================================
 			// CHECK DISTANCE - DISENGAGE IF TOO FAR
 			// Extended range for companions engaged in mounted enemies
 			// ============================================
@@ -945,7 +1015,7 @@ namespace MountedNPCCombatVR
 			bool isCompanion = IsCompanion(actor);
 			
 			// Use extended distance for companions fighting mounted enemies
-			float maxDistance = isCompanion ? MAX_COMPANION_COMBAT_DISTANCE : MAX_COMBAT_DISTANCE;
+			float maxDistance = isCompanion ? MaxCompanionCombatDistance : MaxCombatDistance;
 			
 			if (distanceToTarget > maxDistance)
 			{
@@ -956,9 +1026,55 @@ namespace MountedNPCCombatVR
 				float angleAwayFromTarget = atan2(-dx, -dy);
 				mount->rot.z = angleAwayFromTarget;
 				
-				// DON'T call StopActorCombatAlarm - it can crash CombatBehaviorTreeRootNode
-				// Just clear our follow tracking and let game AI handle combat state
+				// ============================================
+				// CRITICAL: ADD TO DISENGAGE COOLDOWN FIRST
+				// This prevents immediate re-engagement via OnDismountBlocked
+				// ============================================
+				AddNPCToDisengageCooldown(actor->formID);
+				
+				// ============================================
+				// CRITICAL: STOP COMBAT COMPLETELY ON DISENGAGE
+				// Uses StopActorCombatAlarm - same method as HorseMountScanner
+				// This properly clears combat/alarm state and allows return to default AI
+				// ============================================
+				
+				// Stop combat alarm - this properly clears combat state
+				StopActorCombatAlarm(actor);
+				
+				// Sheathe weapon to signal end of combat
+				if (IsWeaponDrawn(actor))
+				{
+					actor->DrawSheatheWeapon(false);
+				}
+				
+				// Clear weapon state data
+				ClearWeaponStateData(actor->formID);
+				
+				// Stop horse sprint
+				StopHorseSprint(mount.get());
+				
+				// Clear horse combat target and flags
+				mount->currentCombatTarget = 0;
+				mount->flags2 &= ~Actor::kFlag_kAttackOnSight;
+				
+				// Force AI re-evaluation on horse
+				Actor_EvaluatePackage(mount.get(), false, false);
+				
+				_MESSAGE("CombatStyles: NPC '%s' combat STOPPED via StopActorCombatAlarm (10s cooldown)", actorName ? actorName : "Unknown");
+				
+				// Clear our follow tracking
 				ClearNPCFollowTarget(actor);
+				
+				// ============================================
+				// CRITICAL: Also remove from MountedCombat tracking
+				// This prevents MountedCombat from detecting alarm packages
+				// and trying to re-apply follow with an unloaded target
+				// ============================================
+				RemoveNPCFromTracking(actor->formID);
+				
+				// Also unregister from MultiMountedCombat
+				UnregisterMultiRider(actor->formID);
+				
 				continue;
 			}
 			
@@ -1174,7 +1290,7 @@ namespace MountedNPCCombatVR
 	// Called during attack animation to check if weapon hits target
 	// Note: MountedAttackHitData struct and g_hitData defined earlier
 	// ============================================
-	
+
 	// Actor Value IDs
 	static const UInt32 AV_Health = 24;
 	
@@ -1245,24 +1361,135 @@ namespace MountedNPCCombatVR
 	// SOUND FORM IDs FOR HIT IMPACTS
 	// These are SOUN (TESSound) records, not SNDR
 	// ============================================
-	
+
 	// Sound FormID from Skyrim.esm (SOUN record)
 	static const UInt32 SOUND_UNBLOCKED_HIT = 0x0001939D;    // Unblocked hit sound
 	static const UInt32 SOUND_WEAPON_BLOCK = 0x0001939B;    // Weapon block sound
 	static const UInt32 SOUND_SHIELD_BLOCK = 0x0001939F;    // Shield block sound
 	
 	// ============================================
+	// BLOOD IMPACT EFFECT SYSTEM
+	// Uses BGSImpactDataSet from Skyrim.esm to spawn blood splatter
+	// Note: g_bloodImpactDataSet and g_bloodImpactInitialized declared above
+	// ============================================
+	
+	// Blood Impact Data Set FormID from Skyrim.esm
+	static const UInt32 BLOOD_IMPACT_DATASET_FORMID = 0x0001F82A;
+	
+	// PlayImpactEffect function - spawns impact VFX on an actor
+	// Note: asNodeName must be a BSFixedString, not a raw char*
+	typedef bool (*_PlayImpactEffect)(VMClassRegistry* registry, UInt32 stackId, TESObjectREFR* obj, 
+		BGSImpactDataSet* impactData, BSFixedString* asNodeName, 
+		float afPickDirX, float afPickDirY, float afPickDirZ, 
+		float afPickLength, bool abApplyNodeRotation, bool abUseNodeLocalRotation);
+	static RelocAddr<_PlayImpactEffect> PlayImpactEffect(0x009D06C0);
+	
+	// Common bone names for blood spawning
+	static const char* BLOOD_BONE_BODY = "NPC Spine2 [Spn2]";
+	static const char* BLOOD_BONE_HEAD = "NPC Head [Head]";
+	static const char* BLOOD_BONE_RHAND = "NPC R Hand [RHnd]";
+	static const char* BLOOD_BONE_LHAND = "NPC L Hand [LHnd]";
+	
+	// Initialize blood impact data set
+	static bool InitBloodImpactEffect()
+	{
+		if (g_bloodImpactInitialized) return (g_bloodImpactDataSet != nullptr);
+		
+		g_bloodImpactInitialized = true;
+		
+		TESForm* form = LookupFormByID(BLOOD_IMPACT_DATASET_FORMID);
+		if (!form)
+		{
+			_MESSAGE("CombatStyles: ERROR - Could not find blood impact dataset (FormID: %08X)", BLOOD_IMPACT_DATASET_FORMID);
+			return false;
+		}
+		
+		g_bloodImpactDataSet = DYNAMIC_CAST(form, TESForm, BGSImpactDataSet);
+		if (!g_bloodImpactDataSet)
+		{
+			_MESSAGE("CombatStyles: ERROR - Form %08X is not a BGSImpactDataSet (type: %d)", 
+				BLOOD_IMPACT_DATASET_FORMID, form->formType);
+			return false;
+		}
+		
+		_MESSAGE("CombatStyles: Blood impact effect initialized (FormID: %08X)", BLOOD_IMPACT_DATASET_FORMID);
+		return true;
+	}
+	
+	// Spawn blood effect on target actor
+	static void SpawnBloodEffect(Actor* target, Actor* attacker)
+	{
+		if (!target || !attacker) return;
+		
+		// Initialize blood impact if needed
+		if (!InitBloodImpactEffect()) return;
+		if (!g_bloodImpactDataSet) return;
+		
+		// Validate target has valid 3D
+		if (!target->GetNiNode())
+		{
+			_MESSAGE("CombatStyles: SpawnBloodEffect - target has no 3D, skipping");
+			return;
+		}
+		
+		// Get VM registry
+		VMClassRegistry* registry = (*g_skyrimVM)->GetClassRegistry();
+		if (!registry) return;
+		
+		// Choose a random bone for variety
+		const char* boneNameStr = BLOOD_BONE_BODY;  // Default to body/torso
+		int roll = rand() % 100;
+		if (roll < 20)
+		{
+			boneNameStr = BLOOD_BONE_HEAD;  // 20% head
+		}
+		else if (roll < 40)
+		{
+			boneNameStr = BLOOD_BONE_RHAND;  // 20% right arm
+		}
+		else if (roll < 60)
+		{
+			boneNameStr = BLOOD_BONE_LHAND;  // 20% left arm
+		}
+		// 40% body (default)
+		
+		// Create BSFixedString for bone name - CRITICAL: must be BSFixedString not raw char*
+		BSFixedString boneName(boneNameStr);
+		
+		// Calculate direction from attacker to target for blood spray direction
+		float dx = target->pos.x - attacker->pos.x;
+		float dy = target->pos.y - attacker->pos.y;
+		float dz = target->pos.z - attacker->pos.z;
+		float len = sqrt(dx * dx + dy * dy + dz * dz);
+		
+		// Normalize direction (blood sprays away from attacker)
+		float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+		if (len > 0.001f)
+		{
+			dirX = dx / len;
+			dirY = dy / len;
+			dirZ = dz / len;
+		}
+		
+		// Play the blood impact effect
+		// Pass pointer to BSFixedString, not raw char*
+		PlayImpactEffect(registry, 0, target, g_bloodImpactDataSet, &boneName,
+			dirX, dirY, dirZ,// Pick direction (blood spray direction)
+			1.0f,     // Pick length
+			true,   // Apply node rotation
+			false);    // Use local rotation
+		
+		_MESSAGE("CombatStyles: Blood effect spawned on target %08X at bone '%s'", target->formID, boneNameStr);
+	}
+	
+	// ============================================
 	// PLAY SOUND AT ACTOR LOCATION
 	// Uses TESSound and PlaySoundEffect (Papyrus native function)
 	// ============================================
-	
+
 	// PlaySoundEffect function signature - same as WeaponThrowVR
 	typedef void(*_PlaySoundEffect)(VMClassRegistry* VMinternal, UInt32 stackId, TESSound* sound, TESObjectREFR* source);
 	static RelocAddr<_PlaySoundEffect> PlaySoundEffect(0x009EF150);
-	
-	// DoCombatSpellApply function - same as WeaponThrowVR (applies spell from one actor to another)
-	typedef bool(*_DoCombatSpellApply)(VMClassRegistry* registry, UInt32 stackId, Actor* akActor, SpellItem* spell, TESObjectREFR* akTarget);
-	static RelocAddr<_DoCombatSpellApply> DoCombatSpellApply(0x00992240);
 	
 	// PushActorAway function - same as WeaponThrowVR (applies knockback/stagger)
 	typedef void(*_PushActorAway)(VMClassRegistry* registry, UInt32 stackId, TESObjectREFR* akSource, Actor* akActor, float afKnockbackForce);
@@ -1297,7 +1524,7 @@ namespace MountedNPCCombatVR
 	// INITIALIZE MOUNTED STAGGER ANIMATION
 	// Looks up the dedicated mounted stagger idle from Update.esm
 	// ============================================
-	
+
 	static bool InitMountedStaggerAnimation()
 	{
 		if (g_mountedStaggerIdle != nullptr) return true;
@@ -1326,7 +1553,7 @@ namespace MountedNPCCombatVR
 	// Called when target successfully blocks the rider's attack
 	// Uses the dedicated mounted stagger animation from Update.esm
 	// ============================================
-	
+
 	static void ApplyBlockStaggerToRider(Actor* rider, Actor* blocker)
 	{
 		if (!rider) return;
@@ -1459,9 +1686,6 @@ namespace MountedNPCCombatVR
 	{
 		if (!rider || !target) return;
 		
-		// Check if target is the player or an NPC
-		bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
-		
 		// Check if rider is a companion
 		bool riderIsCompanion = IsCompanion(rider);
 		
@@ -1479,20 +1703,18 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// DAMAGE MULTIPLIER VS NON-PLAYER TARGETS
+		// DAMAGE MULTIPLIER FOR MOUNTED COMBAT
+		// Applies to ALL targets including the player!
 		// Companions: CompanionRiderDamageMultiplier (default 2x)
-		// Everyone else: HostileRiderDamageMultiplier (default 3x)
+		// Hostile riders: HostileRiderDamageMultiplier (default 3x)
 		// ============================================
-		if (!targetIsPlayer)
+		if (riderIsCompanion)
 		{
-			if (riderIsCompanion)
-			{
-				baseDamage *= CompanionRiderDamageMultiplier;  // Companions use config multiplier
-			}
-			else
-			{
-				baseDamage *= HostileRiderDamageMultiplier;  // Hostile riders use config multiplier
-			}
+			baseDamage *= CompanionRiderDamageMultiplier;  // Companions use config multiplier
+		}
+		else
+		{
+			baseDamage *= HostileRiderDamageMultiplier;  // Hostile riders use config multiplier
 		}
 
 		// Blocking effects:
@@ -1542,29 +1764,36 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// STAGGER ON UNBLOCKED HIT VS NON-PLAYER, NON-MOUNTED TARGETS
 		// 20% chance (configurable) to stagger and push back
-		// Only applies to non-player targets when hit is not blocked
+		// Only applies to NON-PLAYER targets when hit is not blocked
 		// Skip if target is mounted (would look weird and could cause issues)
+		// Skip if target is the player (player shouldn't be staggered by this system)
 		// ============================================
 		bool staggerApplied = false;
-		if (MountedAttackStaggerEnabled && !targetIsPlayer && !blockSuccessful && !guardBroken)
+		if (MountedAttackStaggerEnabled && !blockSuccessful && !guardBroken)
 		{
-			// Check if target is mounted - skip stagger for mounted targets
-			NiPointer<Actor> targetMount;
-			bool targetIsMounted = CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount;
+			// Check if target is the player - NEVER stagger the player
+			bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
 			
-			if (!targetIsMounted)
+			if (!targetIsPlayer)
 			{
-				// Roll for stagger chance
-				int roll = rand() % 100;
-				if (roll < MountedAttackStaggerChance)
+				// Check if target is mounted - skip stagger for mounted targets
+				NiPointer<Actor> targetMount;
+				bool targetIsMounted = CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount;
+				
+				if (!targetIsMounted)
 				{
-					// Apply stagger using PushActorAway
-					// Use rider as the source so target gets pushed away from rider
-					PushActorAway((*g_skyrimVM)->GetClassRegistry(), 0, rider, target, MountedAttackStaggerForce);
-					staggerApplied = true;
-					
-					_MESSAGE("CombatStyles: Target %08X STAGGERED (rolled %d < %d%%, force: %.2f)", 
-						target->formID, roll, MountedAttackStaggerChance, MountedAttackStaggerForce);
+					// Roll for stagger chance
+					int roll = rand() % 100;
+					if (roll < MountedAttackStaggerChance)
+					{
+						// Apply stagger using PushActorAway
+						// Use rider as the source so target gets pushed away from rider
+						PushActorAway((*g_skyrimVM)->GetClassRegistry(), 0, rider, target, MountedAttackStaggerForce);
+						staggerApplied = true;
+						
+						_MESSAGE("CombatStyles: Target %08X STAGGERED (rolled %d < %d%%, force: %.2f)", 
+							target->formID, roll, MountedAttackStaggerChance, MountedAttackStaggerForce);
+					}
 				}
 			}
 		}
@@ -1598,12 +1827,16 @@ namespace MountedNPCCombatVR
 				PlaySoundAtActor(SOUND_WEAPON_BLOCK, target);  // Weapon block sound
 			}
 			
+			// Guard broken = full damage hit, spawn blood effect
+			SpawnBloodEffect(target, rider);
+			
 			// NO ApplyBlockStaggerToRider - rider doesn't get staggered when guard is broken
 		}
 		else
 		{
-			// Unblocked hit - play hit sound
+			// Unblocked hit - play hit sound and spawn blood effect
 			PlaySoundAtActor(SOUND_UNBLOCKED_HIT, target);
+			SpawnBloodEffect(target, rider);
 		}
 		
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
@@ -1611,19 +1844,16 @@ namespace MountedNPCCombatVR
 		
 		// Determine multiplier string for logging
 		char multiplierStr[32] = "";
-		if (!targetIsPlayer)
+		if (riderIsCompanion)
 		{
-			if (riderIsCompanion)
-			{
-				sprintf_s(multiplierStr, " [%.1fx ALLY]", CompanionRiderDamageMultiplier);
-			}
-			else
-			{
-				sprintf_s(multiplierStr, " [%.1fx NPC]", HostileRiderDamageMultiplier);
-			}
+			sprintf_s(multiplierStr, " [%.1fx ALLY]", CompanionRiderDamageMultiplier);
+		}
+		else
+		{
+			sprintf_s(multiplierStr, " [%.1fx MOUNTED]", HostileRiderDamageMultiplier);
 		}
 
-		// Log with blocking info and NPC damage bonus
+		// Log with blocking info and mounted damage bonus
 		if (blockType > 0)
 		{
 			if (blockSuccessful)

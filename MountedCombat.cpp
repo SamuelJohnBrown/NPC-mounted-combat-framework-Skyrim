@@ -10,6 +10,13 @@
 #include "DynamicPackages.h"
 #include "HorseMountScanner.h"
 #include "CompanionCombat.h"
+#include "SpecialMovesets.h"
+#include "skse64/GameRTTI.h"
+#include "skse64/GameData.h"
+#include "skse64/GameObjects.h"
+#include "skse64_common/Utilities.h"
+#include <cmath>
+#include <ctime>
 
 namespace MountedNPCCombatVR
 {
@@ -20,8 +27,28 @@ namespace MountedNPCCombatVR
 	float g_updateInterval = 0.5f;  // Update every 500ms
 	const int MAX_TRACKED_NPCS_ARRAY = 10;  // Maximum array size (hardcoded for memory safety)
 	// Actual runtime limit is MaxTrackedMountedNPCs from config (1-10)
-	const float FLEE_SAFE_DISTANCE = 4500.0f;  // Distance at which fleeing NPCs feel safe (just over 1 cell)
-	const float ALLY_ALERT_RANGE = 2000.0f;    // Range to alert allies when attacked
+	const float FLEE_SAFE_DISTANCE = 2001.0f;  // Distance at which fleeing NPCs feel safe (just over 1 cell)
+	const float ALLY_ALERT_RANGE = 700.0f;    // Range to alert allies when attacked
+	
+	// ============================================
+	// Horse Animation Configuration (from SingleMountedCombat)
+	// ============================================
+	
+	// Horse sprint animation FormIDs from Skyrim.esm
+	const UInt32 HORSE_SPRINT_START_FORMID = 0x0004408B;
+	const UInt32 HORSE_SPRINT_STOP_FORMID = 0x0004408C;
+	const UInt32 HORSE_REAR_UP_FORMID = 0x000DCD7C;  // Horse rear up animation from Skyrim.esm
+	
+	// Horse jump animation from MountedNPCCombat.esp
+	const UInt32 HORSE_JUMP_BASE_FORMID = 0x0008E6;
+	const char* JUMP_ESP_NAME = "MountedNPCCombat.esp";
+	
+	// Horse jump cooldown
+	const float HORSE_JUMP_COOLDOWN = 4.0f;  // Only attempt jump every 4 seconds
+	
+	// Horse sprint cooldown
+	const float HORSE_SPRINT_COOLDOWN = 3.0f;  // Only attempt sprint every 3 seconds
+	const float HORSE_SPRINT_DURATION = 5.0f;  // Sprint lasts 5 seconds before needing refresh
 	
 	// ============================================
 	// Player Mounted Combat State
@@ -52,6 +79,147 @@ namespace MountedNPCCombatVR
 	
 	static MountedNPCData g_trackedNPCs[MAX_TRACKED_NPCS_ARRAY];
 	static bool g_systemInitialized = false;
+	
+	// ============================================
+	// DISENGAGE COOLDOWN TRACKING
+	// Prevents NPCs from immediately re-engaging after distance disengage
+	// ============================================
+	
+	const float DISENGAGE_COOLDOWN = 3.5f;  // 3.5 seconds before NPC can re-engage
+	const int MAX_DISENGAGED_NPCS = 10;
+	
+	struct DisengagedNPCEntry
+	{
+		UInt32 npcFormID;
+		float disengageTime;
+		bool isValid;
+		
+		void Reset()
+		{
+			npcFormID = 0;
+			disengageTime = 0;
+			isValid = false;
+		}
+	};
+	
+	static DisengagedNPCEntry g_disengagedNPCs[MAX_DISENGAGED_NPCS];
+	
+	// Check if an NPC is on disengage cooldown
+	bool IsNPCOnDisengageCooldown(UInt32 npcFormID)
+	{
+		float currentTime = GetCurrentGameTime();
+		
+		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
+		{
+			if (g_disengagedNPCs[i].isValid && g_disengagedNPCs[i].npcFormID == npcFormID)
+			{
+				float elapsed = currentTime - g_disengagedNPCs[i].disengageTime;
+				if (elapsed < DISENGAGE_COOLDOWN)
+				{
+					return true;  // Still on cooldown
+				}
+				else
+				{
+					// Cooldown expired - remove from list
+					g_disengagedNPCs[i].Reset();
+					return false;
+				}
+			}
+		}
+		return false;  // Not in list
+	}
+	
+	// Add an NPC to the disengage cooldown list
+	void AddNPCToDisengageCooldown(UInt32 npcFormID)
+	{
+		// Check if already in list
+		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
+		{
+			if (g_disengagedNPCs[i].isValid && g_disengagedNPCs[i].npcFormID == npcFormID)
+			{
+				// Update time
+				g_disengagedNPCs[i].disengageTime = GetCurrentGameTime();
+				return;
+			}
+		}
+		
+		// Find empty slot
+		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
+		{
+			if (!g_disengagedNPCs[i].isValid)
+			{
+				g_disengagedNPCs[i].npcFormID = npcFormID;
+				g_disengagedNPCs[i].disengageTime = GetCurrentGameTime();
+				g_disengagedNPCs[i].isValid = true;
+				_MESSAGE("MountedCombat: Added NPC %08X to disengage cooldown (%.0f seconds)", npcFormID, DISENGAGE_COOLDOWN);
+				return;
+			}
+		}
+		
+		// List full - overwrite oldest entry
+		float oldestTime = GetCurrentGameTime();
+		int oldestIdx = 0;
+		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
+		{
+			if (g_disengagedNPCs[i].disengageTime < oldestTime)
+			{
+				oldestTime = g_disengagedNPCs[i].disengageTime;
+				oldestIdx = i;
+			}
+		}
+		g_disengagedNPCs[oldestIdx].npcFormID = npcFormID;
+		g_disengagedNPCs[oldestIdx].disengageTime = GetCurrentGameTime();
+		g_disengagedNPCs[oldestIdx].isValid = true;
+	}
+	
+	// Clear all disengage cooldowns
+	void ClearAllDisengageCooldowns()
+	{
+		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
+		{
+			g_disengagedNPCs[i].Reset();
+		}
+	}
+
+	// ============================================
+	// Horse Animation State (from SingleMountedCombat)
+	// ============================================
+	
+	static bool g_singleCombatInitialized = false;
+	static float g_combatStartTime = 0.0f;
+	
+	// Cached sprint idles
+	static TESIdleForm* g_horseSprintStart = nullptr;
+	static TESIdleForm* g_horseSprintStop = nullptr;
+	static TESIdleForm* g_horseRearUp = nullptr;
+	static bool g_sprintIdlesInitialized = false;
+	
+	// Cached horse jump idle
+	static TESIdleForm* g_horseJump = nullptr;
+	static bool g_jumpIdleInitialized = false;
+	
+	// Horse sprint state tracking
+	struct HorseSprintData
+	{
+		UInt32 horseFormID;
+		float lastSprintStartTime;  // When sprint was last started
+		bool isSprinting;           // Currently sprinting
+		bool isValid;
+	};
+	
+	static HorseSprintData g_horseSprintData[10];
+	static int g_horseSprintCount = 0;
+	
+	// Horse jump cooldown tracking
+	struct HorseJumpData
+	{
+		UInt32 horseFormID;
+		float lastJumpTime;
+		bool isValid;
+	};
+	
+	static HorseJumpData g_horseJumpData[5];
+	static int g_horseJumpCount = 0;
 
 	// ============================================
 	// Core Functions
@@ -73,6 +241,9 @@ namespace MountedNPCCombatVR
 		
 		// Initialize companion combat system
 		InitCompanionCombat();
+		
+		// Initialize tactical flee system
+		InitTacticalFlee();
 		
 		g_systemInitialized = true;
 		_MESSAGE("MountedCombat: System initialized (max %d NPCs tracked, config limit: %d)", 
@@ -153,11 +324,17 @@ namespace MountedNPCCombatVR
 		// Clear any remaining protection tracking
 		ClearAllMountedProtection();
 		
+		// Clear all disengage cooldowns
+		ClearAllDisengageCooldowns();
+		
 		// Reset weapon state system
 		ResetWeaponStateSystem();
 		
 		// Reset companion combat tracking
 		ResetCompanionCombat();
+		
+		// Reset tactical flee system
+		ResetTacticalFlee();
 		
 		// Reset player mounted combat state
 		g_playerInMountedCombat = false;
@@ -234,6 +411,15 @@ namespace MountedNPCCombatVR
 			return;
 		}
 		
+		// ============================================
+		// CHECK DISENGAGE COOLDOWN
+		// If this NPC recently disengaged due to distance, don't re-engage
+		// ============================================
+		if (IsNPCOnDisengageCooldown(actor->formID))
+		{
+			return;  // Skip - NPC is on cooldown from recent disengage
+		}
+		
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		
 		// Get or create tracking data for this NPC
@@ -301,6 +487,37 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
+		// ============================================
+		// PRE-ASSIGN MAGES TO RANGED ROLE
+		// Mages ONLY use ranged combat - NEVER switch to melee
+		// They use Captain moveset but retreat instead of melee when close
+		// ============================================
+		if (data->combatClass == MountedCombatClass::MageCaster)
+		{
+			if (!HasBowInInventory(actor))
+			{
+				GiveDefaultBow(actor);
+				_MESSAGE("MountedCombat: Gave Hunting Bow to Mage '%s'", actorName ? actorName : "Unknown");
+			}
+			
+			// Use centralized weapon system to switch to bow
+			RequestWeaponSwitch(actor, WeaponRequest::Bow);
+			
+			_MESSAGE("MountedCombat: Mage '%s' pre-assigned to RANGED (no melee fallback)", actorName ? actorName : "Unknown");
+			
+			Actor* target = nullptr;
+			if (g_thePlayer && (*g_thePlayer))
+			{
+				target = *g_thePlayer;
+			}
+			
+			if (target)
+			{
+				RegisterMultiRider(actor, mount, target);
+				Actor_ClearKeepOffsetFromActor(mount);
+			}
+		}
+
 		// Track player's mount status when combat with mounted NPC starts
 		OnPlayerTriggeredMountedCombat(actor);
 		
@@ -407,6 +624,9 @@ namespace MountedNPCCombatVR
 		// Update mounted companion combat (player teammates on horseback)
 		UpdateMountedCompanionCombat();
 		
+		// Update tactical flee system (low health riders may temporarily retreat)
+		UpdateTacticalFlee();
+		
 		float currentTime = GetCurrentGameTime();
 		
 		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
@@ -465,40 +685,22 @@ namespace MountedNPCCombatVR
 			}
 			
 			// ============================================
+			// SKIP IF RIDER IS CURRENTLY FLEEING
+			// Tactical flee system handles their behavior
+			// ============================================
+			if (IsRiderFleeing(data->actorFormID))
+			{
+				data->lastUpdateTime = currentTime;
+				continue;
+			}
+			
+			// ============================================
 			// CHECK FOR DIALOGUE/CRIME PACKAGE OVERRIDE
-			// This detects when a guard enters crime dialogue
-			// and clears it to restore combat behavior
+			// This detects and logs when a guard enters crime dialogue
+			// We no longer try to clear it - just log for debugging
 			// ============================================
 			if (DetectDialoguePackageIssue(actor))
 			{
-				const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-				_MESSAGE("MountedCombat: NPC '%s' (%08X) has dialogue package - CLEARING IT!", 
-					actorName ? actorName : "Unknown", data->actorFormID);
-				
-				// Clear the dialogue package and restore follow behavior
-				if (ClearDialoguePackageAndRestoreFollow(actor))
-				{
-					_MESSAGE("MountedCombat: Dialogue package cleared - re-applying follow package");
-					
-					// Re-apply the follow package using the stored target
-					if (data->targetFormID != 0 && data->targetFormID != 0x14)  // Has target and not player
-					{
-						TESForm* targetForm = LookupFormByID(data->targetFormID);
-						if (targetForm && targetForm->formType == kFormType_Character)
-						{
-							Actor* storedTarget = static_cast<Actor*>(targetForm);
-							if (!storedTarget->IsDead(1))
-							{
-								SetNPCFollowTarget(actor, storedTarget);
-							}
-						}
-					}
-					else
-					{
-						_MESSAGE("MountedCombat: No valid target stored - skipping follow package re-apply");
-					}
-				}
-				
 				// Log the full AI state for debugging
 				LogMountedCombatAIState(actor, mountPtr.get(), data->actorFormID);
 			}
@@ -522,7 +724,18 @@ namespace MountedNPCCombatVR
 			Actor* target = GetCombatTarget(actor);
 			if (target)
 			{
-			data->targetFormID = target->formID;
+				data->targetFormID = target->formID;
+				
+				// ============================================
+				// CHECK FOR TACTICAL FLEE
+				// Only check if we have a valid target to flee from
+				// ============================================
+				if (CheckAndTriggerTacticalFlee(actor, mountPtr.get(), target))
+				{
+					// Flee was triggered - skip normal combat behavior this frame
+					data->lastUpdateTime = currentTime;
+					continue;
+				}
 			}
 			
 			// Update weapon info periodically
@@ -1231,6 +1444,25 @@ namespace MountedNPCCombatVR
 				
 				ClearAllMountedProtection();
 				
+				// ============================================
+				// CRITICAL: Clear all multi-rider tracking on player death
+				// This resets ranged roles, horse state, weapon states, etc.
+				// ============================================
+				ClearAllMultiRiders();
+				
+				// ============================================
+				// CRITICAL: Reset all special movesets on player death
+				// This clears charge, rapid fire, stand ground, 90-deg turns, etc.
+				// Prevents stale state from carrying over to next combat
+				// ============================================
+				ResetAllSpecialMovesets();
+				
+				// ============================================
+				// CRITICAL: Reset companion combat tracking on player death
+				// This clears all mounted companion tracking and packages
+				// ============================================
+				ResetCompanionCombat();
+				
 				// Reset combat state but NOT the dead tracking!
 				g_playerInMountedCombat = false;
 				g_playerTriggeredMountedCombat = false;
@@ -1373,16 +1605,12 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// HOSTILE TARGET DETECTION & ENGAGEMENT
 	// ============================================
-	// Scans for hostile NPCs from the FactionData list
-	// within range and initiates combat if found.
-	// Called periodically to check for nearby threats.
-	// ============================================
-	
+
 	// ============================================
 	// HOSTILE DETECTION CONFIGURATION
 	// Now loaded from config - see HostileDetectionRange and HostileScanInterval
 	// ============================================
-	
+
 	static float g_lastHostileScanTime = 0;
 
 	// ============================================
@@ -1753,5 +1981,271 @@ namespace MountedNPCCombatVR
 			// If rider has no hostile target but is still in combat (e.g., vs companion),
 			// let the game handle it naturally - don't force stop combat
 		}
+	}
+	
+	// ============================================
+	// HORSE ANIMATION FUNCTIONS (from SingleMountedCombat)
+	// ============================================
+
+	// Use shared GetGameTime() from Helper.h instead of local function
+	static float GetGameTimeSeconds()
+	{
+		return GetGameTime();
+	}
+	
+	// ============================================
+	// HORSE SPRINT TRACKING
+	// ============================================
+
+	static HorseSprintData* GetOrCreateSprintData(UInt32 horseFormID)
+	{
+		// Find existing
+		for (int i = 0; i < g_horseSprintCount; i++)
+		{
+			if (g_horseSprintData[i].isValid && g_horseSprintData[i].horseFormID == horseFormID)
+			{
+				return &g_horseSprintData[i];
+			}
+		}
+		
+		// Create new
+		if (g_horseSprintCount < 10)
+		{
+			HorseSprintData* data = &g_horseSprintData[g_horseSprintCount];
+			data->horseFormID = horseFormID;
+			data->lastSprintStartTime = -HORSE_SPRINT_COOLDOWN;  // Allow immediate first sprint
+			data->isSprinting = false;
+			data->isValid = true;
+			g_horseSprintCount++;
+			return data;
+		}
+		
+		return nullptr;
+	}
+	
+	bool IsHorseSprinting(Actor* horse)
+	{
+		if (!horse) return false;
+		
+		HorseSprintData* data = GetOrCreateSprintData(horse->formID);
+		if (!data) return false;
+		
+		// Check if sprint has expired (after duration, consider it no longer sprinting)
+		float currentTime = GetGameTimeSeconds();
+		if (data->isSprinting && (currentTime - data->lastSprintStartTime) > HORSE_SPRINT_DURATION)
+		{
+			data->isSprinting = false;
+		}
+		
+		return data->isSprinting;
+	}
+	
+	// ============================================
+	// SPRINT ANIMATION FUNCTIONS
+	// ============================================
+
+	static void InitSprintIdles()
+	{
+		if (g_sprintIdlesInitialized) return;
+		
+		// Silently load horse animations - only log errors
+		TESForm* sprintStartForm = LookupFormByID(HORSE_SPRINT_START_FORMID);
+		if (sprintStartForm)
+		{
+			g_horseSprintStart = DYNAMIC_CAST(sprintStartForm, TESForm, TESIdleForm);
+		}
+		else
+		{
+			_MESSAGE("MountedCombat: ERROR - Could not find HORSE_SPRINT_START");
+		}
+		
+		TESForm* sprintStopForm = LookupFormByID(HORSE_SPRINT_STOP_FORMID);
+		if (sprintStopForm)
+		{
+			g_horseSprintStop = DYNAMIC_CAST(sprintStopForm, TESForm, TESIdleForm);
+		}
+		else
+		{
+			_MESSAGE("MountedCombat: ERROR - Could not find HORSE_SPRINT_STOP");
+		}
+		
+		TESForm* rearUpForm = LookupFormByID(HORSE_REAR_UP_FORMID);
+		if (rearUpForm)
+		{
+			g_horseRearUp = DYNAMIC_CAST(rearUpForm, TESForm, TESIdleForm);
+		}
+		else
+		{
+			_MESSAGE("MountedCombat: ERROR - Could not find HORSE_REAR_UP");
+		}
+		
+		g_sprintIdlesInitialized = true;
+	}
+
+	bool SendHorseAnimationEvent(Actor* horse, const char* eventName)
+	{
+		if (!horse) return false;
+		
+		BSFixedString event(eventName);
+		
+		typedef bool (*_IAnimationGraphManagerHolder_NotifyAnimationGraph)(IAnimationGraphManagerHolder* _this, const BSFixedString& eventName);
+		return get_vfunc<_IAnimationGraphManagerHolder_NotifyAnimationGraph>(&horse->animGraphHolder, 0x1)(&horse->animGraphHolder, event);
+	}
+	
+	void StartHorseSprint(Actor* horse)
+	{
+		if (!horse)
+		{
+			return;
+		}
+		
+		HorseSprintData* sprintData = GetOrCreateSprintData(horse->formID);
+		if (!sprintData) return;
+		
+		float currentTime = GetGameTimeSeconds();
+		
+		// Check if already sprinting
+		if (sprintData->isSprinting)
+		{
+			// Check if sprint is still valid (within duration)
+			if ((currentTime - sprintData->lastSprintStartTime) < HORSE_SPRINT_DURATION)
+			{
+				// Still sprinting - don't spam the animation
+				return;
+			}
+			// Sprint expired - allow refresh
+		}
+		
+		// Check cooldown - prevent rapid sprint spam
+		float timeSinceLastSprint = currentTime - sprintData->lastSprintStartTime;
+		if (timeSinceLastSprint < HORSE_SPRINT_COOLDOWN)
+		{
+			// On cooldown - don't spam
+			return;
+		}
+		
+		InitSprintIdles();
+		
+		if (g_horseSprintStart)
+		{
+			const char* eventName = g_horseSprintStart->animationEvent.c_str();
+			if (eventName && strlen(eventName) > 0)
+			{
+				if (SendHorseAnimationEvent(horse, eventName))
+				{
+					sprintData->isSprinting = true;
+					sprintData->lastSprintStartTime = currentTime;
+					_MESSAGE("MountedCombat: Horse %08X sprint STARTED", horse->formID);
+				}
+			}
+		}
+	}
+	
+	void StopHorseSprint(Actor* horse)
+	{
+		if (!horse) return;
+		
+		HorseSprintData* sprintData = GetOrCreateSprintData(horse->formID);
+		if (sprintData)
+		{
+			sprintData->isSprinting = false;
+		}
+		
+		InitSprintIdles();
+		
+		if (g_horseSprintStop)
+		{
+			const char* eventName = g_horseSprintStop->animationEvent.c_str();
+			if (eventName && strlen(eventName) > 0)
+			{
+				SendHorseAnimationEvent(horse, eventName);
+			}
+		}
+	}
+	
+	// ============================================
+	// HORSE REAR UP ANIMATION
+	// ============================================
+	
+	bool PlayHorseRearUpAnimation(Actor* horse)
+	{
+		if (!horse) return false;
+		
+		InitSprintIdles();
+		
+		if (g_horseRearUp)
+		{
+			const char* eventName = g_horseRearUp->animationEvent.c_str();
+			if (eventName && strlen(eventName) > 0)
+			{
+				if (SendHorseAnimationEvent(horse, eventName))
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	// ============================================
+	// RESET CACHED FORMS
+	// ============================================
+
+	void ResetSingleMountedCombatCache()
+	{
+		_MESSAGE("MountedCombat: Resetting cached horse animation forms...");
+		
+		g_horseSprintStart = nullptr;
+		g_horseSprintStop = nullptr;
+		g_horseRearUp = nullptr;
+		g_sprintIdlesInitialized = false;
+		
+		g_horseJump = nullptr;
+		g_jumpIdleInitialized = false;
+		
+		ResetArrowSystemCache();
+		
+		// Reset sprint tracking
+		g_horseSprintCount = 0;
+		for (int i = 0; i < 10; i++)
+		{
+			g_horseSprintData[i].isValid = false;
+			g_horseSprintData[i].horseFormID = 0;
+			g_horseSprintData[i].isSprinting = false;
+		}
+		
+		g_horseJumpCount = 0;
+		for (int i = 0; i < 5; i++)
+		{
+			g_horseJumpData[i].isValid = false;
+			g_horseJumpData[i].horseFormID = 0;
+		}
+		
+		g_singleCombatInitialized = false;
+	}
+	
+	// ============================================
+	// COMBAT TIME TRACKING
+	// ============================================
+
+	void InitSingleMountedCombat()
+	{
+		if (g_singleCombatInitialized) return;
+		
+		g_combatStartTime = GetGameTimeSeconds();
+		InitSprintIdles();
+		InitArrowSystem();
+		g_singleCombatInitialized = true;
+	}
+	
+	void NotifyCombatStarted()
+	{
+		g_combatStartTime = GetGameTimeSeconds();
+	}
+	
+	float GetCombatElapsedTime()
+	{
+		return GetGameTimeSeconds() - g_combatStartTime;
 	}
 }

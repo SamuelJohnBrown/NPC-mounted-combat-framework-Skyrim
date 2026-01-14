@@ -9,15 +9,7 @@ namespace MountedNPCCombatVR
 	// ADDRESS DEFINITIONS
 	// ============================================
 	
-	// Send assault alarm - triggers crime/aggression response (NPC becomes hostile to player)
-	// Address: 0x986530
-	typedef void (*_Actor_SendAssaultAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
-	RelocAddr<_Actor_SendAssaultAlarm> Actor_SendAssaultAlarm_AILog(0x986530);
-	
-	// Stop combat alarm - clears the crime/alarm state (NPC forgives player)
-	// Address: 0x987A70
-	typedef void (*_Actor_StopCombatAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
-	RelocAddr<_Actor_StopCombatAlarm> Actor_StopCombatAlarm(0x987A70);
+	// No longer using crime/alarm handling addresses - logging only
 
 	const char* GetPackageTypeName(UInt8 packageType)
 	{
@@ -154,7 +146,7 @@ namespace MountedNPCCombatVR
 			formID, npcMounted ? "YES" : "NO", inCombat ? "IN COMBAT" : "NOT IN COMBAT");
 	}
 	
-	// New function to detect and log dialogue/crime package issues
+	// Detect and log dialogue/crime package issues (LOGGING ONLY - no handling)
 	bool DetectDialoguePackageIssue(Actor* actor)
 	{
 		if (!actor) return false;
@@ -176,45 +168,6 @@ namespace MountedNPCCombatVR
 		}
 		
 		return false;
-	}
-	
-	// Force-clear dialogue/crime packages and restore combat following
-	bool ClearDialoguePackageAndRestoreFollow(Actor* actor)
-	{
-		if (!actor) return false;
-		
-		TESPackage* currentPackage = GetActorCurrentPackage(actor);
-		if (!currentPackage) return false;
-		
-		if (!IsDialogueOrCrimePackage(currentPackage->type))
-		{
-			return false;  // No dialogue package to clear
-		}
-		
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		const char* packageTypeName = GetPackageTypeName(currentPackage->type);
-		
-		_MESSAGE("MountedCombat: >>> CLEARING DIALOGUE/ALARM PACKAGE <<<");
-		_MESSAGE("MountedCombat: NPC: '%s' (FormID: %08X)", actorName ? actorName : "Unknown", actor->formID);
-		_MESSAGE("MountedCombat: Clearing Package: %s (FormID: %08X)", packageTypeName, currentPackage->formID);
-		
-		// Method 1: Stop the combat alarm - this clears the crime/alarm state
-		_MESSAGE("MountedCombat: Calling Actor_StopCombatAlarm...");
-		Actor_StopCombatAlarm(0, 0, actor);
-		
-		// Method 2: Force AI reset to interrupt the dialogue package
-		CALL_MEMBER_FN(actor, ResetAI)(0, 0);
-		
-		// Method 3: Pause any current dialogue
-		get_vfunc<void(*)(Actor*)>(actor, 0x4F)(actor);
-		
-		// Method 4: Clear the dialogue/crime flags
-		// kFlag_kAttackOnSight helps override the crime response
-		actor->flags2 |= Actor::kFlag_kAttackOnSight;
-		
-		_MESSAGE("MountedCombat: Alarm stopped and AI reset - combat should take over");
-		
-		return true;
 	}
 	
 	void LogMountAIPackage(Actor* mount, UInt32 formID)
@@ -279,7 +232,7 @@ namespace MountedNPCCombatVR
 		LogCurrentAIPackage(rider, riderFormID);
 		LogMountAIPackage(mount, mount->formID);
 		
-		// Check for dialogue/crime package issue
+		// Check for dialogue/crime package issue (logging only)
 		if (DetectDialoguePackageIssue(rider))
 		{
 			_MESSAGE("MountedCombat: >>> ISSUE: Guard entered crime dialogue while mounted! <<<");
@@ -317,64 +270,64 @@ namespace MountedNPCCombatVR
 		
 		_MESSAGE("MountedCombat: ======================================");
 	}
-
+	
 	// ============================================
 	// ALARM PACKAGE HANDLING
+	// Used by HorseMountScanner to stop combat so NPCs can remount
+	// Also used by CombatStyles/MultiMountedCombat to disengage from distant targets
 	// ============================================
 	
-	// Stop combat alarm on an NPC - makes them stop being hostile to player
-	// Based on activeragdoll implementation: the function is called with PLAYER
-	// as the third parameter to make the NPC forgive the player
+	// Stop combat alarm - clears the crime/alarm state (NPC forgives player)
+	// Address: 0x987A70
+	typedef void (*_Actor_StopCombatAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
+	RelocAddr<_Actor_StopCombatAlarm> Actor_StopCombatAlarm(0x987A70);
+	
 	void StopActorCombatAlarm(Actor* actor)
 	{
 		if (!actor) return;
 		
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		_MESSAGE("AILogging: Stopping combat alarm for '%s' (%08X)",
+		_MESSAGE("StopActorCombatAlarm: Stopping combat for '%s' (%08X)", 
 			actorName ? actorName : "Unknown", actor->formID);
 		
-		// Get player reference - the alarm is cleared relative to player
-		if (!g_thePlayer || !(*g_thePlayer))
-		{
-			_MESSAGE("AILogging: WARNING - No player reference, using actor directly");
-			Actor_StopCombatAlarm(0, 0, actor);
-			return;
-		}
+		// ============================================
+		// STEP 1: Call StopCombatAlarm to clear alarm/crime state
+		// This makes the NPC "forgive" the player
+		// ============================================
+		Actor_StopCombatAlarm(0, 0, actor);
 		
-		Actor* player = *g_thePlayer;
+		// ============================================
+		// STEP 2: Clear combat target
+		// This is CRITICAL - without this, the NPC stays "in combat"
+		// ============================================
+		actor->currentCombatTarget = 0;
 		
-		// Method 1: Call StopCombatAlarm with PLAYER to make NPC forgive player
-		// This is the correct usage based on activeragdoll reference
-		Actor_StopCombatAlarm(0, 0, player);
-		_MESSAGE("AILogging: Called Actor_StopCombatAlarm with player");
-		
-		// Method 2: Clear attack-on-sight flag on the NPC
+		// ============================================
+		// STEP 3: Clear attack-on-sight flag
+		// Prevents immediate re-aggression
+		// ============================================
 		actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
-		_MESSAGE("AILogging: Cleared kAttackOnSight flag");
 		
-		// Method 3: Clear the NPC's combat target if it's the player
-		UInt32 combatTargetHandle = actor->currentCombatTarget;
-		if (combatTargetHandle != 0)
+		// ============================================
+		// STEP 4: Sheathe weapon to signal combat end
+		// This helps the AI transition back to normal packages
+		// ============================================
+		if (IsWeaponDrawn(actor))
 		{
-			NiPointer<TESObjectREFR> targetRef;
-			LookupREFRByHandle(combatTargetHandle, targetRef);
-			if (targetRef && targetRef->formID == player->formID)
-			{
-				actor->currentCombatTarget = 0;
-				_MESSAGE("AILogging: Cleared combat target (was player)");
-			}
+			actor->DrawSheatheWeapon(false);
+			_MESSAGE("StopActorCombatAlarm: Sheathing weapon for '%s'", actorName ? actorName : "Unknown");
 		}
 		
-		// Method 4: Force AI re-evaluation to exit combat state
+		// ============================================
+		// STEP 5: Force AI re-evaluation
+		// This makes the NPC pick up their default package
+		// ============================================
 		Actor_EvaluatePackage(actor, false, false);
-		_MESSAGE("AILogging: Evaluated AI package");
 		
-		// Method 5: Reset AI to interrupt any ongoing hostile behavior
-		CALL_MEMBER_FN(actor, ResetAI)(0, 0);
-		_MESSAGE("AILogging: Reset AI");
-		
-		_MESSAGE("AILogging: Combat alarm stop complete for '%s'", 
-			actorName ? actorName : "Unknown");
+		// Log final state
+		bool stillInCombat = actor->IsInCombat();
+		_MESSAGE("StopActorCombatAlarm: '%s' combat state after: %s", 
+			actorName ? actorName : "Unknown", stillInCombat ? "STILL IN COMBAT" : "NOT IN COMBAT");
 	}
 	
 	// ============================================

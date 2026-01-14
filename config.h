@@ -79,7 +79,7 @@ namespace MountedNPCCombatVR {
 	// ============================================
 	
 	// Attack Angle Threshold vs Player (radians) - how aligned the horse must be to attack
-	// Default: 0.26 (~15 degrees) - tight requirement for player
+	// Default: 0.52 (~30 degrees) - increased for better close-range combat
 	extern float AttackAnglePlayer;
 	
 	// Attack Angle Threshold vs NPC (radians) - more lenient for NPC targets
@@ -90,6 +90,29 @@ namespace MountedNPCCombatVR {
 	// Default: 0.35 (~20 degrees)
 	extern float AttackAngleMounted;
 	
+	// Close Range Attack Distance - when target is closer than this, skip angle check entirely
+	// This guarantees attacks will trigger when very close to the target
+	// Default: 120.0 units
+	extern float CloseRangeAttackDistance;
+	
+	// ============================================
+	// CLOSE RANGE MELEE ASSAULT SETTINGS
+	// ============================================
+	
+	// Distance threshold for triggering close range melee assault
+	// When target is within this distance of rider's SIDE, rapid attacks begin
+	// Default: 145.0 units
+	extern float CloseRangeMeleeAssaultDistance;
+	
+	// Attack interval during close range melee assault (seconds)
+	// Default: 1.0 second between attacks
+	extern float CloseRangeMeleeAssaultInterval;
+	
+	// Distance threshold for locking horse rotation (ON FOOT TARGETS ONLY)
+	// When target is closer than this, horse stops rotating to prevent spinning
+	// Default: 140.0 units
+	extern float CloseRangeRotationLockDistance;
+
 	// ============================================
 	// CHARGE MANEUVER SETTINGS
 	// ============================================
@@ -310,5 +333,23 @@ namespace MountedNPCCombatVR {
 	
 	// Damage multiplier for companion riders vs NPCs
 	extern float CompanionRiderDamageMultiplier;
+	
+	// ============================================
+	// MOUNTED WEAPON REACH SETTINGS
+	// ============================================
+	
+	// Additional reach bonus for two-handed weapons (greatswords, battleaxes)
+	// Makes 2H weapons more effective for mounted combat
+	extern float TwoHandedReachBonus;
+
+	// ============================================
+	// COMBAT DISTANCE SETTINGS
+	// ============================================
+	
+	// Maximum distance before NPC disengages from combat
+	extern float MaxCombatDistance;
+	
+	// Maximum distance for companions before disengaging (can be larger)
+	extern float MaxCompanionCombatDistance;
 
 }

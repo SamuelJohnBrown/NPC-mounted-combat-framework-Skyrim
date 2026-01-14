@@ -306,6 +306,32 @@ namespace MountedNPCCombatVR
 	void ClearPlayerAggroSwitchData(UInt32 horseFormID);
 
 	// ============================================
+	// Close Range Melee Assault (Emergency Close Combat)
+	// ============================================
+	// When target gets within 145 units of the rider's side,
+	// triggers rapid melee attacks (1 per second) until they move away.
+	// 100% trigger chance, 0 cooldown - purely distance-based.
+	// Uses the same melee attack logic as normal mounted combat.
+	// Attacks from LEFT if target is on left side, RIGHT if on right.
+	
+	// Check and trigger close range melee assault
+	// Returns true if assault is active (target within range)
+	bool TryCloseRangeMeleeAssault(Actor* horse, Actor* rider, Actor* target);
+	
+	// Check if horse is currently in close range melee assault mode
+	bool IsInCloseRangeMeleeAssault(UInt32 horseFormID);
+	
+	// Update close range melee assault - triggers attacks every 1 second
+	// Returns true if still in assault mode, false if target moved away
+	bool UpdateCloseRangeMeleeAssault(Actor* horse, Actor* rider, Actor* target);
+	
+	// Stop close range melee assault (target moved out of range)
+	void StopCloseRangeMeleeAssault(UInt32 horseFormID);
+	
+	// Clear close range melee assault data for a horse
+	void ClearCloseRangeMeleeAssaultData(UInt32 horseFormID);
+
+	// ============================================
 	// Clear All Moveset Data for a Horse
 	// ============================================
 	// Call this when combat ends (death, escape, dismount, etc.)

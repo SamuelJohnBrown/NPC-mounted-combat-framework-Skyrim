@@ -1,10 +1,11 @@
 #include "DynamicPackages.h"
 #include "CombatStyles.h"
 #include "WeaponDetection.h"
-#include "SingleMountedCombat.h"
+#include "MountedCombat.h"
 #include "ArrowSystem.h"
 #include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
+#include "FleeingBehavior.h"
 #include "AILogging.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -355,7 +356,7 @@ namespace MountedNPCCombatVR
 		float dy = target->pos.y - actor->pos.y;
 		float distanceToTarget = sqrt(dx * dx + dy * dy);
 		
-		const float STOP_OFFSET_DISTANCE = 150.0f;
+		const float STOP_OFFSET_DISTANCE = 100.0f;
 		if (distanceToTarget < STOP_OFFSET_DISTANCE)
 		{
 			// Within close range - clear any follow offset and let 90-degree turn handle it
@@ -670,7 +671,7 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// CRITICAL: Verify target has valid processManager
+		// CRITICAL: VERIFY TARGET HAS VALID PROCESSMANAGER
 		// ============================================
 		if (!target->processManager)
 		{
@@ -714,13 +715,10 @@ namespace MountedNPCCombatVR
 
 	bool ForceHorseCombatWithTarget(Actor* horse, Actor* target)
 	{
+		// ============================================
+		// SAFETY: Validate actors before any processing
+		// ============================================
 		if (!horse || !target)
-		{
-			return false;
-		}
-		
-		// Safety checks - verify actors are in valid state
-		if (horse->IsDead(1) || target->IsDead(1))
 		{
 			return false;
 		}
@@ -765,10 +763,27 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// CRITICAL: Verify target has valid processManager
+		// CRITICAL: VERIFY TARGET HAS VALID PROCESSMANAGER
 		// ============================================
 		if (!target->processManager)
 		{
+			return false;
+		}
+		
+		// ============================================
+		// CRITICAL: Check distance BEFORE creating handle
+		// If target is extremely far (> 8000 units), don't attempt follow
+		// This prevents CTD when MovementPathManager can't handle distant targets
+		// ============================================
+		float dx = target->pos.x - horse->pos.x;
+		float dy = target->pos.y - horse->pos.y;
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		
+		const float MAX_FOLLOW_DISTANCE = 8000.0f;  // Don't attempt pathfinding beyond this
+		if (distanceToTarget > MAX_FOLLOW_DISTANCE)
+		{
+			_MESSAGE("ForceHorseCombatWithTarget: Target %08X too far (%.0f > %.0f) - skipping follow",
+				target->formID, distanceToTarget, MAX_FOLLOW_DISTANCE);
 			return false;
 		}
 
@@ -797,10 +812,6 @@ namespace MountedNPCCombatVR
 		// Within close range, we let the 90-degree turn system handle positioning
 		// The offset follow can cause the horse to walk into the target
 		// ============================================
-		float dx = target->pos.x - horse->pos.x;
-		float dy = target->pos.y - horse->pos.y;
-		float distanceToTarget = sqrt(dx * dx + dy * dy);
-		
 		const float STOP_OFFSET_DISTANCE = 150.0f;
 		if (distanceToTarget < STOP_OFFSET_DISTANCE)
 		{
@@ -886,12 +897,13 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// RATE LIMIT: Skip if already processed this frame
-		// Prevents duplicate rotation/movement when called from multiple places
+		// CHECK IF RIDER IS FLEEING - SKIP ALL PROCESSING
+		// Fleeing riders are controlled by tactical flee system
+		// Do NOT apply any movement, rotation, or packages!
 		// ============================================
-		if (ShouldSkipDuplicateProcessing(horse->formID))
+		if (IsHorseRiderFleeing(horse->formID))
 		{
-			return 0;  // Already processed this frame
+			return 0;  // Skip all processing - flee system handles this horse
 		}
 		
 		// Validate horse is still valid and has required state
@@ -916,6 +928,41 @@ namespace MountedNPCCombatVR
 		if (!target->loadedState)
 		{
 			return 0;
+		}
+		
+		// ============================================
+		// CLOSE RANGE MELEE ASSAULT - HIGHEST PRIORITY!
+		// This MUST be checked FIRST before any other logic.
+		// When target is within 145 units, FORCE ATTACKS regardless
+		// of angle, weapon state, or any other conditions!
+		// ============================================
+		float dx_assault = target->pos.x - horse->pos.x;
+		float dy_assault = target->pos.y - horse->pos.y;
+		float distanceForAssault = sqrt(dx_assault * dx_assault + dy_assault * dy_assault);
+		
+		NiPointer<Actor> riderForAssault;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAssault) && riderForAssault)
+		{
+			// Try to activate close range melee assault
+			if (TryCloseRangeMeleeAssault(horse, riderForAssault.get(), target))
+			{
+				// Assault is active - FORCE attacks every interval
+				// But DO NOT override rotation - let normal 90-degree turn handle it
+				UpdateCloseRangeMeleeAssault(horse, riderForAssault.get(), target);
+				
+				// DON'T return here - let the rest of the function handle rotation normally!
+				// The assault just guarantees attacks happen, it doesn't change movement
+			}
+		}
+		
+		// ============================================
+		// RATE LIMIT: Skip if already processed this frame
+		// Prevents duplicate rotation/movement when called from multiple places
+		// EXCEPTION: Rapid fire horses MUST be processed every frame!
+		// ============================================
+		if (!IsInRapidFire(horse->formID) && ShouldSkipDuplicateProcessing(horse->formID))
+		{
+			return 0;  // Already processed this frame
 		}
 		
 		// ============================================
@@ -1055,21 +1102,21 @@ namespace MountedNPCCombatVR
 						}
 					}
 					
-					// CRITICAL: Return immediately to skip ALL other rotation code
+					// CRITICAL: Return immediately to skip ALL OTHER rotation code
 					return 7;  // Stand ground with locked rotation
 				}
 				
 				// ============================================
 				// ROTATION NOT YET LOCKED - Still doing initial 90-degree turn
 				// ============================================
-				float targetAngleForStand;
+				float targetAngle;
 				bool noRotation = IsStandGroundNoRotation(horse->formID);
 				
 				if (noRotation)
 				{
 					// NO ROTATION mode - immediately lock to current facing
 					LockStandGroundRotation(horse->formID, horse->rot.z);
-					// CRITICAL: Return immediately to skip ALL other rotation code
+					// CRITICAL: Return immediately to skip ALL OTHER rotation code
 					return 7;
 				}
 				
@@ -1079,10 +1126,10 @@ namespace MountedNPCCombatVR
 				// Do NOT recalculate based on current angleToTarget!
 				// The target may have moved, but we want to turn to where they WERE
 				// ============================================
-				targetAngleForStand = GetStandGroundTarget90DegreeAngle(horse->formID, angleToTarget);
+				targetAngle = GetStandGroundTarget90DegreeAngle(horse->formID, angleToTarget);
 				
 				float currentAngle = horse->rot.z;
-				float angleDiff = targetAngleForStand - currentAngle;
+				float angleDiff = targetAngle - currentAngle;
 				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
 				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 				
@@ -1092,7 +1139,7 @@ namespace MountedNPCCombatVR
 				{
 					// Turn complete! Lock the rotation at this angle
 					LockStandGroundRotation(horse->formID, currentAngle);
-					// CRITICAL: Return immediately to skip ALL other rotation code
+					// CRITICAL: Return immediately to skip ALL OTHER rotation code
 					return 7;
 				}
 				
@@ -1102,7 +1149,7 @@ namespace MountedNPCCombatVR
 				while (newAngle < -3.14159f) newAngle += 6.28318f;
 				horse->rot.z = newAngle;
 				
-				// CRITICAL: Return immediately to skip ALL other rotation code
+				// CRITICAL: Return immediately to skip ALL OTHER rotation code
 				return 7;  // Horse standing ground, still turning
 			}
 		}
@@ -1172,9 +1219,34 @@ namespace MountedNPCCombatVR
 			bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
 			float attackAngleThreshold = targetIsPlayer ? AttackAnglePlayer : AttackAngleNPC;
 			
-			if (fabs(angleDiff) < attackAngleThreshold)
+			// ============================================
+			// CLOSE RANGE ATTACK GUARANTEE
+			// When target is very close (within CloseRangeAttackDistance),
+			// ALWAYS allow attacks regardless of angle. This fixes the issue
+			// where attacks stop working when the target gets too close.
+			// ============================================
+			bool closeRangeOverride = (distanceToTarget < CloseRangeAttackDistance);
+			
+			// ============================================
+			// CLOSE RANGE MELEE ASSAULT - EMERGENCY CLOSE COMBAT
+			// When target is within CloseRangeMeleeAssaultDistance (145 units),
+			// trigger rapid attacks every 1 second. This guarantees hits
+			// when the target gets very close to the rider.
+			// ============================================
+			NiPointer<Actor> riderForAssault;
+			if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAssault) && riderForAssault)
 			{
-				// In attack position - determine side and attack
+				// Try to activate or continue close range melee assault
+				if (TryCloseRangeMeleeAssault(horse, riderForAssault.get(), target))
+				{
+					// Assault is active - update it (triggers attacks every 1 second)
+					UpdateCloseRangeMeleeAssault(horse, riderForAssault.get(), target);
+				}
+			}
+			
+			if (closeRangeOverride || fabs(angleDiff) < attackAngleThreshold)
+			{
+				// In attack position (or close enough to override) - determine side and attack
 				float horseRightX = cos(horse->rot.z);
 				float horseRightY = -sin(horse->rot.z);
 				
@@ -1341,6 +1413,7 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// CHARGE MANEUVER CHECK (700-1500 units away)
 		// ============================================
+
 		NiPointer<Actor> riderForCharge;
 		if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForCharge) && riderForCharge)
 		{
@@ -1419,6 +1492,23 @@ namespace MountedNPCCombatVR
 			TryRearUpOnApproach(horse, target, distanceToTarget);
 			
 			// ============================================
+			// CLOSE RANGE MELEE ASSAULT - EMERGENCY CLOSE COMBAT
+			// When target is within CloseRangeMeleeAssaultDistance (145 units),
+			// trigger rapid attacks every 1 second. This guarantees hits
+			// when the target gets very close to the rider.
+			// ============================================
+			NiPointer<Actor> riderForAssault;
+			if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAssault) && riderForAssault)
+			{
+				// Try to activate or continue close range melee assault
+				if (TryCloseRangeMeleeAssault(horse, riderForAssault.get(), target))
+				{
+					// Assault is active - update it (triggers attacks every 1 second)
+					UpdateCloseRangeMeleeAssault(horse, riderForAssault.get(), target);
+				}
+			}
+			
+			// ============================================
 			// TRY STAND GROUND MANEUVER (vs non-player NPCs only)
 			// 25% chance when within 260 units of a mobile NPC target
 			// ============================================
@@ -1471,17 +1561,17 @@ namespace MountedNPCCombatVR
 				
 				// ============================================
 				// RATE LIMIT ROTATION UPDATES FOR MOUNTED VS MOUNTED
-				// Only update rotation every 100ms to prevent jitter and CTD
+				// Only update rotation every 75ms to prevent jitter and CTD
 				// ============================================
 				static UInt32 lastRotationUpdateHorse = 0;
 				static float lastRotationUpdateTime = 0;
 				float currentTime = GetGameTime();
 				
-				// Only process rotation updates every 0.1 seconds (10 times per second max)
+				// Only process rotation updates every 0.075 seconds (~13 times per second max)
 				bool shouldUpdateRotation = true;
 				if (lastRotationUpdateHorse == horse->formID)
 				{
-					if ((currentTime - lastRotationUpdateTime) < 0.1f)
+					if ((currentTime - lastRotationUpdateTime) < 0.075f)
 					{
 						shouldUpdateRotation = false;
 					}
@@ -1541,8 +1631,8 @@ namespace MountedNPCCombatVR
 				
 				float currentAngle = horse->rot.z;
 				float angleDiff = targetAngle - currentAngle;
-			 while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-			 while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+				while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+				while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 				
 				// Use config value for attack angle threshold
 				// More lenient for NPCs (AttackAngleNPC) vs Player (AttackAnglePlayer)
@@ -1602,7 +1692,7 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// APPLY ROTATION
 		// ============================================
-		
+
 		// CRITICAL: Skip ALL rotation if in stand ground!
 		// Stand ground horses should NOT have any rotation applied here
 		if (IsInStandGround(horse->formID))
@@ -1671,13 +1761,34 @@ namespace MountedNPCCombatVR
 	// ALL riders use this - single/multi, melee/ranged captains
 	// NOW USES WeaponDetection's state machine
 	// ============================================
-	
+
 	// DEPRECATED: Old weapon switch data - now handled by WeaponDetection
 	// Keeping ClearWeaponSwitchData for backward compatibility
 	
 	bool UpdateRiderWeaponForDistance(Actor* rider, float distanceToTarget, bool targetIsMounted)
 	{
 		if (!rider) return false;
+		
+		// ============================================
+		// MAGES NEVER SWITCH TO MELEE - ALWAYS BOW
+		// Mages use Captain moveset but without melee fallback
+		// When close, they retreat (handled by MultiMountedCombat)
+		// ============================================
+		MultiRiderData* riderData = GetMultiRiderData(rider->formID);
+		if (riderData && riderData->isMageCaster)
+		{
+			// Mage - always request bow, never melee
+			// Just ensure bow is equipped and drawn
+			if (!IsBowEquipped(rider))
+			{
+				RequestWeaponSwitch(rider, WeaponRequest::Bow);
+			}
+			else if (!IsWeaponDrawn(rider))
+			{
+				RequestWeaponDraw(rider);
+			}
+			return true;
+		}
 		
 		// Use the centralized weapon state machine from WeaponDetection
 		return RequestWeaponForDistance(rider, distanceToTarget, targetIsMounted);
@@ -1707,13 +1818,21 @@ namespace MountedNPCCombatVR
 		// Clear weapon switch tracking
 		ClearAllWeaponSwitchData();
 		
-			// Clear horse movement tracking
+		// Clear horse movement tracking
 		for (int i = 0; i < 5; i++)
 		{
 			g_horseMovement[i].isValid = false;
 			g_horseMovement[i].horseFormID = 0;
 		}
 		g_horseMovementCount = 0;
+		
+		// Clear horse processing tracking
+		for (int i = 0; i < 10; i++)
+		{
+			g_horseProcessing[i].isValid = false;
+			g_horseProcessing[i].horseFormID = 0;
+		}
+		g_horseProcessingCount = 0;
 		
 		// Reset initialization flag so system can re-init
 		g_dynamicPackageSystemInitialized = false;

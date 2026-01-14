@@ -1,6 +1,6 @@
 #include "WeaponDetection.h"
 #include "DynamicPackages.h"  // For get_vfunc
-#include "Helper.h" // For GetGameTime
+#include "Helper.h" // For GetGameTime, GetFullFormIdMine
 #include "config.h"    // For WeaponSwitchDistance, SheatheTransitionTime
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -10,6 +10,239 @@
 
 namespace MountedNPCCombatVR
 {
+	// ============================================
+	// WEAPON FORMIDS
+	// ============================================
+	
+	// Iron Arrow FormID from Skyrim.esm
+	const UInt32 IRON_ARROW_FORMID = 0x0001397D;
+	
+	// Glaive BASE FormID from MountedNPCCombat.esp (ESL-flagged) - FALLBACK
+	// Must use GetFullFormIdMine() to resolve at runtime!
+	const UInt32 MOUNTED_GLAIVE_BASE_FORMID = 0x0008F8;
+	const char* WEAPON_ESP_NAME = "MountedNPCCombat.esp";
+	
+	// ============================================
+	// GLAIVE DANGER ESP - OPTIONAL VARIETY
+	// GlaiveDanger.esp provides multiple glaive varieties
+	// This is OPTIONAL - if not installed, falls back to MountedNPCCombat.esp
+	// ============================================
+	const char* GLAIVE_DANGER_ESP_NAME = "GlaiveDanger.esp";
+	
+	// Two-Handed Glaives from GlaiveDanger.esp (excluding Daedric)
+	// These are BASE FormIDs - need GetFullFormIdMine() to resolve
+	// 2H Glaives are preferred for mounted combat due to longer reach
+	const UInt32 GLAIVE_DANGER_2H_FORMIDS[] = {
+		0x000839,  // IronGlaive2H - Iron Glaive 2H
+		0x00083A,  // SteelGlaive2H - Steel Glaive 2H
+		0x00083B,  // DwarvenGlaive2H - Dwarven Glaive 2H
+		0x00083C,  // ElvenGlaive2H - Elven Glaive 2H
+		0x00083D,  // GlassGlaive2H - Glass Glaive 2H
+		0x00083E,  // OrcishGlaive2H - Orcish Glaive 2H
+		0x000840,  // EbonyGlaive2H - Ebony Glaive 2H
+		0x000841,  // DragonboneGlaive2H - Dragonbone Glaive 2H
+		0x000842,  // StalhrimGlaive2H - Stalhrim Glaive 2H
+		0x000843,  // DraugrGlaive2H - Draugr Glaive 2H
+	};
+	const int GLAIVE_DANGER_2H_COUNT = sizeof(GLAIVE_DANGER_2H_FORMIDS) / sizeof(GLAIVE_DANGER_2H_FORMIDS[0]);
+	
+	// Flag to track if GlaiveDanger.esp is available
+	static bool g_glaiveDangerChecked = false;
+	static bool g_glaiveDangerAvailable = false;
+	
+	// Hunting Bow FormID from Skyrim.esm
+	const UInt32 HUNTING_BOW_FORMID = 0x00013985;
+	
+	// ============================================
+	// CHECK IF GLAIVE DANGER ESP IS AVAILABLE
+	// ============================================
+	static bool IsGlaiveDangerAvailable()
+	{
+		if (g_glaiveDangerChecked)
+		{
+			return g_glaiveDangerAvailable;
+		}
+		
+		g_glaiveDangerChecked = true;
+		
+		// Try to resolve any glaive from the ESP to check if it's loaded
+		UInt32 testFormID = GetFullFormIdMine(GLAIVE_DANGER_ESP_NAME, GLAIVE_DANGER_2H_FORMIDS[0]);
+		if (testFormID != 0)
+		{
+			TESForm* testForm = LookupFormByID(testFormID);
+			if (testForm)
+			{
+				g_glaiveDangerAvailable = true;
+				_MESSAGE("WeaponDetection: GlaiveDanger.esp DETECTED - using random 2H glaive variety!");
+				return true;
+			}
+		}
+		
+		g_glaiveDangerAvailable = false;
+		_MESSAGE("WeaponDetection: GlaiveDanger.esp not found - using fallback glaive from MountedNPCCombat.esp");
+		return false;
+	}
+	
+	// ============================================
+	// GET RANDOM GLAIVE FROM GLAIVE DANGER ESP
+	// Returns nullptr if ESP not available or glaive not found
+	// Always uses 2H glaives for mounted combat (better reach)
+	// ============================================
+	static TESObjectWEAP* GetRandomGlaiveFromGlaiveDanger()
+	{
+		if (!IsGlaiveDangerAvailable())
+		{
+			return nullptr;
+		}
+		
+		// Random selection from 2H glaives
+		int randomIndex = rand() % GLAIVE_DANGER_2H_COUNT;
+		UInt32 baseFormID = GLAIVE_DANGER_2H_FORMIDS[randomIndex];
+		
+		UInt32 fullFormID = GetFullFormIdMine(GLAIVE_DANGER_ESP_NAME, baseFormID);
+		if (fullFormID == 0)
+		{
+			_MESSAGE("WeaponDetection: Failed to resolve GlaiveDanger FormID %04X", baseFormID);
+			return nullptr;
+		}
+		
+		TESForm* form = LookupFormByID(fullFormID);
+		if (!form)
+		{
+			_MESSAGE("WeaponDetection: Could not find GlaiveDanger form %08X", fullFormID);
+			return nullptr;
+		}
+		
+		TESObjectWEAP* weapon = DYNAMIC_CAST(form, TESForm, TESObjectWEAP);
+		if (!weapon)
+		{
+			_MESSAGE("WeaponDetection: GlaiveDanger form %08X is not a weapon!", fullFormID);
+			return nullptr;
+		}
+		
+		const char* weaponName = weapon->fullName.name.data;
+		_MESSAGE("WeaponDetection: Selected random 2H glaive: '%s' (FormID: %08X)", 
+			weaponName ? weaponName : "Unknown", fullFormID);
+		
+		return weapon;
+	}
+	
+	// ============================================
+	// CHECK IF ACTOR HAS ANY GLAIVE
+	// Checks both equipped and inventory for any glaive weapon
+	// This prevents NPCs from accumulating multiple glaives
+	// ============================================
+	static bool HasAnyGlaiveEquippedOrInInventory(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		// Check equipped weapon first
+		TESForm* equippedWeapon = actor->GetEquippedObject(false);
+		if (equippedWeapon)
+		{
+			TESObjectWEAP* weapon = DYNAMIC_CAST(equippedWeapon, TESForm, TESObjectWEAP);
+			if (weapon)
+			{
+				const char* weaponName = weapon->fullName.name.data;
+				if (weaponName)
+				{
+					// Check if name contains "Glaive" (case-sensitive but covers all glaive types)
+					if (strstr(weaponName, "Glaive") != nullptr || strstr(weaponName, "glaive") != nullptr)
+					{
+						return true;
+					}
+				}
+			}
+		}
+		
+		// Check inventory
+		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
+			actor->extraData.GetByType(kExtraData_ContainerChanges));
+		
+		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
+			return false;
+		
+		tList<InventoryEntryData>* objList = containerChanges->data->objList;
+		
+		for (tList<InventoryEntryData>::Iterator it = objList->Begin(); !it.End(); ++it)
+		{
+			InventoryEntryData* entry = it.Get();
+			if (!entry || !entry->type) continue;
+			
+			TESObjectWEAP* weapon = DYNAMIC_CAST(entry->type, TESForm, TESObjectWEAP);
+			if (weapon && entry->countDelta > 0)
+			{
+				const char* weaponName = weapon->fullName.name.data;
+				if (weaponName)
+				{
+					if (strstr(weaponName, "Glaive") != nullptr || strstr(weaponName, "glaive") != nullptr)
+					{
+						return true;
+					}
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	// ============================================
+	// GET EXISTING GLAIVE FROM INVENTORY
+	// Returns any glaive already in inventory (to equip instead of adding new)
+	// ============================================
+	static TESObjectWEAP* GetExistingGlaiveFromInventory(Actor* actor)
+	{
+		if (!actor) return nullptr;
+		
+		// Check equipped weapon first
+		TESForm* equippedWeapon = actor->GetEquippedObject(false);
+		if (equippedWeapon)
+		{
+			TESObjectWEAP* weapon = DYNAMIC_CAST(equippedWeapon, TESForm, TESObjectWEAP);
+			if (weapon)
+			{
+				const char* weaponName = weapon->fullName.name.data;
+				if (weaponName)
+				{
+					if (strstr(weaponName, "Glaive") != nullptr || strstr(weaponName, "glaive") != nullptr)
+					{
+						return weapon;
+					}
+				}
+			}
+		}
+		
+		// Check inventory
+		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
+			actor->extraData.GetByType(kExtraData_ContainerChanges));
+		
+		if (!containerChanges || !containerChanges->data || !containerChanges->data->objList)
+			return nullptr;
+		
+		tList<InventoryEntryData>* objList = containerChanges->data->objList;
+		
+		for (tList<InventoryEntryData>::Iterator it = objList->Begin(); !it.End(); ++it)
+		{
+			InventoryEntryData* entry = it.Get();
+			if (!entry || !entry->type) continue;
+			
+			TESObjectWEAP* weapon = DYNAMIC_CAST(entry->type, TESForm, TESObjectWEAP);
+			if (weapon && entry->countDelta > 0)
+			{
+				const char* weaponName = weapon->fullName.name.data;
+				if (weaponName)
+				{
+					if (strstr(weaponName, "Glaive") != nullptr || strstr(weaponName, "glaive") != nullptr)
+					{
+						return weapon;
+					}
+				}
+			}
+		}
+		
+		return nullptr;
+	}
+	
 	// ============================================
 	// CENTRALIZED WEAPON STATE MACHINE
 	// ============================================
@@ -92,8 +325,147 @@ namespace MountedNPCCombatVR
 		
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		
+		// ============================================
+		// GLAIVE REQUEST - Specifically for mounted vs mounted combat
+		// First check if actor already has a glaive - use that instead of adding new
+		// ============================================
+		if (request == WeaponRequest::Glaive)
+		{
+			// Check if actor already has any glaive - use it instead of adding new
+			TESObjectWEAP* existingGlaive = GetExistingGlaiveFromInventory(actor);
+			if (existingGlaive)
+			{
+				EquipManager* equipManager = EquipManager::GetSingleton();
+				if (equipManager)
+				{
+					BGSEquipSlot* rightSlot = GetRightHandSlot();
+					CALL_MEMBER_FN(equipManager, EquipItem)(actor, existingGlaive, nullptr, 1, rightSlot, false, false, false, nullptr);
+					const char* weaponName = existingGlaive->fullName.name.data;
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED existing '%s'", 
+						actor->formID, actorName ? actorName : "Unknown", weaponName ? weaponName : "Glaive");
+					return;
+				}
+			}
+			
+			// No existing glaive - try to get a random one from GlaiveDanger.esp
+			TESObjectWEAP* glaive = GetRandomGlaiveFromGlaiveDanger();
+			
+			if (glaive)
+			{
+				// Add glaive to inventory and equip
+				AddItem_Native(nullptr, 0, actor, glaive, 1, true);
+				
+				EquipManager* equipManager = EquipManager::GetSingleton();
+				if (equipManager)
+				{
+					BGSEquipSlot* rightSlot = GetRightHandSlot();
+					CALL_MEMBER_FN(equipManager, EquipItem)(actor, glaive, nullptr, 1, rightSlot, false, false, false, nullptr);
+					const char* weaponName = glaive->fullName.name.data;
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED NEW '%s' for mounted combat", 
+						actor->formID, actorName ? actorName : "Unknown", weaponName ? weaponName : "Glaive");
+					return;
+				}
+			}
+			
+			// Fallback to MountedNPCCombat.esp glaive
+			UInt32 glaiveFormID = GetFullFormIdMine(WEAPON_ESP_NAME, MOUNTED_GLAIVE_BASE_FORMID);
+			if (glaiveFormID != 0)
+			{
+				TESForm* glaiveForm = LookupFormByID(glaiveFormID);
+				if (glaiveForm)
+				{
+					TESObjectWEAP* fallbackGlaive = DYNAMIC_CAST(glaiveForm, TESForm, TESObjectWEAP);
+					if (fallbackGlaive)
+					{
+						AddItem_Native(nullptr, 0, actor, glaiveForm, 1, true);
+						
+						EquipManager* equipManager = EquipManager::GetSingleton();
+						if (equipManager)
+						{
+							BGSEquipSlot* rightSlot = GetRightHandSlot();
+							CALL_MEMBER_FN(equipManager, EquipItem)(actor, fallbackGlaive, nullptr, 1, rightSlot, false, false, false, nullptr);
+							_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED fallback glaive (FormID: %08X)", 
+								actor->formID, actorName ? actorName : "Unknown", glaiveFormID);
+							return;
+						}
+					}
+				}
+			}
+			
+			// Neither ESP has glaive - fall through to regular melee
+			_MESSAGE("WeaponState: ERROR - No glaive available, falling back to melee for actor %08X", actor->formID);
+			request = WeaponRequest::Melee;
+		}
+		
 		if (request == WeaponRequest::Melee)
 		{
+			// ============================================
+			// MELEE REQUEST - Check for existing glaive first
+			// Falls back to GlaiveDanger.esp, then MountedNPCCombat.esp, then best melee
+			// ============================================
+			
+			// Check if actor already has any glaive - use it
+			TESObjectWEAP* existingGlaive = GetExistingGlaiveFromInventory(actor);
+			if (existingGlaive)
+			{
+				EquipManager* equipManager = EquipManager::GetSingleton();
+				if (equipManager)
+				{
+					BGSEquipSlot* rightSlot = GetRightHandSlot();
+					CALL_MEMBER_FN(equipManager, EquipItem)(actor, existingGlaive, nullptr, 1, rightSlot, false, false, false, nullptr);
+					const char* weaponName = existingGlaive->fullName.name.data;
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED existing '%s'", 
+						actor->formID, actorName ? actorName : "Unknown", weaponName ? weaponName : "Glaive");
+					return;
+				}
+			}
+			
+			// Try GlaiveDanger.esp
+			TESObjectWEAP* glaive = GetRandomGlaiveFromGlaiveDanger();
+			
+			if (glaive)
+			{
+				AddItem_Native(nullptr, 0, actor, glaive, 1, true);
+				
+				EquipManager* equipManager = EquipManager::GetSingleton();
+				if (equipManager)
+				{
+					BGSEquipSlot* rightSlot = GetRightHandSlot();
+					CALL_MEMBER_FN(equipManager, EquipItem)(actor, glaive, nullptr, 1, rightSlot, false, false, false, nullptr);
+					const char* weaponName = glaive->fullName.name.data;
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED NEW '%s'", 
+						actor->formID, actorName ? actorName : "Unknown", weaponName ? weaponName : "Glaive");
+					return;
+				}
+			}
+			
+			// Fallback to MountedNPCCombat.esp glaive
+			UInt32 glaiveFormID = GetFullFormIdMine(WEAPON_ESP_NAME, MOUNTED_GLAIVE_BASE_FORMID);
+			if (glaiveFormID != 0)
+			{
+				TESForm* glaiveForm = LookupFormByID(glaiveFormID);
+				if (glaiveForm)
+				{
+					TESObjectWEAP* fallbackGlaive = DYNAMIC_CAST(glaiveForm, TESForm, TESObjectWEAP);
+					if (fallbackGlaive)
+					{
+						AddItem_Native(nullptr, 0, actor, glaiveForm, 1, true);
+						
+						EquipManager* equipManager = EquipManager::GetSingleton();
+						if (equipManager)
+						{
+							BGSEquipSlot* rightSlot = GetRightHandSlot();
+							CALL_MEMBER_FN(equipManager, EquipItem)(actor, fallbackGlaive, nullptr, 1, rightSlot, false, false, false, nullptr);
+							_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED fallback glaive (FormID: %08X)", 
+								actor->formID, actorName ? actorName : "Unknown", glaiveFormID);
+							return;
+						}
+					}
+				}
+			}
+			
+			// Last resort - best melee in inventory
+			_MESSAGE("WeaponState: No glaive available - using best melee in inventory for actor %08X", actor->formID);
 			TESObjectWEAP* melee = FindBestMeleeInInventory(actor);
 			if (melee)
 			{
@@ -102,27 +474,7 @@ namespace MountedNPCCombatVR
 				{
 					BGSEquipSlot* rightSlot = GetRightHandSlot();
 					CALL_MEMBER_FN(equipManager, EquipItem)(actor, melee, nullptr, 1, rightSlot, false, false, false, nullptr);
-					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED melee", actor->formID, actorName ? actorName : "Unknown");
-				}
-			}
-			else
-			{
-				// Give default Iron Mace
-				TESForm* maceForm = LookupFormByID(0x00013982);
-				if (maceForm)
-				{
-					TESObjectWEAP* mace = DYNAMIC_CAST(maceForm, TESForm, TESObjectWEAP);
-					if (mace)
-					{
-						AddItem_Native(nullptr, 0, actor, maceForm, 1, true);
-						EquipManager* equipManager = EquipManager::GetSingleton();
-						if (equipManager)
-						{
-							BGSEquipSlot* rightSlot = GetRightHandSlot();
-							CALL_MEMBER_FN(equipManager, EquipItem)(actor, mace, nullptr, 1, rightSlot, false, false, false, nullptr);
-							_MESSAGE("WeaponState: Actor %08X '%s' GIVEN default melee", actor->formID, actorName ? actorName : "Unknown");
-						}
-					}
+					_MESSAGE("WeaponState: Actor %08X '%s' EQUIPPED fallback melee", actor->formID, actorName ? actorName : "Unknown");
 				}
 			}
 		}
@@ -251,6 +603,11 @@ namespace MountedNPCCombatVR
 			g_weaponStateData[i].actorFormID = 0;
 		}
 		g_weaponStateCount = 0;
+		
+		// Reset GlaiveDanger availability check so it re-checks on next equip
+		g_glaiveDangerChecked = false;
+		g_glaiveDangerAvailable = false;
+		
 		_MESSAGE("WeaponState: Reset complete");
 	}
 	
@@ -288,13 +645,30 @@ namespace MountedNPCCombatVR
 		}
 		
 		// Check if we already have what's requested
-		if (request == WeaponRequest::Melee && IsMeleeEquipped(actor))
+		// For Glaive request, check if glaive is specifically equipped
+		if (request == WeaponRequest::Glaive)
+		{
+			// Check if glaive is equipped by checking the weapon FormID
+			TESForm* equippedWeapon = actor->GetEquippedObject(false);
+			if (equippedWeapon)
+			{
+				UInt32 glaiveFormID = GetFullFormIdMine(WEAPON_ESP_NAME, MOUNTED_GLAIVE_BASE_FORMID);
+				if (glaiveFormID != 0 && equippedWeapon->formID == glaiveFormID)
+				{
+					// Glaive already equipped
+					if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
+					data->state = WeaponState::Ready;
+					return true;
+				}
+			}
+		}
+		else if (request == WeaponRequest::Melee && IsMeleeEquipped(actor))
 		{
 			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
 			data->state = WeaponState::Ready;
 			return true;
 		}
-		if (request == WeaponRequest::Bow && IsBowEquipped(actor))
+		else if (request == WeaponRequest::Bow && IsBowEquipped(actor))
 		{
 			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
 			data->state = WeaponState::Ready;
@@ -303,7 +677,11 @@ namespace MountedNPCCombatVR
 		
 		// Start weapon switch sequence
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		const char* reqStr = (request == WeaponRequest::Melee) ? "MELEE" : "BOW";
+		const char* reqStr = "UNKNOWN";
+		if (request == WeaponRequest::Melee) reqStr = "MELEE";
+		else if (request == WeaponRequest::Bow) reqStr = "BOW";
+		else if (request == WeaponRequest::Glaive) reqStr = "GLAIVE";
+		
 		_MESSAGE("WeaponState: Actor %08X '%s' requesting %s switch", actor->formID, actorName ? actorName : "Unknown", reqStr);
 		
 		data->pendingRequest = request;
@@ -328,8 +706,21 @@ namespace MountedNPCCombatVR
 		
 		if (distanceToTarget <= switchDist)
 		{
-			// Within melee range - ALWAYS use melee weapon
-			request = WeaponRequest::Melee;
+			// Within melee range
+			// ============================================
+			// MOUNTED VS MOUNTED: PREFER GLAIVE
+			// When fighting a mounted target in melee range, use glaive
+			// ============================================
+			if (targetIsMounted)
+			{
+				request = WeaponRequest::Glaive;
+				_MESSAGE("WeaponState: %08X requesting GLAIVE (mounted vs mounted, dist: %.0f)", 
+					actor->formID, distanceToTarget);
+			}
+			else
+			{
+				request = WeaponRequest::Melee;
+			}
 			
 			// CRITICAL: If bow is currently equipped and we're in melee range, FORCE the switch
 			// This bypasses cooldown because being stuck with a bow in melee is deadly
@@ -348,13 +739,26 @@ namespace MountedNPCCombatVR
 		else
 		{
 			// Beyond switch distance but no bow - use melee anyway
-			request = WeaponRequest::Melee;
+			// ============================================
+			// MOUNTED VS MOUNTED: PREFER GLAIVE EVEN AT RANGE
+			// If target is mounted and we're closing in, use glaive
+			// ============================================
+			if (targetIsMounted)
+			{
+				request = WeaponRequest::Glaive;
+			}
+			else
+			{
+				request = WeaponRequest::Melee;
+			}
 		}
 		
 		// If forcing melee, bypass the normal request and directly switch
 		if (forceMelee)
 		{
-			return ForceWeaponSwitch(actor, WeaponRequest::Melee);
+			// For mounted targets, force glaive instead of generic melee
+			WeaponRequest forceRequest = targetIsMounted ? WeaponRequest::Glaive : WeaponRequest::Melee;
+			return ForceWeaponSwitch(actor, forceRequest);
 		}
 		
 		return RequestWeaponSwitch(actor, request);
@@ -378,13 +782,29 @@ namespace MountedNPCCombatVR
 		}
 		
 		// Check if we already have what's requested
-		if (request == WeaponRequest::Melee && IsMeleeEquipped(actor))
+		// For Glaive request, check if glaive is specifically equipped
+		if (request == WeaponRequest::Glaive)
+		{
+			TESForm* equippedWeapon = actor->GetEquippedObject(false);
+			if (equippedWeapon)
+			{
+				UInt32 glaiveFormID = GetFullFormIdMine(WEAPON_ESP_NAME, MOUNTED_GLAIVE_BASE_FORMID);
+				if (glaiveFormID != 0 && equippedWeapon->formID == glaiveFormID)
+				{
+					// Glaive already equipped
+					if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
+					data->state = WeaponState::Ready;
+					return true;
+				}
+			}
+		}
+		else if (request == WeaponRequest::Melee && IsMeleeEquipped(actor))
 		{
 			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
 			data->state = WeaponState::Ready;
 			return true;
 		}
-		if (request == WeaponRequest::Bow && IsBowEquipped(actor))
+		else if (request == WeaponRequest::Bow && IsBowEquipped(actor))
 		{
 			if (!IsWeaponDrawn(actor)) DoDrawWeapon(actor);
 			data->state = WeaponState::Ready;
@@ -393,7 +813,11 @@ namespace MountedNPCCombatVR
 		
 		// FORCE the switch - NO COOLDOWN CHECK
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-		const char* reqStr = (request == WeaponRequest::Melee) ? "MELEE" : "BOW";
+		const char* reqStr = "UNKNOWN";
+		if (request == WeaponRequest::Melee) reqStr = "MELEE";
+		else if (request == WeaponRequest::Bow) reqStr = "BOW";
+		else if (request == WeaponRequest::Glaive) reqStr = "GLAIVE";
+		
 		_MESSAGE("WeaponState: Actor %08X '%s' FORCING %s switch (bypassing cooldown)", 
 			actor->formID, actorName ? actorName : "Unknown", reqStr);
 		
@@ -498,15 +922,8 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// ORIGINAL WEAPON DETECTION CODE BELOW
 	// ============================================
-
-	// Iron Arrow FormID from Skyrim.esm
-	const UInt32 IRON_ARROW_FORMID = 0x0001397D;
 	
-	// Iron Mace FormID from Skyrim.esm - default weapon for unarmed mounted NPCs
-	const UInt32 IRON_MACE_FORMID = 0x00013982;
-	
-	// Hunting Bow FormID from Skyrim.esm
-	const UInt32 HUNTING_BOW_FORMID = 0x00013985;
+	// (FormID constants moved to top of namespace)
 	
 	// ============================================
 	// Inventory Add Functions
@@ -994,30 +1411,90 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		
-		if (HasMeleeWeaponInInventory(actor)) return false;
+		// ============================================
+		// CHECK IF ACTOR ALREADY HAS A GLAIVE
+		// If so, just equip it - don't add a new one
+		// ============================================
+		TESObjectWEAP* existingGlaive = GetExistingGlaiveFromInventory(actor);
+		if (existingGlaive)
+		{
+			EquipManager* equipManager = EquipManager::GetSingleton();
+			if (equipManager)
+			{
+				BGSEquipSlot* rightSlot = GetRightHandSlot();
+				CALL_MEMBER_FN(equipManager, EquipItem)(actor, existingGlaive, nullptr, 1, rightSlot, true, false, false, nullptr);
+				
+				BSFixedString weaponDrawEvent("WeaponDraw");
+				get_vfunc<bool (*)(IAnimationGraphManagerHolder*, const BSFixedString&)>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, weaponDrawEvent);
+				
+				const char* weaponName = existingGlaive->fullName.name.data;
+				_MESSAGE("WeaponDetection: Equipped existing '%s' on actor %08X", weaponName ? weaponName : "Glaive", actor->formID);
+				return true;
+			}
+		}
 		
-		TESForm* maceForm = LookupFormByID(IRON_MACE_FORMID);
-		if (!maceForm) return false;
+		// ============================================
+		// No existing glaive - try GlaiveDanger.esp first for variety
+		// Falls back to MountedNPCCombat.esp if not available
+		// ============================================
 		
-		TESObjectWEAP* mace = DYNAMIC_CAST(maceForm, TESForm, TESObjectWEAP);
-		if (!mace) return false;
+		// Try GlaiveDanger.esp first
+		TESObjectWEAP* glaive = GetRandomGlaiveFromGlaiveDanger();
 		
-		AddItem_Native(nullptr, 0, actor, maceForm, 1, true);
+		if (glaive)
+		{
+			AddItem_Native(nullptr, 0, actor, glaive, 1, true);
+			
+			EquipManager* equipManager = EquipManager::GetSingleton();
+			if (equipManager)
+			{
+				BGSEquipSlot* rightSlot = GetRightHandSlot();
+				CALL_MEMBER_FN(equipManager, EquipItem)(actor, glaive, nullptr, 1, rightSlot, true, false, false, nullptr);
+				
+				BSFixedString weaponDrawEvent("WeaponDraw");
+				get_vfunc<bool (*)(IAnimationGraphManagerHolder*, const BSFixedString&)>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, weaponDrawEvent);
+				
+				const char* weaponName = glaive->fullName.name.data;
+				_MESSAGE("WeaponDetection: Gave NEW '%s' to actor %08X", weaponName ? weaponName : "Glaive", actor->formID);
+				return true;
+			}
+		}
+		
+		// Fallback to MountedNPCCombat.esp glaive
+		UInt32 glaiveFormID = GetFullFormIdMine(WEAPON_ESP_NAME, MOUNTED_GLAIVE_BASE_FORMID);
+		if (glaiveFormID == 0)
+		{
+			_MESSAGE("WeaponDetection: ERROR - Could not resolve glaive FormID from %s", WEAPON_ESP_NAME);
+			return false;
+		}
+		
+		TESForm* glaiveForm = LookupFormByID(glaiveFormID);
+		if (!glaiveForm)
+		{
+			_MESSAGE("WeaponDetection: ERROR - Could not find glaive form %08X", glaiveFormID);
+			return false;
+		}
+		
+		TESObjectWEAP* fallbackGlaive = DYNAMIC_CAST(glaiveForm, TESForm, TESObjectWEAP);
+		if (!fallbackGlaive)
+		{
+			_MESSAGE("WeaponDetection: ERROR - Glaive form %08X is not a weapon!", glaiveFormID);
+			return false;
+		}
+		
+		// Add to inventory (won't duplicate if already owned)
+		AddItem_Native(nullptr, 0, actor, glaiveForm, 1, true);
 		
 		EquipManager* equipManager = EquipManager::GetSingleton();
 		if (equipManager)
 		{
 			BGSEquipSlot* rightSlot = GetRightHandSlot();
-			CALL_MEMBER_FN(equipManager, EquipItem)(actor, mace, nullptr, 1, rightSlot, true, false, false, nullptr);
+			CALL_MEMBER_FN(equipManager, EquipItem)(actor, fallbackGlaive, nullptr, 1, rightSlot, true, false, false, nullptr);
 			
-			// ============================================
-			// ANIMATION FIX: Send weapon equip animation event
-			// Some horse behavior graphs need explicit animation notifications
-			// to properly show the weapon model
-			// ============================================
 			BSFixedString weaponDrawEvent("WeaponDraw");
 			get_vfunc<bool (*)(IAnimationGraphManagerHolder*, const BSFixedString&)>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, weaponDrawEvent);
 			
+			_MESSAGE("WeaponDetection: Gave default glaive to actor %08X (FormID: %08X)", actor->formID, glaiveFormID);
 			return true;
 		}
 		
@@ -1184,6 +1661,18 @@ namespace MountedNPCCombatVR
 	}
 	
 	// ============================================
+	// CHECK IF WEAPON IS TWO-HANDED
+	// Returns true if the equipped weapon is a two-handed melee weapon
+	// ============================================
+	
+	bool IsTwoHandedWeaponEquipped(Actor* actor)
+	{
+		if (!actor) return false;
+		WeaponType type = GetEquippedWeaponType(actor, false);
+		return (type == WeaponType::TwoHandSword || type == WeaponType::TwoHandAxe);
+	}
+	
+	// ============================================
 	// MELEE HIT DETECTION - SIMPLE DISTANCE BASED
 	// Replaces complex collision system with reliable distance check
 	// ============================================
@@ -1210,6 +1699,16 @@ namespace MountedNPCCombatVR
 		float baseThreshold = targetIsPlayer ? HIT_THRESHOLD_PLAYER : HIT_THRESHOLD_NPC;
 		
 		float effectiveThreshold = baseThreshold + (weaponReach * 0.5f) + MOUNTED_REACH_BONUS;
+		
+		// ============================================
+		// TWO-HANDED WEAPON REACH BONUS
+		// 2H weapons (greatswords, battleaxes) have longer reach when mounted
+		// Uses TwoHandedReachBonus from config (default 80.0)
+		// ============================================
+		if (IsTwoHandedWeaponEquipped(rider))
+		{
+			effectiveThreshold += TwoHandedReachBonus;
+		}
 		
 		return (distance <= effectiveThreshold);
 	}

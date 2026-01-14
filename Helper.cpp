@@ -3,7 +3,6 @@
 #include "CombatStyles.h"
 #include "DynamicPackages.h"
 #include "SpecialDismount.h"
-#include "SingleMountedCombat.h"
 #include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "ArrowSystem.h"
@@ -57,7 +56,7 @@ namespace MountedNPCCombatVR
 	
 	// Maximum distance from player to check NPCs (in game units)
 	// 4000 units = roughly 1 cell distance
-	const float MAX_DISTANCE_FROM_PLAYER = 4000.0f;
+	const float MAX_DISTANCE_FROM_PLAYER = 2000.0f;
 
 	// ============================================
 	// Player World Position Tracking
@@ -703,7 +702,7 @@ namespace MountedNPCCombatVR
 		}
 		
 		// Allocate trampoline memory
-		void* trampMem = g_localTrampoline.Alocate(prologSize + 14);
+		void* trampMem = g_localTrampoline.Allocate(prologSize + 14);
 		unsigned char* tramp = (unsigned char*)trampMem;
 		
 		// Copy the original prolog bytes
