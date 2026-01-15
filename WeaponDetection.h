@@ -31,7 +31,8 @@ namespace MountedNPCCombatVR
 		None,
 		Melee,
 		Bow,
-		Glaive  // Preferred weapon for mounted vs mounted combat
+		Glaive,  // Preferred weapon for mounted vs mounted combat
+		Staff    // Warstaff for MageCaster class riders ONLY
 	};
 	
 	// ============================================
@@ -160,6 +161,12 @@ namespace MountedNPCCombatVR
 	bool GiveDefaultMountedWeapon(Actor* actor);
 	bool GiveDefaultBow(Actor* actor);
 	bool RemoveDefaultBow(Actor* actor);
+	
+	// Staff functions - FOR MAGE CLASS ONLY
+	bool HasStaffInInventory(Actor* actor);
+	bool IsStaffEquipped(Actor* actor);
+	bool GiveWarstaff(Actor* actor);
+	TESObjectWEAP* FindStaffInInventory(Actor* actor);
 	
 	// ============================================
 	// Weapon Node / Hitbox Detection

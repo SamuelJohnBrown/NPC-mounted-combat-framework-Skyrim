@@ -11,6 +11,7 @@
 #include "HorseMountScanner.h"
 #include "CompanionCombat.h"
 #include "SpecialMovesets.h"
+#include "MagicCastingSystem.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
 #include "skse64/GameObjects.h"
@@ -245,6 +246,9 @@ namespace MountedNPCCombatVR
 		// Initialize tactical flee system
 		InitTacticalFlee();
 		
+		// Initialize civilian flee system
+		InitCivilianFlee();
+		
 		g_systemInitialized = true;
 		_MESSAGE("MountedCombat: System initialized (max %d NPCs tracked, config limit: %d)", 
 			MAX_TRACKED_NPCS_ARRAY, MaxTrackedMountedNPCs);
@@ -265,6 +269,12 @@ namespace MountedNPCCombatVR
 		
 		// Shutdown companion combat system
 		ShutdownCompanionCombat();
+		
+		// Shutdown tactical flee system
+		ShutdownTacticalFlee();
+		
+		// Shutdown civilian flee system
+		ShutdownCivilianFlee();
 		
 		g_systemInitialized = false;
 		
@@ -335,6 +345,15 @@ namespace MountedNPCCombatVR
 		
 		// Reset tactical flee system
 		ResetTacticalFlee();
+		
+		// Reset civilian flee system
+		ResetCivilianFlee();
+		
+		// ============================================
+		// RESET MAGIC CASTING SYSTEM
+		// Clear all mage spell casting state
+		// ============================================
+		ResetMagicCastingSystem();
 		
 		// Reset player mounted combat state
 		g_playerInMountedCombat = false;
@@ -474,11 +493,8 @@ namespace MountedNPCCombatVR
 			
 			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED", actorName);
 			
-			Actor* target = nullptr;
-			if (g_thePlayer && (*g_thePlayer))
-			{
-				target = *g_thePlayer;
-			}
+			// Get the captain's actual combat target (not always player!)
+			Actor* target = GetCombatTarget(actor);
 			
 			if (target)
 			{
@@ -488,28 +504,26 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// PRE-ASSIGN MAGES TO RANGED ROLE
-		// Mages ONLY use ranged combat - NEVER switch to melee
-		// They use Captain moveset but retreat instead of melee when close
+		// PRE-ASSIGN MAGES TO USE WARSTAFF
+		// Mages get the warstaff from MountedNPCCombat.esp
+		// This is their primary weapon for mounted combat
 		// ============================================
 		if (data->combatClass == MountedCombatClass::MageCaster)
 		{
-			if (!HasBowInInventory(actor))
+			// Give warstaff if they don't have one
+			if (!HasStaffInInventory(actor))
 			{
-				GiveDefaultBow(actor);
-				_MESSAGE("MountedCombat: Gave Hunting Bow to Mage '%s'", actorName ? actorName : "Unknown");
+				GiveWarstaff(actor);
+				_MESSAGE("MountedCombat: Gave Warstaff to Mage '%s'", actorName ? actorName : "Unknown");
 			}
 			
-			// Use centralized weapon system to switch to bow
-			RequestWeaponSwitch(actor, WeaponRequest::Bow);
+			// Use centralized weapon system to switch to staff
+			RequestWeaponSwitch(actor, WeaponRequest::Staff);
 			
-			_MESSAGE("MountedCombat: Mage '%s' pre-assigned to RANGED (no melee fallback)", actorName ? actorName : "Unknown");
+			_MESSAGE("MountedCombat: Mage '%s' pre-assigned to STAFF combat", actorName ? actorName : "Unknown");
 			
-			Actor* target = nullptr;
-			if (g_thePlayer && (*g_thePlayer))
-			{
-				target = *g_thePlayer;
-			}
+			// Get the mage's actual combat target (not always player!)
+			Actor* target = GetCombatTarget(actor);
 			
 			if (target)
 			{
@@ -530,14 +544,19 @@ namespace MountedNPCCombatVR
 		}
 		else
 		{
-			// For guards/soldiers without a target, default to player if player is in combat nearby
+			// For guards/soldiers without a target, check if they should be hostile to player
+			// Only target player if NPC is actually hostile to them (e.g., player committed crime)
 			if (data->combatClass == MountedCombatClass::GuardMelee ||
 				data->combatClass == MountedCombatClass::SoldierMelee)
 			{
 				if (g_thePlayer && (*g_thePlayer))
 				{
 					Actor* player = *g_thePlayer;
-					if (player->IsInCombat())
+					
+					// Only target player if NPC is hostile to them
+					bool isHostileToPlayer = IsActorHostileToActor(actor, player);
+					
+					if (isHostileToPlayer && player->IsInCombat())
 					{
 						float distance = GetDistanceBetween(actor, player);
 						if (distance < ALLY_ALERT_RANGE)
@@ -551,6 +570,10 @@ namespace MountedNPCCombatVR
 								actor->currentCombatTarget = playerHandle;
 							}
 							actor->flags2 |= Actor::kFlag_kAttackOnSight;
+							
+							const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+							_MESSAGE("MountedCombat: Guard/Soldier '%s' targeting player (is hostile)", 
+								actorName ? actorName : "Unknown");
 						}
 					}
 				}
@@ -597,6 +620,18 @@ namespace MountedNPCCombatVR
 			return;
 		}
 		
+		// ============================================
+		// CRITICAL: EARLY EXIT IF PLAYER IS DEAD
+		// This is the PRIMARY protection against CTD when player dies
+		// All subsystems should also have their own checks but this is first line
+		// ============================================
+		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->IsDead(1))
+		{
+			// Player is dead - skip all processing
+			// The death handler in UpdatePlayerMountedCombatState will clean up
+			return;
+		}
+		
 		// Update delayed arrow fires (200ms delay between animation and arrow spawn)
 		UpdateDelayedArrowFires();
 		
@@ -621,11 +656,17 @@ namespace MountedNPCCombatVR
 		// Update horse mount scanner (independent system for tracking horses near combat NPCs)
 		UpdateHorseMountScanner();
 		
+		// Update NPC mounting detection scanner (logs NPCs mounting horses within 2000 units)
+		UpdateNPCMountingScanner();
+		
 		// Update mounted companion combat (player teammates on horseback)
 		UpdateMountedCompanionCombat();
 		
 		// Update tactical flee system (low health riders may temporarily retreat)
 		UpdateTacticalFlee();
+		
+		// Update civilian flee system (civilians flee from threats)
+		UpdateCivilianFlee();
 		
 		float currentTime = GetCurrentGameTime();
 		
@@ -860,10 +901,20 @@ namespace MountedNPCCombatVR
 					{
 						RemoveMountedProtection(actor);
 						
-						// Clear follow mode on the rider
+						// Clear follow mode on the rider (also clears mage spell state)
 						ClearNPCFollowTarget(actor);
 					}
 				}
+				
+				// ============================================
+				// CLEAR COMBAT STATES FOR THIS NPC
+				// Belt-and-suspenders: also clear directly in case
+				// ClearNPCFollowTarget didn't find the actor in its list
+				// ============================================
+				ResetBowAttackState(formID);
+				ResetRapidFireBowAttack(formID);
+				ResetMageSpellState(formID);
+				ClearWeaponStateData(formID);
 				
 				// ============================================
 				// CRITICAL: Clear the HORSE's movement packages too!
@@ -885,9 +936,17 @@ namespace MountedNPCCombatVR
 							// Clear KeepOffsetFromActor on the horse
 							Actor_ClearKeepOffsetFromActor(mount);
 							
+							// Clear special movesets (charge, stand ground, rapid fire, etc.)
+							ClearAllMovesetData(mountFormID);
+							
 							// Re-evaluate the horse's AI packages so it returns to normal behavior
 							Actor_EvaluatePackage(mount, false, false);
 						}
+					}
+					else
+					{
+						// Horse form not found but still clear moveset data by ID
+						ClearAllMovesetData(mountFormID);
 					}
 				}
 				
@@ -1229,20 +1288,24 @@ namespace MountedNPCCombatVR
 			}
 			
 			// ============================================
-			// FOURTH: For guards with NO hostiles found, check if player is in combat
-			// If player is attacking allies, guards should join in
+			// FOURTH: For guards with NO hostiles found, check if player is hostile
+			// Only target player if guard is actually hostile to them
 			// ============================================
 			if (g_thePlayer && (*g_thePlayer))
 			{
 				Actor* player = *g_thePlayer;
-				if (player->IsInCombat())
+				
+				// Only target player if guard is hostile to them
+				bool isHostileToPlayer = IsActorHostileToActor(actor, player);
+				
+				if (isHostileToPlayer && player->IsInCombat())
 				{
 					float distance = GetDistanceBetween(actor, player);
 					if (distance < ALLY_ALERT_RANGE)
 					{
-						// Player is in combat nearby - they're a valid target
+						// Player is hostile and in combat nearby
 						data->targetFormID = player->formID;
-						_MESSAGE("GetCombatTarget: Guard %08X targeting player (in combat nearby, %.0f units)", 
+						_MESSAGE("GetCombatTarget: Guard %08X targeting player (hostile, in combat nearby, %.0f units)", 
 							actor->formID, distance);
 						return player;
 					}
@@ -1451,9 +1514,7 @@ namespace MountedNPCCombatVR
 				ClearAllMultiRiders();
 				
 				// ============================================
-				// CRITICAL: Reset all special movesets on player death
-				// This clears charge, rapid fire, stand ground, 90-deg turns, etc.
-				// Prevents stale state from carrying over to next combat
+				// CRITICAL: Reset all special moveset
 				// ============================================
 				ResetAllSpecialMovesets();
 				
@@ -1463,13 +1524,41 @@ namespace MountedNPCCombatVR
 				// ============================================
 				ResetCompanionCombat();
 				
+				// ============================================
+				// CRITICAL: Reset tactical and civilian flee on player death
+				// ============================================
+				ResetTacticalFlee();
+				ResetCivilianFlee();
+				
+				// ============================================
+				// CRITICAL: Reset weapon state tracking on player death
+				// Prevents stale FormIDs from causing crashes
+				// ============================================
+				ResetWeaponStateSystem();
+				
+				// ============================================
+				// CRITICAL: Reset arrow system on player death
+				// Clears bow attack data and pending projectiles
+				// ============================================
+				ResetArrowSystem();
+				
+				// ============================================
+				// CRITICAL: Reset magic casting system on player death
+				// Clears spell casting state and delayed casts
+				// ============================================
+				ResetMagicCastingSystem();
+				
+				// ============================================
+				// CRITICAL: Reset dynamic package state on player death
+				// Clears horse movement tracking and follow packages
+				// ============================================
+				ResetDynamicPackageState();
+				
 				// Reset combat state but NOT the dead tracking!
 				g_playerInMountedCombat = false;
 				g_playerTriggeredMountedCombat = false;
 				g_playerWasMountedWhenCombatStarted = false;
 				g_playerInExterior = true;  // Assume exterior until checked
-				g_lastPlayerMountedCombatState = false;
-				g_lastExteriorState = true;
 				// DON'T reset g_playerIsDead or g_lastPlayerDeadState here!
 			}
 			else
@@ -1508,6 +1597,10 @@ namespace MountedNPCCombatVR
 						g_trackedNPCs[i].Reset();
 					}
 				}
+				
+				// Reset flee systems on cell change
+				ResetTacticalFlee();
+				ResetCivilianFlee();
 				
 				// Reset combat state bools
 				g_playerInMountedCombat = false;
@@ -1986,7 +2079,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// HORSE ANIMATION FUNCTIONS (from SingleMountedCombat)
 	// ============================================
-
+	
 	// Use shared GetGameTime() from Helper.h instead of local function
 	static float GetGameTimeSeconds()
 	{
@@ -1996,7 +2089,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// HORSE SPRINT TRACKING
 	// ============================================
-
+	
 	static HorseSprintData* GetOrCreateSprintData(UInt32 horseFormID)
 	{
 		// Find existing
@@ -2057,7 +2150,7 @@ namespace MountedNPCCombatVR
 		else
 		{
 			_MESSAGE("MountedCombat: ERROR - Could not find HORSE_SPRINT_START");
-		}
+			}
 		
 		TESForm* sprintStopForm = LookupFormByID(HORSE_SPRINT_STOP_FORMID);
 		if (sprintStopForm)
@@ -2105,7 +2198,7 @@ namespace MountedNPCCombatVR
 		float currentTime = GetGameTimeSeconds();
 		
 		// Check if already sprinting
-		if (sprintData->isSprinting)
+	 if (sprintData->isSprinting)
 		{
 			// Check if sprint is still valid (within duration)
 			if ((currentTime - sprintData->lastSprintStartTime) < HORSE_SPRINT_DURATION)
@@ -2166,7 +2259,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// HORSE REAR UP ANIMATION
 	// ============================================
-	
+
 	bool PlayHorseRearUpAnimation(Actor* horse)
 	{
 		if (!horse) return false;

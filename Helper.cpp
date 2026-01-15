@@ -8,6 +8,10 @@
 #include "ArrowSystem.h"
 #include "CompanionCombat.h"
 #include "WeaponDetection.h"
+#include "MagicCastingSystem.h"
+#include "HorseMountScanner.h"
+#include "AILogging.h"
+#include "FleeingBehavior.h"
 #include "config.h"
 
 namespace MountedNPCCombatVR
@@ -540,6 +544,29 @@ namespace MountedNPCCombatVR
 		// Reset CompanionCombat system (mounted teammates/followers)
 		ResetCompanionCombat();
 		
+		// Reset WeaponDetection state (weapon state machine, equip tracking)
+		ResetWeaponStateSystem();
+		
+		// Reset MagicCastingSystem (spell casting state, delayed casts)
+		ResetMagicCastingSystem();
+		
+		// Reset HorseMountScanner (dismounted NPCs, available horses tracking)
+		ResetHorseMountScanner();
+		ClearAllDismountedTracking();
+		
+		// Reset NPC Mounting Scanner
+		ResetNPCMountingScanner();
+		
+		// Reset AILogging (obstruction tracking, sheer drop detection)
+		ClearAllObstructionInfo();
+		
+		// Reset FleeingBehavior (tactical flee, civilian flee tracking)
+		ResetTacticalFlee();
+		ResetCivilianFlee();
+		
+		// Reset SpecialDismount (grabbed actors, horse grabs, controller tracking)
+		ShutdownSpecialDismount();
+		
 		_MESSAGE("MountedNPCCombatVR: Mod DEACTIVATED - all state reset");
 	}
 	
@@ -842,6 +869,13 @@ namespace MountedNPCCombatVR
 		// Hot-reload config on every game load
 		loadConfig();
 		
+		// ============================================
+		// CRITICAL: Reset all cached forms on game load
+		// Cached pointers become invalid after load
+		// ============================================
+		ResetArrowSystemCache();
+		ResetMagicCastingSystemCache();
+		
 		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->loadedState)
 		{
 			_MESSAGE("MountedNPCCombatVR: Player loaded successfully - activating mod with delay");
@@ -855,6 +889,10 @@ namespace MountedNPCCombatVR
 		
 		// Hot-reload config on new game
 		loadConfig();
+		
+		// Reset cached forms for new game
+		ResetArrowSystemCache();
+		ResetMagicCastingSystemCache();
 		
 		ActivateModWithDelay();
 	}

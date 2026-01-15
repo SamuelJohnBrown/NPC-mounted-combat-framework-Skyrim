@@ -8,6 +8,7 @@
 #include "MultiMountedCombat.h"  // For RegisterMultiRider
 #include "ArrowSystem.h"  // For ResetBowAttackState
 #include "SpecialMovesets.h"  // For ClearAllMovesetData
+#include "MagicCastingSystem.h"  // For ResetMageSpellState
 
 #include "Helper.h"  // For GetGameTime
 #include "config.h"

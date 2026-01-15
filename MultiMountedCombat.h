@@ -38,6 +38,7 @@ namespace MountedNPCCombatVR
 		float distanceToTarget;
 		float lastRoleCheckTime;
 		float lastRangedSetupTime;  // Rate limit ranged follow setup
+		float rangedMaxDistance;    // Randomized max distance for this rider (prevents stale gameplay)
 		bool hasBow;
 		bool isCompanion;  // True if this is a player's companion (not counted in hostile limit)
 		bool isMageCaster;       // True if this is a mage - NEVER switches to melee
@@ -47,6 +48,7 @@ namespace MountedNPCCombatVR
 			riderFormID(0), horseFormID(0), targetFormID(0),
 			role(MultiCombatRole::None), distanceToTarget(0.0f),
 			lastRoleCheckTime(0.0f), lastRangedSetupTime(0.0f),
+			rangedMaxDistance(0.0f),
 			hasBow(false), isCompanion(false), isMageCaster(false), isValid(false)
 		{}
 		
@@ -59,6 +61,7 @@ namespace MountedNPCCombatVR
 			distanceToTarget = 0.0f;
 			lastRoleCheckTime = 0.0f;
 			lastRangedSetupTime = 0.0f;
+			rangedMaxDistance = 0.0f;
 			hasBow = false;
 			isCompanion = false;
 			isMageCaster = false;

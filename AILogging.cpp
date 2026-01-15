@@ -284,44 +284,92 @@ namespace MountedNPCCombatVR
 	
 	void StopActorCombatAlarm(Actor* actor)
 	{
+		// ============================================
+		// CRITICAL VALIDATION - Prevent CTD from invalid actors
+		// This function is called during combat cleanup and the actor
+		// may have become invalid (unloaded, deleted, etc.)
+		// ============================================
 		if (!actor) return;
+		
+		// Check if actor pointer is valid (basic sanity check)
+		__try
+		{
+			if (actor->formID == 0 || actor->formID == 0xFFFFFFFF)
+			{
+				_MESSAGE("StopActorCombatAlarm: Invalid actor formID - skipping");
+				return;
+			}
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			_MESSAGE("StopActorCombatAlarm: Exception accessing actor - skipping");
+			return;
+		}
+		
+		// Check if actor is still valid and loaded
+		if (!actor->loadedState)
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X is not loaded - skipping", actor->formID);
+			return;
+		}
+		
+		// Check for valid NiNode (required for AI operations)
+		if (!actor->GetNiNode())
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X has no NiNode - skipping", actor->formID);
+			return;
+		}
+		
+		// Check if actor has process manager (required for AI operations)
+		if (!actor->processManager)
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X has no process manager - skipping", actor->formID);
+			return;
+		}
+		
+		// Check if actor is dead - don't try to stop combat for dead actors
+		if (actor->IsDead(1))
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X is dead - skipping", actor->formID);
+			return;
+		}
+		
+		// Check if actor is actually in combat before trying to stop it
+		if (!actor->IsInCombat())
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X is not in combat - skipping", actor->formID);
+			return;
+		}
 		
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		_MESSAGE("StopActorCombatAlarm: Stopping combat for '%s' (%08X)", 
 			actorName ? actorName : "Unknown", actor->formID);
 		
 		// ============================================
-		// STEP 1: Call StopCombatAlarm to clear alarm/crime state
-		// This makes the NPC "forgive" the player
+		// SAFER APPROACH: Clear combat state without calling StopCombatAlarm
+		// The StopCombatAlarm function can cause CTD if called while
+		// CombatBehaviorTree is being processed
 		// ============================================
-		Actor_StopCombatAlarm(0, 0, actor);
 		
-		// ============================================
-		// STEP 2: Clear combat target
-		// This is CRITICAL - without this, the NPC stays "in combat"
-		// ============================================
+		// STEP 1: Clear combat target FIRST before any AI changes
+		// This should make the actor "lose" their target
 		actor->currentCombatTarget = 0;
 		
-		// ============================================
-		// STEP 3: Clear attack-on-sight flag
+		// STEP 2: Clear attack-on-sight flag
 		// Prevents immediate re-aggression
-		// ============================================
 		actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
 		
-		// ============================================
-		// STEP 4: Sheathe weapon to signal combat end
+		// STEP 3: Sheathe weapon to signal combat end
 		// This helps the AI transition back to normal packages
-		// ============================================
 		if (IsWeaponDrawn(actor))
 		{
 			actor->DrawSheatheWeapon(false);
 			_MESSAGE("StopActorCombatAlarm: Sheathing weapon for '%s'", actorName ? actorName : "Unknown");
 		}
 		
-		// ============================================
-		// STEP 5: Force AI re-evaluation
+		// STEP 4: Force AI re-evaluation
 		// This makes the NPC pick up their default package
-		// ============================================
+		// Do this INSTEAD of calling Actor_StopCombatAlarm which can CTD
 		Actor_EvaluatePackage(actor, false, false);
 		
 		// Log final state

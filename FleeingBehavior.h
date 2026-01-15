@@ -44,16 +44,52 @@ namespace MountedNPCCombatVR
 	UInt32 GetFleeingRiderFormID();
 	float GetFleeTimeRemaining(UInt32 riderFormID);
 	
-	// Check if a horse's rider is fleeing
+	// Check if a horse's rider is fleeing (includes both tactical and civilian flee)
 	bool IsHorseRiderFleeing(UInt32 horseFormID);
 
 	// ============================================
-	// Civilian Flee Behavior (Legacy Placeholder)
+	// CIVILIAN FLEE SYSTEM
+	// ============================================
+	// Mounted civilians (merchants, traders, caravans, etc.) 
+	// will flee from any threat until they reach a safe distance
+	// of 2000 units, then reset to default AI behavior.
+	// 
+	// NO combat logic is applied to civilians - only flee package.
+	// ============================================
+	
+	// Initialize civilian flee system
+	void InitCivilianFlee();
+	
+	// Shutdown civilian flee system
+	void ShutdownCivilianFlee();
+	
+	// Reset civilian flee state (on game load)
+	void ResetCivilianFlee();
+	
+	// Check if a rider is a civilian and should flee
+	// Returns true if civilian flee was started or is already active
+	bool ProcessCivilianMountedNPC(Actor* rider, Actor* horse, Actor* threat);
+	
+	// Start civilian flee
+	bool StartCivilianFlee(Actor* rider, Actor* horse, Actor* threat);
+	
+	// Stop civilian flee
+	// resetToDefaultAI: if true, clears combat state and returns to normal AI
+	void StopCivilianFlee(UInt32 riderFormID, bool resetToDefaultAI);
+	
+	// Update all fleeing civilians - call every frame
+	void UpdateCivilianFlee();
+	
+	// Check if a civilian is currently fleeing
+	bool IsCivilianFleeing(UInt32 riderFormID);
+
+	// ============================================
+	// Legacy Namespace - For compatibility
 	// ============================================
 
 	namespace CivilianFlee
 	{
-		// Initialize flee behavior system
+		// Initialize flee behavior system (both tactical and civilian)
 		void InitFleeingBehavior();
 		
 		// Shutdown flee behavior system

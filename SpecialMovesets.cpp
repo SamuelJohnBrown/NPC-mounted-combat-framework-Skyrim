@@ -1074,6 +1074,19 @@ namespace MountedNPCCombatVR
 		// Block if in stand ground
 		if (IsInStandGround(horse->formID)) return false;
 		
+		// ============================================
+		// EXCLUDE CIVILIANS - They flee, not fight
+		// ============================================
+		NiPointer<Actor> rider;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
+		{
+			MountedCombatClass combatClass = DetermineCombatClass(rider.get());
+			if (combatClass == MountedCombatClass::CivilianFlee)
+			{
+				return false;
+			}
+		}
+		
 		// Check distance
 		if (distanceToTarget > REAR_UP_APPROACH_DISTANCE)
 		{
@@ -1148,6 +1161,19 @@ namespace MountedNPCCombatVR
 		
 		// Check if rear up is enabled
 		if (!RearUpEnabled) return false;
+		
+		// ============================================
+		// EXCLUDE CIVILIANS - They flee, not fight
+		// ============================================
+		NiPointer<Actor> rider;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
+		{
+			MountedCombatClass combatClass = DetermineCombatClass(rider.get());
+			if (combatClass == MountedCombatClass::CivilianFlee)
+			{
+				return false;
+			}
+		}
 		
 		// Check if damage exceeds threshold
 		if (damageAmount < REAR_UP_DAMAGE_THRESHOLD)
@@ -1848,7 +1874,7 @@ namespace MountedNPCCombatVR
 				data->sideChosen = true;
 				data->targetFormID = target->formID;
 				
-				// Rate-limit this log message too
+				// // Rate-limit this log message too
 				static UInt32 lastLoggedHorseApproach = 0;
 				static float lastLogTimeApproach = 0;
 				float currentTime = GetGameTime();
@@ -1972,6 +1998,16 @@ namespace MountedNPCCombatVR
 		
 		// Block if in stand ground
 		if (IsInStandGround(horse->formID)) return false;
+		
+		// ============================================
+		// EXCLUDE MAGE CASTERS AND CIVILIANS
+		// Mages don't charge into melee, civilians flee
+		// ============================================
+		MountedCombatClass combatClass = DetermineCombatClass(rider);
+		if (combatClass == MountedCombatClass::MageCaster || combatClass == MountedCombatClass::CivilianFlee)
+		{
+			return false;
+		}
 		
 		// ============================================
 		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
@@ -2255,9 +2291,9 @@ namespace MountedNPCCombatVR
 			data->isValid = true;
 			g_horseRapidFireCount++;
 			return data;
-			}
+		}
 		
-	 return nullptr;
+		return nullptr;
 	}
 	
 	bool IsInRapidFire(UInt32 horseFormID)
@@ -2285,6 +2321,15 @@ namespace MountedNPCCombatVR
 		
 		// Block if in stand ground
 		if (IsInStandGround(horse->formID)) return false;
+		
+		// ============================================
+		// EXCLUDE CIVILIANS - They flee, not fight
+		// ============================================
+		MountedCombatClass combatClass = DetermineCombatClass(rider);
+		if (combatClass == MountedCombatClass::CivilianFlee)
+		{
+			return false;
+		}
 		
 		// ============================================
 		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
@@ -2726,6 +2771,16 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
+		// EXCLUDE MAGE CASTERS AND CIVILIANS
+		// Mages use their own stationary behavior, civilians flee
+		// ============================================
+		MountedCombatClass combatClass = DetermineCombatClass(rider);
+		if (combatClass == MountedCombatClass::MageCaster || combatClass == MountedCombatClass::CivilianFlee)
+		{
+			return false;
+		}
+		
+		// ============================================
 		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
 		// ============================================
 		if (distanceToTarget > SPECIAL_MOVESET_MAX_DISTANCE)
@@ -2958,6 +3013,15 @@ namespace MountedNPCCombatVR
 	{
 		if (!horse || !rider || !currentTarget) return false;
 		
+		// ============================================
+		// EXCLUDE CIVILIANS - They flee, not fight
+		// ============================================
+		MountedCombatClass combatClass = DetermineCombatClass(rider);
+		if (combatClass == MountedCombatClass::CivilianFlee)
+		{
+			return false;
+		}
+		
 		// Only trigger when fighting a NON-PLAYER target
 		if (g_thePlayer && (*g_thePlayer) && currentTarget == (*g_thePlayer))
 		{
@@ -3129,6 +3193,16 @@ namespace MountedNPCCombatVR
 		// Block if rider is fleeing
 		if (IsHorseRiderFleeing(horse->formID)) return false;
 		
+		// ============================================
+		// EXCLUDE MAGE CASTERS AND CIVILIANS
+		// Mages and civilians don't use melee assault
+		// ============================================
+		MountedCombatClass combatClass = DetermineCombatClass(rider);
+		if (combatClass == MountedCombatClass::MageCaster || combatClass == MountedCombatClass::CivilianFlee)
+		{
+			return false;
+		}
+		
 		// Calculate distance to target
 		float dx = target->pos.x - horse->pos.x;
 		float dy = target->pos.y - horse->pos.y;
@@ -3150,7 +3224,7 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// TARGET IS WITHIN RANGE - FORCE MELEE WEAPON!
-		// This OVERRIDES any bow/ranged state
+		// THIS OVERRIDES ANY BOW/RANGED STATE
 		// ============================================
 		if (!IsMeleeEquipped(rider))
 		{

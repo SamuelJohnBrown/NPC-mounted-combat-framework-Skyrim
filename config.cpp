@@ -115,10 +115,16 @@ namespace MountedNPCCombatVR {
 	
 	float RangedRoleMinDistance = 500.0f;       // If closer than this, switch to melee
 	float RangedRoleIdealDistance = 800.0f;     // Ideal distance to hold position
-	float RangedRoleMaxDistance = 1400.0f;      // If further than this, move closer
+	float RangedRoleMaxDistanceMin = 1200.0f;   // Minimum value for randomized max distance
+	float RangedRoleMaxDistanceMax = 1600.0f;   // Maximum value for randomized max distance
 	float RangedPositionTolerance = 100.0f;     // How close to ideal is "close enough"
-	float RangedFireMinDistance = 300.0f;       // Minimum distance to fire bow
-	float RangedFireMaxDistance = 1900.0f;      // Maximum distance to fire bow
+	
+	// Mage combat distance settings (mages use shorter distances than archers)
+	float MageRangedMaxDistanceMin = 400.0f;    // Minimum value for randomized max distance (mages)
+	float MageRangedMaxDistanceMax = 700.0f;    // Maximum value for randomized max distance (mages)
+	
+	float RangedFireMinDistance = 300.0f;    // Minimum distance to fire bow
+	float RangedFireMaxDistance = 1900.0f;    // Maximum distance to fire bow
 	float RoleCheckInterval = 2.0f;             // Time in seconds to re-check roles
 
 	// ============================================
@@ -148,6 +154,33 @@ namespace MountedNPCCombatVR {
 	
 	float MaxCombatDistance = 2000.0f;   // Max distance before NPC disengages
 	float MaxCompanionCombatDistance = 1950.0f;    // Max distance for companions (slightly less)
+
+	// ============================================
+	// MAGE SPELL ORIGIN OFFSET SETTINGS
+	// ============================================
+	// These offsets make spells appear to come from the staff tip
+	// Offsets are relative to caster facing direction
+	
+	float SpellOriginForwardOffset = 100.0f;   // Forward toward target (staff tip reach)
+	float SpellOriginRightOffset = 30.0f;      // Slightly right (staff held in right hand)
+	float SpellOriginUpOffset = 120.0f;      // Up to staff height (mounted rider)
+
+	// ============================================
+	// MAGE SPELL CASTING SETTINGS
+	// ============================================
+	
+	float SpellChargeMinTime = 2.5f;   // Minimum charge time before casting
+	float SpellChargeMaxTime = 3.5f;           // Maximum charge time before casting
+	float SpellCooldownTime = 0.5f;            // Cooldown after cast before next spell
+	float SpellRangeMin = 240.0f;     // Minimum distance for fire-and-forget spells
+	float SpellRangeMax = 2000.0f;    // Maximum distance for fire-and-forget spells
+	float SpellTargetFootHeight = 60.0f;       // Target height offset when on foot
+	float SpellTargetMountedHeight = 120.0f;   // Target height offset when mounted
+	// Mage Concentration Spell Settings (Close Range)
+	float ConcentrationBurstMinTime = 3.0f;    // Minimum burst duration (seconds)
+	float ConcentrationBurstMaxTime = 7.0f;    // Maximum burst duration (seconds)
+	float ConcentrationCooldownTime = 3.0f;    // Cooldown between bursts (seconds)
+	float ConcentrationRangeMax = 240.0f;      // Max range for concentration (same as SpellRangeMin)
 
 	// ============================================
 	// HOSTILE DETECTION SETTINGS
@@ -313,8 +346,11 @@ namespace MountedNPCCombatVR {
 				// Special Rider Combat
 				else if (variableName == "RangedRoleMinDistance") RangedRoleMinDistance = std::stof(variableValueStr);
 				else if (variableName == "RangedRoleIdealDistance") RangedRoleIdealDistance = std::stof(variableValueStr);
-				else if (variableName == "RangedRoleMaxDistance") RangedRoleMaxDistance = std::stof(variableValueStr);
+				else if (variableName == "RangedRoleMaxDistanceMin") RangedRoleMaxDistanceMin = std::stof(variableValueStr);
+				else if (variableName == "RangedRoleMaxDistanceMax") RangedRoleMaxDistanceMax = std::stof(variableValueStr);
 				else if (variableName == "RangedPositionTolerance") RangedPositionTolerance = std::stof(variableValueStr);
+				else if (variableName == "MageRangedMaxDistanceMin") MageRangedMaxDistanceMin = std::stof(variableValueStr);
+				else if (variableName == "MageRangedMaxDistanceMax") MageRangedMaxDistanceMax = std::stof(variableValueStr);
 				else if (variableName == "RangedFireMinDistance") RangedFireMinDistance = std::stof(variableValueStr);
 				else if (variableName == "RangedFireMaxDistance") RangedFireMaxDistance = std::stof(variableValueStr);
 				else if (variableName == "RoleCheckInterval") RoleCheckInterval = std::stof(variableValueStr);
@@ -330,6 +366,23 @@ namespace MountedNPCCombatVR {
 				// Combat Distance
 				else if (variableName == "MaxCombatDistance") MaxCombatDistance = std::stof(variableValueStr);
 				else if (variableName == "MaxCompanionCombatDistance") MaxCompanionCombatDistance = std::stof(variableValueStr);
+				// Mage Spell Origin Offsets
+				else if (variableName == "SpellOriginForwardOffset") SpellOriginForwardOffset = std::stof(variableValueStr);
+				else if (variableName == "SpellOriginRightOffset") SpellOriginRightOffset = std::stof(variableValueStr);
+				else if (variableName == "SpellOriginUpOffset") SpellOriginUpOffset = std::stof(variableValueStr);
+				// Mage Spell Casting Settings
+				else if (variableName == "SpellChargeMinTime") SpellChargeMinTime = std::stof(variableValueStr);
+				else if (variableName == "SpellChargeMaxTime") SpellChargeMaxTime = std::stof(variableValueStr);
+				else if (variableName == "SpellCooldownTime") SpellCooldownTime = std::stof(variableValueStr);
+				else if (variableName == "SpellRangeMin") SpellRangeMin = std::stof(variableValueStr);
+				else if (variableName == "SpellRangeMax") SpellRangeMax = std::stof(variableValueStr);
+				else if (variableName == "SpellTargetFootHeight") SpellTargetFootHeight = std::stof(variableValueStr);
+				else if (variableName == "SpellTargetMountedHeight") SpellTargetMountedHeight = std::stof(variableValueStr);
+				// Mage Concentration Spell Settings (Close Range)
+				else if (variableName == "ConcentrationBurstMinTime") ConcentrationBurstMinTime = std::stof(variableValueStr);
+				else if (variableName == "ConcentrationBurstMaxTime") ConcentrationBurstMaxTime = std::stof(variableValueStr);
+				else if (variableName == "ConcentrationCooldownTime") ConcentrationCooldownTime = std::stof(variableValueStr);
+				else if (variableName == "ConcentrationRangeMax") ConcentrationRangeMax = std::stof(variableValueStr);
 				// Hostile Detection
 				else if (variableName == "HostileDetectionRange") HostileDetectionRange = std::stof(variableValueStr);
 				else if (variableName == "HostileScanInterval") HostileScanInterval = std::stof(variableValueStr);

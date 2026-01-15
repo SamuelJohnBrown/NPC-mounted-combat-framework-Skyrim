@@ -779,7 +779,7 @@ namespace MountedNPCCombatVR
 		float dy = target->pos.y - horse->pos.y;
 		float distanceToTarget = sqrt(dx * dx + dy * dy);
 		
-		const float MAX_FOLLOW_DISTANCE = 8000.0f;  // Don't attempt pathfinding beyond this
+		const float MAX_FOLLOW_DISTANCE = 4100.0f;  // Don't attempt pathfinding beyond this
 		if (distanceToTarget > MAX_FOLLOW_DISTANCE)
 		{
 			_MESSAGE("ForceHorseCombatWithTarget: Target %08X too far (%.0f > %.0f) - skipping follow",
@@ -904,6 +904,19 @@ namespace MountedNPCCombatVR
 		if (IsHorseRiderFleeing(horse->formID))
 		{
 			return 0;  // Skip all processing - flee system handles this horse
+		}
+		
+		// ============================================
+		// CHECK IF CIVILIAN - PROCESS AS FLEE ONLY
+		// Civilians get NO combat logic - only flee package
+		// ============================================
+		NiPointer<Actor> riderForCivilianCheck;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForCivilianCheck) && riderForCivilianCheck)
+		{
+			if (ProcessCivilianMountedNPC(riderForCivilianCheck.get(), horse, target))
+			{
+				return 0;  // Civilian is fleeing - skip all combat logic
+			}
 		}
 		
 		// Validate horse is still valid and has required state
@@ -1770,24 +1783,23 @@ namespace MountedNPCCombatVR
 		if (!rider) return false;
 		
 		// ============================================
-		// MAGES NEVER SWITCH TO MELEE - ALWAYS BOW
-		// Mages use Captain moveset but without melee fallback
-		// When close, they retreat (handled by MultiMountedCombat)
+		// MAGES NEVER SWITCH WEAPONS - STAFF ONLY
+		// Mages equip warstaff once at combat start and keep it
+		// They do NOT switch to bow, melee, or anything else
 		// ============================================
 		MultiRiderData* riderData = GetMultiRiderData(rider->formID);
 		if (riderData && riderData->isMageCaster)
 		{
-			// Mage - always request bow, never melee
-			// Just ensure bow is equipped and drawn
-			if (!IsBowEquipped(rider))
+			// Mage - ensure staff is equipped and drawn, nothing else
+			if (!IsStaffEquipped(rider))
 			{
-				RequestWeaponSwitch(rider, WeaponRequest::Bow);
+				RequestWeaponSwitch(rider, WeaponRequest::Staff);
 			}
 			else if (!IsWeaponDrawn(rider))
 			{
 				RequestWeaponDraw(rider);
 			}
-			return true;
+			return true;  // Exit early - mages don't use distance-based weapon switching
 		}
 		
 		// Use the centralized weapon state machine from WeaponDetection

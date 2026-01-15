@@ -59,4 +59,20 @@ namespace MountedNPCCombatVR
 	
 	// Legacy - no longer needed (poll-based now)
 	void InstallCombatStateHook();
+	
+	// ============================================
+	// NPC MOUNTING DETECTION SCANNER
+	// Logs any NPC within 2000 units that is mounting
+	// or attempting to mount a horse.
+	// Only active in outdoor cells.
+	// ============================================
+	
+	// Update the NPC mounting scanner - call from main update loop
+	void UpdateNPCMountingScanner();
+	
+	// Reset the NPC mounting scanner state
+	void ResetNPCMountingScanner();
+	
+	// Check if NPC mounting scanner is active
+	bool IsNPCMountingScannerActive();
 }

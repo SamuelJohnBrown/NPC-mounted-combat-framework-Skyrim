@@ -9,6 +9,8 @@
 #include "AILogging.h"
 #include "NPCProtection.h"  // For AllowTemporaryStagger
 #include "CompanionCombat.h"  // For IsCompanion
+#include "MagicCastingSystem.h"  // For ResetMageSpellState
+#include "FactionData.h"  // For IsActorHostileToActor
 #include "config.h"  // For MountedAttackStagger settings
 #include "skse64/GameData.h"
 #include "skse64/GameReferences.h"
@@ -631,8 +633,12 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// INITIAL WEAPON EQUIP - USE CENTRALIZED SYSTEM
 		// Use the distance already calculated above
+		// MAGES: Skip - they keep warstaff equipped, no distance-based switching
 		// ============================================
-		RequestWeaponForDistance(actor, distanceToTarget, false);
+		if (!IsRiderMage(actor->formID))
+		{
+			RequestWeaponForDistance(actor, distanceToTarget, false);
+		}
 		
 		// Ensure attack flags are set
 		actor->flags2 |= Actor::kFlag_kAttackOnSight;
@@ -668,8 +674,12 @@ namespace MountedNPCCombatVR
 			ClearInjectedPackages(actor);
 			actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
 			
+			// Clear bow attack states
 			ResetBowAttackState(actor->formID);
 			ResetRapidFireBowAttack(actor->formID);
+			
+			// Clear mage spell states
+			ResetMageSpellState(actor->formID);
 			
 			NiPointer<Actor> mount;
 			if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
@@ -696,13 +706,20 @@ namespace MountedNPCCombatVR
 		{
 			if (g_followingNPCs[i].isValid)
 			{
-				TESForm* form = LookupFormByID(g_followingNPCs[i].actorFormID);
+				UInt32 actorFormID = g_followingNPCs[i].actorFormID;
+				
+				TESForm* form = LookupFormByID(actorFormID);
 				if (form && form->formType == kFormType_Character)
 				{
 					Actor* actor = static_cast<Actor*>(form);
 					ClearInjectedPackages(actor);
 					actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
 				}
+				
+				// Clear bow and mage states (even if actor lookup failed)
+				ResetBowAttackState(actorFormID);
+				ResetRapidFireBowAttack(actorFormID);
+				ResetMageSpellState(actorFormID);
 			}
 			g_followingNPCs[i].isValid = false;
 		}
@@ -719,6 +736,32 @@ namespace MountedNPCCombatVR
 	
 	void UpdateFollowBehavior()
 	{
+		// ============================================
+		// CRITICAL: EARLY EXIT IF PLAYER IS DEAD
+		// Prevents processing actors when game state is invalid
+		// This is the fix for CTD when player dies in mounted combat
+		// ============================================
+		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->IsDead(1))
+		{
+			// Player is dead - clear all tracking and exit immediately
+			// Do NOT call any actor functions - just invalidate entries
+			for (int i = 0; i < 5; i++)
+			{
+				g_followingNPCs[i].isValid = false;
+			}
+			g_followingNPCCount = 0;
+			return;
+		}
+		
+		// ============================================
+		// CRITICAL: EARLY EXIT IF MOD IS NOT ACTIVE
+		// Prevents processing during game transitions
+		// ============================================
+		if (!g_modActive)
+		{
+			return;
+		}
+		
 		float currentTime = GetCurrentGameTime();
 		
 		for (int i = g_followingNPCCount - 1; i >= 0; i--)
@@ -739,6 +782,16 @@ namespace MountedNPCCombatVR
 			}
 			
 			Actor* actor = static_cast<Actor*>(form);
+			
+			// ============================================
+			// CRITICAL: Validate actor is fully loaded
+			// Prevents crashes from accessing unloaded actors
+			// ============================================
+			if (!actor->loadedState || !actor->GetNiNode())
+			{
+				g_followingNPCs[i].isValid = false;
+				continue;
+			}
 			
 			// Safety check - verify actor has process manager
 			if (!actor->processManager)
@@ -794,30 +847,45 @@ namespace MountedNPCCombatVR
 				const float REENGAGE_DISTANCE = 1500.0f;
 				if (playerInCombat && distToPlayer < REENGAGE_DISTANCE)
 				{
-					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-					_MESSAGE("CombatStyles: Rider '%s' (%08X) lost combat state but player still fighting (dist: %.0f) - RE-ENGAGING",
-					(actorName ? actorName : "Unknown"), actor->formID, distToPlayer);
-					
-					// Force re-engage with player
+					// Only re-engage if NPC is actually hostile to player
 					Actor* player = *g_thePlayer;
-					g_followingNPCs[i].targetFormID = player->formID;
-					g_followingNPCs[i].lastTargetSwitchTime = currentTime;
+					bool isHostileToPlayer = IsActorHostileToActor(actor, player);
 					
-					// CRITICAL: Clear weapon switch data to allow immediate re-equip
-					ClearWeaponStateData(actor->formID);
-					
-					// Set combat flags
-					actor->flags2 |= Actor::kFlag_kAttackOnSight;
-					
-					// Update the NPC's combat target to the player
-					UInt32 playerHandle = player->CreateRefHandle();
-					if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+					if (isHostileToPlayer)
 					{
-						actor->currentCombatTarget = playerHandle;
+						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+						_MESSAGE("CombatStyles: Rider '%s' (%08X) lost combat state but hostile to player (dist: %.0f) - RE-ENGAGING",
+						(actorName ? actorName : "Unknown"), actor->formID, distToPlayer);
+						
+						// Force re-engage with player
+						g_followingNPCs[i].targetFormID = player->formID;
+						g_followingNPCs[i].lastTargetSwitchTime = currentTime;
+						
+						// CRITICAL: Clear weapon switch data to allow immediate re-equip
+						ClearWeaponStateData(actor->formID);
+						
+						// Set combat flags
+						actor->flags2 |= Actor::kFlag_kAttackOnSight;
+						
+						// Update the NPC's combat target to the player
+						UInt32 playerHandle = player->CreateRefHandle();
+						if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+						{
+							actor->currentCombatTarget = playerHandle;
+						}
+						
+						// Continue processing this NPC with player as target
+						// Don't clear follow
 					}
-					
-					// Continue processing this NPC with player as target
-					// Don't clear follow
+					else
+					{
+						// Not hostile to player - just clear tracking
+						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+						_MESSAGE("CombatStyles: Rider '%s' (%08X) exited combat, not hostile to player - clearing",
+							actorName ? actorName : "Unknown", actor->formID);
+						ClearNPCFollowTarget(actor);
+						continue;
+					}
 				}
 				else
 				{
@@ -890,6 +958,7 @@ namespace MountedNPCCombatVR
 									actor->DrawSheatheWeapon(true);
 								}
 								
+
 								const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 								const char* targetName = CALL_MEMBER_FN(combatTarget, GetReferenceName)();
 								_MESSAGE("CombatStyles: NPC '%s' (%08X) SWITCHED TARGET to '%s' (%08X) - weapon switch reset",
@@ -937,7 +1006,7 @@ namespace MountedNPCCombatVR
 					else if (target->IsDead(1))
 					{
 						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-						_MESSAGE("CombatStyles: Target died - NPC '%s' switching to PLAYER",
+						_MESSAGE("CombatStyles: Target died - NPC '%s' checking for new target",
 							actorName ? actorName : "Unknown");
 						target = nullptr;
 						g_followingNPCs[i].targetFormID = 0;
@@ -945,25 +1014,41 @@ namespace MountedNPCCombatVR
 						// CRITICAL: Clear weapon state when target dies - allows fresh equip
 						ClearWeaponStateData(actor->formID);
 						
-						// Immediately switch to player if available
+						// Check if NPC is actually hostile to player before switching to them
 						if (g_thePlayer && (*g_thePlayer) && !(*g_thePlayer)->IsDead(1))
 						{
-							target = *g_thePlayer;
-							g_followingNPCs[i].targetFormID = target->formID;
-							g_followingNPCs[i].lastTargetSwitchTime = currentTime;
+							Actor* player = *g_thePlayer;
 							
-							// Update the NPC's actual combat target
-							UInt32 playerHandle = target->CreateRefHandle();
-							if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+							// Only switch to player if NPC is hostile to player
+							bool isHostileToPlayer = IsActorHostileToActor(actor, player);
+							
+							if (isHostileToPlayer)
 							{
-								actor->currentCombatTarget = playerHandle;
+								target = player;
+								g_followingNPCs[i].targetFormID = target->formID;
+								g_followingNPCs[i].lastTargetSwitchTime = currentTime;
+								
+								// Update the NPC's actual combat target
+								UInt32 playerHandle = target->CreateRefHandle();
+								if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+								{
+									actor->currentCombatTarget = playerHandle;
+								}
+								
+								// Ensure attack flags are set
+								actor->flags2 |= Actor::kFlag_kAttackOnSight;
+								
+								_MESSAGE("CombatStyles: NPC '%s' now targeting PLAYER after target death (was hostile)",
+									actorName ? actorName : "Unknown");
 							}
-							
-							// Ensure attack flags are set
-							actor->flags2 |= Actor::kFlag_kAttackOnSight;
-							
-							_MESSAGE("CombatStyles: NPC '%s' now targeting PLAYER after target death",
-								actorName ? actorName : "Unknown");
+							else
+							{
+								// Not hostile to player - just clear tracking, let game AI handle
+								_MESSAGE("CombatStyles: NPC '%s' target died but not hostile to player - clearing tracking",
+									actorName ? actorName : "Unknown");
+								ClearNPCFollowTarget(actor);
+								continue;
+							}
 						}
 					}
 				}
@@ -979,13 +1064,27 @@ namespace MountedNPCCombatVR
 			
 			// ============================================
 			// PRIORITY 3: Default to player if no target
+			// Only if NPC is actually hostile to player!
 			// ============================================
 			if (!target)
 			{
 				if (g_thePlayer && (*g_thePlayer))
 				{
-					target = *g_thePlayer;
-					g_followingNPCs[i].targetFormID = target->formID;
+					Actor* player = *g_thePlayer;
+					
+					// Only target player if NPC is hostile to them
+					if (IsActorHostileToActor(actor, player))
+					{
+						target = player;
+						g_followingNPCs[i].targetFormID = target->formID;
+					}
+					else
+					{
+						// Not hostile to player - clear tracking
+						_MESSAGE("CombatStyles: NPC %08X has no target and not hostile to player - clearing", actor->formID);
+						ClearNPCFollowTarget(actor);
+						continue;
+					}
 				}
 				else
 				{
@@ -1092,8 +1191,23 @@ namespace MountedNPCCombatVR
 			// Skip if weapon is transitioning (sheathing/equipping/drawing)
 			if (!IsWeaponTransitioning(actor))
 			{
+				// ============================================
+				// MAGES: Skip weapon switching - they keep warstaff equipped
+				// ============================================
+				if (IsRiderMage(actor->formID))
+				{
+					// Mage - just ensure staff is equipped and drawn
+					if (!IsStaffEquipped(actor))
+					{
+						RequestWeaponSwitch(actor, WeaponRequest::Staff);
+					}
+					else if (!IsWeaponDrawn(actor))
+					{
+						RequestWeaponDraw(actor);
+					}
+				}
 				// If no melee or bow equipped at all, request weapon based on distance
-				if (!IsMeleeEquipped(actor) && !IsBowEquipped(actor))
+				else if (!IsMeleeEquipped(actor) && !IsBowEquipped(actor))
 				{
 					float dx = target->pos.x - actor->pos.x;
 					float dy = target->pos.y - actor->pos.y;
@@ -1758,7 +1872,7 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-		// Apply damage
+			// Apply damage
 		target->actorValueOwner.RestoreActorValue(Actor::kDamage, AV_Health, -actualDamage);
 		
 		// ============================================
@@ -1805,7 +1919,7 @@ namespace MountedNPCCombatVR
 			if (blockType == 2)
 			{
 				PlaySoundAtActor(SOUND_SHIELD_BLOCK, target);  // Shield block sound
-			}
+						}
 			else
 			{
 				PlaySoundAtActor(SOUND_WEAPON_BLOCK, target);  // Weapon block sound

@@ -557,8 +557,8 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// CHECK NPC NAME FIRST - Highest Priority
-		// NPCs with "Mage" in their name should be MageCaster
-		// regardless of their faction membership
+		// NPCs with specific keywords in their name should be
+		// classified accordingly regardless of faction
 		// ============================================
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		if (actorName && strlen(actorName) > 0)
@@ -566,7 +566,7 @@ namespace MountedNPCCombatVR
 			std::string nameStr = actorName;
 			std::transform(nameStr.begin(), nameStr.end(), nameStr.begin(), ::tolower);
 			
-			// Check for mage-related names (highest priority)
+			// Check for mage-related names (highest priority for combat class)
 			if (nameStr.find("mage") != std::string::npos ||
 				nameStr.find("wizard") != std::string::npos ||
 				nameStr.find("warlock") != std::string::npos ||
@@ -577,6 +577,25 @@ namespace MountedNPCCombatVR
 				nameStr.find("electromancer") != std::string::npos)
 			{
 				return MountedCombatClass::MageCaster;
+			}
+			
+			// Check for civilian-related names (flee behavior)
+			if (nameStr.find("merchant") != std::string::npos ||
+				nameStr.find("trader") != std::string::npos ||
+				nameStr.find("caravan") != std::string::npos ||
+				nameStr.find("civilian") != std::string::npos ||
+				nameStr.find("farmer") != std::string::npos ||
+				nameStr.find("pilgrim") != std::string::npos ||
+				nameStr.find("traveler") != std::string::npos ||
+				nameStr.find("traveller") != std::string::npos ||
+				nameStr.find("peddler") != std::string::npos ||
+				nameStr.find("vendor") != std::string::npos ||
+				nameStr.find("shopkeeper") != std::string::npos ||
+				nameStr.find("innkeeper") != std::string::npos ||
+				nameStr.find("bard") != std::string::npos ||
+				nameStr.find("courier") != std::string::npos)
+			{
+				return MountedCombatClass::CivilianFlee;
 			}
 		}
 		

@@ -8,6 +8,7 @@
 #include "WeaponDetection.h"
 #include "ArrowSystem.h"
 #include "SpecialMovesets.h"
+#include "MagicCastingSystem.h"  // For ResetMageSpellState
 #include "skse64/GameReferences.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -478,6 +479,12 @@ namespace MountedNPCCombatVR
 		// Prevents stuck bow draw state after dismount
 		// ============================================
 		ResetBowAttackState(target->formID);
+		
+		// ============================================
+		// CRITICAL: Clear any pending mage spell casting
+		// Prevents stuck spell casting state after dismount
+		// ============================================
+		ResetMageSpellState(target->formID);
 		
 		// ============================================
 		// CRITICAL: Clear horse's special movesets

@@ -8,6 +8,8 @@
 #include "Helper.h"
 #include "SpecialDismount.h"
 #include "HorseMountScanner.h"
+#include "skse64/GameMenus.h"  // For MenuManager, MenuOpenCloseEvent
+#include "skse64/GameEvents.h" // For BSTEventSink
 
 #include "skse64_common/BranchTrampoline.h"
 
@@ -36,6 +38,99 @@ namespace MountedNPCCombatVR
 	#pragma comment(lib, "Ws2_32.lib")
 
 	// ============================================
+	// MENU EVENT HANDLER - Hot reload config on menu close
+	// ============================================
+	class MenuOpenCloseHandler : public BSTEventSink<MenuOpenCloseEvent>
+	{
+	public:
+		virtual EventResult ReceiveEvent(MenuOpenCloseEvent* evn, EventDispatcher<MenuOpenCloseEvent>* dispatcher) override
+		{
+			if (!evn) return kEvent_Continue;
+			
+			// Only reload on menu CLOSE (not open)
+			if (!evn->opening)
+			{
+				// Check for menus where user might have changed settings
+				// Journal Menu = Pause menu in VR (contains System)
+				// Console Menu = Debug console
+				// MCM menus typically have "MCM" in name or use custom menus
+				const char* menuName = evn->menuName.data;
+				
+				if (menuName)
+				{
+					bool shouldReload = false;
+					
+					// Journal Menu (pause menu) - most common place to change INI
+					if (strcmp(menuName, "Journal Menu") == 0)
+					{
+						shouldReload = true;
+					}
+					// System pause menu 
+					else if (strcmp(menuName, "System Menu") == 0)
+					{
+						shouldReload = true;
+					}
+					// Console - user might have reloaded INI via console
+					else if (strcmp(menuName, "Console") == 0)
+					{
+						shouldReload = true;
+					}
+					// Main Menu - returning from main menu
+					else if (strcmp(menuName, "Main Menu") == 0)
+					{
+						shouldReload = true;
+					}
+					
+					if (shouldReload)
+					{
+						_MESSAGE("MenuHandler: '%s' closed - hot-reloading config", menuName);
+						loadConfig();
+					}
+				}
+			}
+			
+			return kEvent_Continue;
+		}
+	};
+	
+	static MenuOpenCloseHandler g_menuHandler;
+	static bool g_menuHandlerRegistered = false;
+	
+	void RegisterMenuHandler()
+	{
+		if (g_menuHandlerRegistered) return;
+		
+		MenuManager* mm = MenuManager::GetSingleton();
+		if (mm)
+		{
+			EventDispatcher<MenuOpenCloseEvent>* dispatcher = mm->MenuOpenCloseEventDispatcher();
+			if (dispatcher)
+			{
+				dispatcher->AddEventSink(&g_menuHandler);
+				g_menuHandlerRegistered = true;
+				_MESSAGE("MenuHandler: Registered for menu open/close events (config hot-reload enabled)");
+			}
+		}
+	}
+	
+	void UnregisterMenuHandler()
+	{
+		if (!g_menuHandlerRegistered) return;
+		
+		MenuManager* mm = MenuManager::GetSingleton();
+		if (mm)
+		{
+			EventDispatcher<MenuOpenCloseEvent>* dispatcher = mm->MenuOpenCloseEventDispatcher();
+			if (dispatcher)
+			{
+				dispatcher->RemoveEventSink(&g_menuHandler);
+				g_menuHandlerRegistered = false;
+				_MESSAGE("MenuHandler: Unregistered from menu events");
+			}
+		}
+	}
+
+	// ============================================
 	// START MOD (moved from Engine.cpp)
 	// ============================================
 	void StartMod()
@@ -57,8 +152,9 @@ namespace MountedNPCCombatVR
 	void SetupReceptors()
 	{
 		_MESSAGE("Building Event Sinks...");
-
 		
+		// Register menu handler for config hot-reload
+		RegisterMenuHandler();
 	}
 
 	extern "C" {

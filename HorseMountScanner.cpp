@@ -1529,5 +1529,322 @@ namespace MountedNPCCombatVR
 	bool IsScannerActive() { return g_scannerActive; }
 	int GetLastScanHorseCount() { return g_lastScanHorseCount; }
 	void InstallCombatStateHook() { _MESSAGE("HorseMountScanner: Poll-based (no hooks)"); }
+	
+	// ============================================
+	// NPC MOUNTING DETECTION SCANNER
+	// Logs any NPC within 2000 units that is mounting
+	// or attempting to mount a horse.
+	// Only active in outdoor cells.
+	// ============================================
+	
+	const float NPC_MOUNT_SCAN_RANGE = 2000.0f;
+	const float NPC_MOUNT_SCAN_INTERVAL = 1.0f;  // Check every 1 second
+	
+	static float g_lastMountScanTime = 0.0f;
+	static bool g_mountScannerActive = false;
+	
+	// Track NPCs we've already logged mounting to avoid spam
+	struct MountingNPCEntry
+	{
+		UInt32 npcFormID;
+		UInt32 horseFormID;
+		float detectedTime;
+		bool isValid;
+		
+		void Reset()
+		{
+			npcFormID = 0;
+			horseFormID = 0;
+			detectedTime = 0;
+			isValid = false;
+		}
+	};
+	
+	const int MAX_MOUNTING_NPCS = 20;
+	static MountingNPCEntry g_mountingNPCs[MAX_MOUNTING_NPCS];
+	static int g_mountingNPCCount = 0;
+	
+	// Check if we've already logged this NPC mounting this horse recently
+	static bool AlreadyLoggedMounting(UInt32 npcFormID, UInt32 horseFormID)
+	{
+		float currentTime = GetGameTime();
+		
+		for (int i = 0; i < MAX_MOUNTING_NPCS; i++)
+		{
+			if (g_mountingNPCs[i].isValid && 
+			    g_mountingNPCs[i].npcFormID == npcFormID &&
+			    g_mountingNPCs[i].horseFormID == horseFormID)
+			{
+				// Already logged - check if it's been more than 30 seconds
+				if ((currentTime - g_mountingNPCs[i].detectedTime) > 30.0f)
+				{
+					// Old entry, update it and allow re-logging
+					g_mountingNPCs[i].detectedTime = currentTime;
+					return false;
+				}
+				return true;  // Recently logged
+			}
+		}
+		return false;
+	}
+	
+	// Register that we logged this NPC mounting
+	static void RegisterMountingLog(UInt32 npcFormID, UInt32 horseFormID)
+	{
+		float currentTime = GetGameTime();
+		
+		// Check if already in list
+		for (int i = 0; i < MAX_MOUNTING_NPCS; i++)
+		{
+			if (g_mountingNPCs[i].isValid && 
+			    g_mountingNPCs[i].npcFormID == npcFormID &&
+			    g_mountingNPCs[i].horseFormID == horseFormID)
+			{
+				g_mountingNPCs[i].detectedTime = currentTime;
+				return;
+			}
+		}
+		
+		// Find empty slot
+		for (int i = 0; i < MAX_MOUNTING_NPCS; i++)
+		{
+			if (!g_mountingNPCs[i].isValid)
+			{
+				g_mountingNPCs[i].npcFormID = npcFormID;
+				g_mountingNPCs[i].horseFormID = horseFormID;
+				g_mountingNPCs[i].detectedTime = currentTime;
+				g_mountingNPCs[i].isValid = true;
+				g_mountingNPCCount++;
+				return;
+			}
+		}
+		
+		// No empty slot - overwrite oldest
+		float oldestTime = currentTime;
+		int oldestIdx = 0;
+		for (int i = 0; i < MAX_MOUNTING_NPCS; i++)
+		{
+			if (g_mountingNPCs[i].detectedTime < oldestTime)
+			{
+				oldestTime = g_mountingNPCs[i].detectedTime;
+				oldestIdx = i;
+			}
+		}
+		g_mountingNPCs[oldestIdx].npcFormID = npcFormID;
+		g_mountingNPCs[oldestIdx].horseFormID = horseFormID;
+		g_mountingNPCs[oldestIdx].detectedTime = currentTime;
+		g_mountingNPCs[oldestIdx].isValid = true;
+	}
+	
+	// Clear mounting detection tracking
+	static void ClearMountingTracking()
+	{
+		for (int i = 0; i < MAX_MOUNTING_NPCS; i++)
+		{
+			g_mountingNPCs[i].Reset();
+		}
+		g_mountingNPCCount = 0;
+	}
+	
+	// Check if an NPC is in the process of mounting (has mount but is in mounting animation state)
+	static bool IsNPCMounting(Actor* actor, Actor** outHorse)
+	{
+		if (!actor) return false;
+		if (outHorse) *outHorse = nullptr;
+		
+		// Check if NPC is mounted
+		NiPointer<Actor> mount;
+		if (!CALL_MEMBER_FN(actor, GetMount)(mount) || !mount)
+		{
+			// Not mounted - check if they're near a horse and in a mounting state
+			// Check actorState for mounting animation
+			// This is tricky - we need to detect when they're transitioning to mounted
+			return false;
+		}
+		
+		if (outHorse) *outHorse = mount.get();
+		
+		// Check if they just recently mounted (within last few seconds)
+		// We can detect this by checking if their mount relationship is new
+		// For now, return true if they have a mount - the caller will filter
+		return true;
+	}
+	
+	// Check if an NPC is approaching a horse to mount (near horse, not mounted, facing horse)
+	static bool IsNPCApproachingToMount(Actor* actor, Actor** outHorse)
+	{
+		if (!actor) return false;
+		if (outHorse) *outHorse = nullptr;
+		
+		// Skip if already mounted
+		if (IsActorMounted(actor)) return false;
+		
+		// Skip if dead
+		if (actor->IsDead(1)) return false;
+		
+		// Get player for range check
+		if (!g_thePlayer || !(*g_thePlayer)) return false;
+		Actor* player = *g_thePlayer;
+		
+		TESObjectCELL* cell = player->parentCell;
+		if (!cell) return false;
+		
+		// Find nearest unridden horse to this NPC
+		Actor* nearestHorse = nullptr;
+		float nearestDist = 99999.0f;
+		
+		for (UInt32 i = 0; i < cell->objectList.count; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			if (ref->formType != kFormType_Character) continue;
+			
+			Actor* potentialHorse = static_cast<Actor*>(ref);
+			
+			// Check if it's a horse
+			if (!IsHorseRace(potentialHorse)) continue;
+			
+			// Check if horse is alive
+			if (potentialHorse->IsDead(1)) continue;
+			
+			// Check if horse has no rider
+			if (IsHorseRidden(potentialHorse)) continue;
+			
+			// Calculate distance from NPC to horse
+			float dist = CalculateDistance3D(actor, potentialHorse);
+			
+			if (dist < nearestDist && dist < 300.0f)  // Within 300 units
+			{
+				nearestDist = dist;
+				nearestHorse = potentialHorse;
+			}
+		}
+		
+		if (nearestHorse && nearestDist < 300.0f)
+		{
+			if (outHorse) *outHorse = nearestHorse;
+			return true;
+		}
+		
+		return false;
+	}
+	
+	// Main NPC mounting scanner update
+	void UpdateNPCMountingScanner()
+	{
+		// Only run in outdoor cells
+		if (!IsOutdoorCell())
+		{
+			if (g_mountScannerActive)
+			{
+				_MESSAGE("NPCMountScanner: Interior cell - deactivated");
+				g_mountScannerActive = false;
+				ClearMountingTracking();
+			}
+			return;
+		}
+		
+		if (!g_thePlayer || !(*g_thePlayer)) return;
+		Actor* player = *g_thePlayer;
+		
+		TESObjectCELL* cell = player->parentCell;
+		if (!cell) return;
+		
+		float currentTime = GetGameTime();
+		
+		// Rate limit scanning
+		if ((currentTime - g_lastMountScanTime) < NPC_MOUNT_SCAN_INTERVAL) return;
+		g_lastMountScanTime = currentTime;
+		
+		g_mountScannerActive = true;
+		
+		// Scan all NPCs in cell
+		for (UInt32 i = 0; i < cell->objectList.count; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			if (ref->formType != kFormType_Character) continue;
+			
+			Actor* actor = static_cast<Actor*>(ref);
+			
+			// Skip player
+			if (actor->IsPlayerRef()) continue;
+			if (actor == player) continue;
+			
+			// Skip dead
+			if (actor->IsDead(1)) continue;
+			
+			// Skip if not humanoid
+			if (!IsHumanoidNPC(actor)) continue;
+			
+			// Check distance to player
+			float distToPlayer = CalculateDistanceToPlayer(actor);
+			if (distToPlayer > NPC_MOUNT_SCAN_RANGE) continue;
+			
+			// Check if NPC is currently mounted
+			Actor* mount = nullptr;
+			NiPointer<Actor> mountPtr;
+			if (CALL_MEMBER_FN(actor, GetMount)(mountPtr) && mountPtr)
+			{
+				mount = mountPtr.get();
+				
+				// Check if we've already logged this mount event
+				if (!AlreadyLoggedMounting(actor->formID, mount->formID))
+				{
+					const char* npcName = CALL_MEMBER_FN(actor, GetReferenceName)();
+					const char* horseName = CALL_MEMBER_FN(mount, GetReferenceName)();
+					
+					_MESSAGE("NPCMountScanner: *** NPC MOUNTED ***");
+					_MESSAGE("  NPC: '%s' (%08X)", npcName ? npcName : "Unknown", actor->formID);
+					_MESSAGE("  Horse: '%s' (%08X)", horseName ? horseName : "Horse", mount->formID);
+					_MESSAGE("  Distance to player: %.0f units", distToPlayer);
+					
+					RegisterMountingLog(actor->formID, mount->formID);
+				}
+			}
+			else
+			{
+				// Not mounted - check if approaching a horse to mount
+				Actor* targetHorse = nullptr;
+				if (IsNPCApproachingToMount(actor, &targetHorse) && targetHorse)
+				{
+					// Check if we've already logged this approach
+					if (!AlreadyLoggedMounting(actor->formID, targetHorse->formID))
+					{
+						const char* npcName = CALL_MEMBER_FN(actor, GetReferenceName)();
+						const char* horseName = CALL_MEMBER_FN(targetHorse, GetReferenceName)();
+						float distToHorse = CalculateDistance3D(actor, targetHorse);
+						
+						_MESSAGE("NPCMountScanner: *** NPC APPROACHING HORSE ***");
+						_MESSAGE("  NPC: '%s' (%08X)", npcName ? npcName : "Unknown", actor->formID);
+						_MESSAGE("  Horse: '%s' (%08X)", horseName ? horseName : "Horse", targetHorse->formID);
+						_MESSAGE("  Distance to horse: %.0f units", distToHorse);
+						_MESSAGE("  Distance to player: %.0f units", distToPlayer);
+						
+						RegisterMountingLog(actor->formID, targetHorse->formID);
+					}
+				}
+			}
+		}
+	}
+	
+	// Reset the NPC mounting scanner
+	void ResetNPCMountingScanner()
+	{
+		g_lastMountScanTime = 0.0f;
+		g_mountScannerActive = false;
+		ClearMountingTracking();
+		_MESSAGE("NPCMountScanner: Reset");
+	}
+	
+	// Check if NPC mounting scanner is active
+	bool IsNPCMountingScannerActive()
+	{
+		return g_mountScannerActive;
+	}
 }
 
