@@ -27,7 +27,7 @@ namespace MountedNPCCombatVR
 	// MAXIMUM DISTANCE FOR ALL SPECIAL MOVESET
 	// Don't trigger any special moveset if target is beyond this distance
 	// ============================================
-	const float SPECIAL_MOVESET_MAX_DISTANCE = 1800.0f;
+	const float SPECIAL_MOVESET_MAX_DISTANCE = 1700.0f;
 	
 	// Rear up on approach (facing target head-on)
 	// REAR_UP_APPROACH_CHANCE now uses RearUpApproachChance from config
@@ -46,11 +46,6 @@ namespace MountedNPCCombatVR
 	const UInt32 HORSE_JUMP_BASE_FORMID = 0x0008E6;  // From MountedNPCCombat.esp
 	const char* HORSE_JUMP_ESP_NAME = "MountedNPCCombat.esp";
 	const float HORSE_JUMP_COOLDOWN = 4.0f;  // 4 seconds between jump attempts
-	
-	// Horse trot turns (obstruction avoidance) - From Skyrim.esm
-	const UInt32 HORSE_TROT_LEFT_FORMID = 0x00056DAA;   // Trot forward to trot left
-	const UInt32 HORSE_TROT_RIGHT_FORMID = 0x00052728;  // Trot forward to trot right
-	const float HORSE_TROT_TURN_COOLDOWN = 2.0f;  // 2 seconds between trot turns (increased from 0.5)
 	
 	// Charge maneuver configuration (some now loaded from INI)
 	// CHARGE_MIN_DISTANCE, CHARGE_MAX_DISTANCE, CHARGE_COOLDOWN, CHARGE_CHANCE_PERCENT from config
@@ -90,17 +85,16 @@ namespace MountedNPCCombatVR
 	// Global rear up tracking (prevents synchronized rear ups)
 	static float g_lastGlobalRearUpTime = -8.0f;  // Initialize to allow immediate first use
 	
+	// Global rapid fire tracking (prevents synchronized rapid fires)
+	const float RAPID_FIRE_GLOBAL_COOLDOWN = 10.0f;  // 10 seconds global cooldown - no horse can rapid fire if ANY horse is rapid firing recently
+	static float g_lastGlobalRapidFireTime = -10.0f;  // Initialize to allow immediate first use
+	
 	const int MAX_TRACKED_HORSES = 10;  // Array size (hardcoded max for memory safety)
 	// Actual runtime limit uses MaxTrackedMountedNPCs from config
 	
 	// Cached horse jump idle
 	static TESIdleForm* g_horseJumpIdle = nullptr;
 	static bool g_jumpIdleInitialized = false;
-	
-	// Cached horse trot turn idles
-	static TESIdleForm* g_horseTrotLeftIdle = nullptr;
-	static TESIdleForm* g_horseTrotRightIdle = nullptr;
-	 static bool g_trotIdlesInitialized = false;
 	
 	// Rear up tracking per horse
 	struct HorseRearUpTracking
@@ -133,40 +127,10 @@ namespace MountedNPCCombatVR
 		UInt32 horseFormID;
 		float lastJumpTime;
 		bool isValid;
-		// Elevated target tracking
-		int jumpAttemptsInArea;       // Number of jumps while stuck in same area
-		NiPoint3 firstJumpPosition;   // Position when first jump was made
-		float firstJumpTime;          // When first jump in this area was made
-		// General stuck tracking (time-based)
-		float jumpTimestamps[3];      // Timestamps of last 3 jumps
-		int jumpTimestampIndex;    // Current index in circular buffer
 	};
 	
 	static HorseJumpData g_horseJumpData[MAX_TRACKED_HORSES];
 	static int g_horseJumpCount = 0;
-	
-	// Horse trot turn cooldown tracking
-	struct HorseTrotTurnData
-	{
-		UInt32 horseFormID;
-		float lastTrotTurnTime;
-		bool isValid;
-	};
-	
-	static HorseTrotTurnData g_horseTrotTurnData[MAX_TRACKED_HORSES];
-	static int g_horseTrotTurnCount = 0;
-	
-	// Adjacent riding tracking per horse (for mounted vs mounted combat)
-	struct HorseAdjacentRidingData
-	{
-		UInt32 horseFormID;
-		bool ridingOnRightSide;    // true = ride on target's right, false = left
-		bool sideChosen;    // true once a side has been selected
-		bool isValid;
-	};
-	
-	static HorseAdjacentRidingData g_horseAdjacentData[MAX_TRACKED_HORSES];
-	static int g_horseAdjacentCount = 0;
 	
 	// Charge maneuver tracking per horse
 	enum class ChargeState
@@ -257,10 +221,10 @@ namespace MountedNPCCombatVR
 	// When fighting a non-player NPC and player is nearby,
 	// occasionally switch targets to the player with a charge.
 	
-	const float PLAYER_AGGRO_SWITCH_RANGE = 900.0f;      // Player must be within this range (reduced from 1500)
-	const int PLAYER_AGGRO_SWITCH_CHANCE_MAX = 15;    // 15% chance at closest range
-	const int PLAYER_AGGRO_SWITCH_CHANCE_MIN = 2;        // 2% chance at max range
-	const float PLAYER_AGGRO_SWITCH_INTERVAL = 20.0f;    // Check every 20 seconds
+	const float PLAYER_AGGRO_SWITCH_RANGE = 450.0f;      // Player must be within this range (reduced from 1500)
+	const int PLAYER_AGGRO_SWITCH_CHANCE_MAX = 3;        // 3% chance at close range
+	const int PLAYER_AGGRO_SWITCH_CHANCE_MIN = 1;      // 1% chance at max range
+	const float PLAYER_AGGRO_SWITCH_INTERVAL = 25.0f;    // Check every 20 seconds
 	
 	struct PlayerAggroSwitchData
 	{
@@ -291,30 +255,6 @@ namespace MountedNPCCombatVR
 	static int g_closeRangeMeleeAssaultCount = 0;
 	
 	// ============================================
-	// ELEVATED TARGET DETECTION CONSTANTS
-	// ============================================
-	const float ELEVATED_TARGET_HEIGHT_THRESHOLD = 250.0f;  // Target must be 150+ units above horse
-	const float STUCK_AREA_RADIUS = 30.0f;  // Consider "same area" if within 100 units
-	const int MAX_JUMP_ATTEMPTS_BEFORE_DISMOUNT = 2;  // Dismount after 2 failed jumps (elevated target)
-	const int MAX_JUMP_ATTEMPTS_STUCK = 3;  // Dismount after 3 failed jumps (general stuck)
-	const float STUCK_JUMP_TIME_WINDOW = 20.0f;  // 3 jumps within 20 seconds = stuck
-	const float COMBAT_DISMOUNT_REMOUNT_COOLDOWN = 45.0f;  // Can remount after 45 seconds
-	const float REMOUNT_DISTANCE_THRESHOLD = 250.0f;  // Must be within 250 units of horse to remount
-	
-	// Combat dismount tracking
-	struct CombatDismountData
-	{
-		UInt32 riderFormID;
-		UInt32 horseFormID;
-		float dismountTime;
-		bool canRemount;
-		bool isValid;
-	};
-	
-	static CombatDismountData g_combatDismountData[MAX_TRACKED_HORSES];
-	static int g_combatDismountCount = 0;
-	
-	// ============================================
 	// MOBILE TARGET INTERCEPT DATA
 	// ============================================
 	struct MobileInterceptData
@@ -329,8 +269,7 @@ namespace MountedNPCCombatVR
 	static MobileInterceptData g_mobileInterceptData[MAX_TRACKED_HORSES];
 	static int g_mobileInterceptCount = 0;
 	
-	// Forward declaration for InitTrotIdles (defined later in this file)
-	static void InitTrotIdles();
+	// Forward declaration for InitTrotIdles REMOVED - trot turn system no longer in use
 	
 	// ============================================
 	// UTILITY FUNCTIONS
@@ -437,6 +376,9 @@ namespace MountedNPCCombatVR
 		// Reset global rear up cooldown
 		g_lastGlobalRearUpTime = -REAR_UP_GLOBAL_COOLDOWN;
 		
+		// Reset global rapid fire cooldown
+		g_lastGlobalRapidFireTime = -RAPID_FIRE_GLOBAL_COOLDOWN;
+		
 		// Clear rear up tracking data
 		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
 		{
@@ -461,41 +403,10 @@ namespace MountedNPCCombatVR
 			g_horseJumpData[i].isValid = false;
 			g_horseJumpData[i].horseFormID = 0;
 			g_horseJumpData[i].lastJumpTime = -HORSE_JUMP_COOLDOWN;
-			g_horseJumpData[i].jumpAttemptsInArea = 0;
-			g_horseJumpData[i].firstJumpPosition = NiPoint3();
-			g_horseJumpData[i].firstJumpTime = 0;
-			for (int j = 0; j < 3; j++)
-			{
-				g_horseJumpData[i].jumpTimestamps[j] = -STUCK_JUMP_TIME_WINDOW;
-			}
-			g_horseJumpData[i].jumpTimestampIndex = 0;
 		}
 		g_horseJumpCount = 0;
 		
-		// Clear combat dismount data
-		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
-		{
-			g_combatDismountData[i].isValid = false;
-			g_combatDismountData[i].riderFormID = 0;
-			g_combatDismountData[i].horseFormID = 0;
-			g_combatDismountData[i].dismountTime = 0;
-			g_combatDismountData[i].canRemount = false;
-		}
-		g_combatDismountCount = 0;
-		
-		// Clear trot turn cooldown data
-		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
-		{
-			g_horseTrotTurnData[i].isValid = false;
-		}
-		g_horseTrotTurnCount = 0;
-		
-		// Clear adjacent riding data
-		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
-		{
-			g_horseAdjacentData[i].isValid = false;
-		}
-		g_horseAdjacentCount = 0;
+		// Combat dismount data - REMOVED (system no longer exists)
 		
 		// Clear charge data
 		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
@@ -540,10 +451,8 @@ namespace MountedNPCCombatVR
 		
 		// Reset initialization flags so idles can be re-cached if needed
 		g_jumpIdleInitialized = false;
-		g_trotIdlesInitialized = false;
 		g_horseJumpIdle = nullptr;
-		g_horseTrotLeftIdle = nullptr;
-		g_horseTrotRightIdle = nullptr;
+		// Trot turn idles removed - system no longer in use
 		
 		_MESSAGE("SpecialMovesets: All state reset complete");
 	}
@@ -559,16 +468,12 @@ namespace MountedNPCCombatVR
 			g_horseRearUpTracking[i].isValid = false;
 			g_horseTurnData[i].isValid = false;
 			g_horseJumpData[i].isValid = false;
-			g_horseTrotTurnData[i].isValid = false;
-			g_horseAdjacentData[i].isValid = false;
 			g_horseChargeData[i].isValid = false;
 			g_horseRapidFireData[i].isValid = false;
 		}
 		g_horseRearUpCount = 0;
 		g_horseTurnCount = 0;
 		g_horseJumpCount = 0;
-		g_horseTrotTurnCount = 0;
-		g_horseAdjacentCount = 0;
 		g_horseChargeCount = 0;
 		g_horseRapidFireCount = 0;
 		
@@ -597,16 +502,6 @@ namespace MountedNPCCombatVR
 			data->horseFormID = horseFormID;
 			data->lastJumpTime = -HORSE_JUMP_COOLDOWN;  // Allow immediate first use
 			data->isValid = true;
-			// Initialize elevated target tracking
-		 data->jumpAttemptsInArea = 0;
-		 data->firstJumpPosition = NiPoint3();
-		 data->firstJumpTime = 0;
-			// Initialize general stuck tracking
-			for (int i = 0; i < 3; i++)
-			{
-				data->jumpTimestamps[i] = -STUCK_JUMP_TIME_WINDOW;  // Initialize to old times
-			}
-			data->jumpTimestampIndex = 0;
 			g_horseJumpCount++;
 			return data;
 		}
@@ -694,366 +589,6 @@ namespace MountedNPCCombatVR
 		{
 			_MESSAGE("SpecialMovesets: Horse %08X jump animation rejected (graph busy?)", horse->formID);
 			return false;
-		}
-	}
-	
-	// ============================================
-	// ELEVATED TARGET DETECTION & COMBAT DISMOUNT
-	// ============================================
-	
-	// Check if target is significantly above the horse (e.g., on a fort wall)
-	bool IsTargetElevatedAboveHorse(Actor* horse, Actor* target)
-	{
-		if (!horse || !target) return false;
-		
-		float heightDiff = target->pos.z - horse->pos.z;
-		return (heightDiff >= ELEVATED_TARGET_HEIGHT_THRESHOLD);
-	}
-	
-	// Check if horse is still in the same area as first jump attempt
-	static bool IsHorseInSameArea(HorseJumpData* data, const NiPoint3& currentPos)
-	{
-		if (!data || data->jumpAttemptsInArea == 0) return false;
-		
-		float dx = currentPos.x - data->firstJumpPosition.x;
-		float dy = currentPos.y - data->firstJumpPosition.y;
-		float distance = sqrt(dx * dx + dy * dy);
-		
-		return (distance <= STUCK_AREA_RADIUS);
-	}
-	
-	// Get or create combat dismount data
-	static CombatDismountData* GetOrCreateCombatDismountData(UInt32 riderFormID)
-	{
-		for (int i = 0; i < g_combatDismountCount; i++)
-		{
-			if (g_combatDismountData[i].isValid && g_combatDismountData[i].riderFormID == riderFormID)
-			{
-				return &g_combatDismountData[i];
-			}
-		}
-		
-		if (g_combatDismountCount < MAX_TRACKED_HORSES)
-		{
-			CombatDismountData* data = &g_combatDismountData[g_combatDismountCount];
-			data->riderFormID = riderFormID;
-			data->horseFormID = 0;
-			data->dismountTime = 0;
-			data->canRemount = false;
-			data->isValid = true;
-			g_combatDismountCount++;
-			return data;
-		}
-		
-		return nullptr;
-	}
-	
-	// Track a jump attempt for elevated target detection
-	void TrackJumpAttemptForElevatedTarget(Actor* horse, Actor* target)
-	{
-		if (!horse || !target) return;
-		
-		HorseJumpData* data = GetOrCreateJumpData(horse->formID);
-		if (!data) return;
-		
-		float currentTime = GetCurrentTime();
-		
-		// ============================================
-		// TRACK GENERAL STUCK (TIME-BASED)
-		// Record this jump timestamp in circular buffer
-		// ============================================
-		data->jumpTimestamps[data->jumpTimestampIndex] = currentTime;
-		data->jumpTimestampIndex = (data->jumpTimestampIndex + 1) % 3;
-		
-		// Check if this is a new area or same area
-		if (data->jumpAttemptsInArea == 0 || !IsHorseInSameArea(data, horse->pos))
-		{
-			// New area - reset tracking
-			data->jumpAttemptsInArea = 1;
-			data->firstJumpPosition = horse->pos;
-			data->firstJumpTime = currentTime;
-			
-			_MESSAGE("SpecialMovesets: Horse %08X - First jump attempt in new area (target height diff: %.0f)",
-				horse->formID, target->pos.z - horse->pos.z);
-		}
-		else
-		{
-			// Same area - increment counter
-			data->jumpAttemptsInArea++;
-			
-			_MESSAGE("SpecialMovesets: Horse %08X - Jump attempt %d in same area (target height diff: %.0f)",
-				horse->formID, data->jumpAttemptsInArea, 
-				target->pos.z - horse->pos.z);
-		}
-	}
-	
-	// Check if rider should dismount due to being generally stuck (3 jumps in short time)
-	bool ShouldDismountForGeneralStuck(Actor* horse)
-	{
-		if (!horse) return false;
-		
-		HorseJumpData* data = GetOrCreateJumpData(horse->formID);
-		if (!data) return false;
-		
-		float currentTime = GetCurrentTime();
-		
-		// Check if all 3 jump timestamps are within the time window
-		bool allJumpsRecent = true;
-		for (int i = 0; i < 3; i++)
-		{
-			if ((currentTime - data->jumpTimestamps[i]) > STUCK_JUMP_TIME_WINDOW)
-			{
-				allJumpsRecent = false;
-				break;
-			}
-		}
-		
-		if (!allJumpsRecent)
-		{
-			return false;
-		}
-		
-		// Must still be in the same area (haven't moved significantly)
-		if (!IsHorseInSameArea(data, horse->pos))
-		{
-			// Horse moved - reset tracking
-		 data->jumpAttemptsInArea = 0;
-		 return false;
-		}
-		
-		// Check minimum jump attempts
-		if (data->jumpAttemptsInArea < MAX_JUMP_ATTEMPTS_STUCK)
-		{
-			return false;
-		}
-		
-		_MESSAGE("SpecialMovesets: Horse %08X - GENERAL STUCK DISMOUNT triggered! (%d jumps in %.0f seconds in same area)",
-			horse->formID, data->jumpAttemptsInArea, STUCK_JUMP_TIME_WINDOW);
-		
-		return true;
-	}
-	
-	// Check if rider should dismount due to elevated target
-	bool ShouldDismountForElevatedTarget(Actor* horse, Actor* target)
-	{
-		if (!horse || !target) return false;
-		
-		// Target must be significantly above
-		if (!IsTargetElevatedAboveHorse(horse, target))
-		{
-			return false;
-		}
-		
-		HorseJumpData* data = GetOrCreateJumpData(horse->formID);
-		if (!data) return false;
-		
-		// Must have tried jumping multiple times in the same area
-		if (data->jumpAttemptsInArea < MAX_JUMP_ATTEMPTS_BEFORE_DISMOUNT)
-		{
-			return false;
-		}
-		
-		// Must still be in same area
-		if (!IsHorseInSameArea(data, horse->pos))
-		{
-			// Horse moved - reset tracking
-		 data->jumpAttemptsInArea = 0;
-		 return false;
-		}
-		
-		_MESSAGE("SpecialMovesets: Horse %08X - ELEVATED TARGET DISMOUNT triggered! (target %.0f units above, %d failed jumps)",
-			horse->formID, target->pos.z - horse->pos.z, data->jumpAttemptsInArea);
-		
-		return true;
-	}
-	
-	// Execute combat dismount - rider gets off horse to pursue target on foot
-	bool ExecuteCombatDismount(Actor* rider, Actor* horse)
-	{
-		if (!rider || !horse) return false;
-		
-		// Record dismount for potential remount later
-		CombatDismountData* data = GetOrCreateCombatDismountData(rider->formID);
-		if (data)
-		{
-			data->horseFormID = horse->formID;
-			data->dismountTime = GetCurrentTime();
-			data->canRemount = false;  // Will be set to true after cooldown
-		}
-		
-		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-		_MESSAGE("SpecialMovesets: ========================================");
-		_MESSAGE("SpecialMovesets: COMBAT DISMOUNT - '%s' (%08X) dismounting to pursue elevated target",
-			riderName ? riderName : "Rider", rider->formID);
-		_MESSAGE("SpecialMovesets: Can remount in %.0f seconds if within %.0f units of horse",
-			COMBAT_DISMOUNT_REMOUNT_COOLDOWN, REMOUNT_DISTANCE_THRESHOLD);
-		_MESSAGE("SpecialMovesets: ========================================");
-		
-		// Force dismount using the game's dismount function
-		// Dismount is achieved by calling Actor_Dismount or using the animation event
-		typedef void (*_Actor_Dismount)(Actor* actor);
-		static RelocAddr<_Actor_Dismount> Actor_Dismount(0x60C950);
-		
-		Actor_Dismount(rider);
-		
-		// Clear the horse's jump tracking since rider dismounted
-		HorseJumpData* jumpData = GetOrCreateJumpData(horse->formID);
-		if (jumpData)
-		{
-			jumpData->jumpAttemptsInArea = 0;
-		}
-		
-		return true;
-	}
-	
-	// Check if rider can remount their horse after combat dismount
-	bool CanRemountAfterCombatDismount(Actor* rider, Actor* horse)
-	{
-		if (!rider || !horse) return false;
-		
-		// Find the combat dismount data
-		CombatDismountData* data = nullptr;
-		for (int i = 0; i < g_combatDismountCount; i++)
-		{
-			if (g_combatDismountData[i].isValid && g_combatDismountData[i].riderFormID == rider->formID)
-			{
-				data = &g_combatDismountData[i];
-				break;
-			}
-		}
-		
-		if (!data) return false;
-		
-		// Check if cooldown has passed
-		float currentTime = GetCurrentTime();
-		float timeSinceDismount = currentTime - data->dismountTime;
-		
-		if (timeSinceDismount < COMBAT_DISMOUNT_REMOUNT_COOLDOWN)
-		{
-			return false;  // Still on cooldown
-		}
-		
-		// Check if rider is still in combat
-		if (!rider->IsInCombat())
-		{
-			return false;  // No need to remount if not fighting
-		}
-		
-		// Check if horse matches the one we dismounted from
-		if (data->horseFormID != horse->formID)
-		{
-			return false;
-		}
-		
-		// Check distance to horse
-		float dx = horse->pos.x - rider->pos.x;
-		float dy = horse->pos.y - rider->pos.y;
-		float distance = sqrt(dx * dx + dy * dy);
-		
-		if (distance > REMOUNT_DISTANCE_THRESHOLD)
-		{
-			return false;  // Too far from horse
-		}
-		
-		return true;
-	}
-	
-	// Execute remount after combat dismount
-	bool ExecuteCombatRemount(Actor* rider, Actor* horse)
-	{
-		if (!rider || !horse) return false;
-		
-		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
-		_MESSAGE("SpecialMovesets: COMBAT REMOUNT - '%s' (%08X) remounting horse %08X",
-			riderName ? riderName : "Rider", rider->formID, horse->formID);
-		
-		// Use the mount function
-		typedef void (*_Actor_MountHorse)(Actor* rider, Actor* horse);
-		static RelocAddr<_Actor_MountHorse> Actor_MountHorse(0x60C8E0);
-		
-		Actor_MountHorse(rider, horse);
-		
-		// Clear the combat dismount data
-		for (int i = 0; i < g_combatDismountCount; i++)
-		{
-			if (g_combatDismountData[i].isValid && g_combatDismountData[i].riderFormID == rider->formID)
-			{
-				g_combatDismountData[i].isValid = false;
-				// Shift remaining entries
-				for (int j = i; j < g_combatDismountCount - 1; j++)
-				{
-					g_combatDismountData[j] = g_combatDismountData[j + 1];
-				}
-				g_combatDismountCount--;
-				break;
-			}
-		}
-		
-		return true;
-	}
-	
-	// Clear combat dismount data for a rider
-	void ClearCombatDismountData(UInt32 riderFormID)
-	{
-		for (int i = 0; i < g_combatDismountCount; i++)
-		{
-			if (g_combatDismountData[i].isValid && g_combatDismountData[i].riderFormID == riderFormID)
-			{
-				// Shift remaining entries
-				for (int j = i; j < g_combatDismountCount - 1; j++)
-				{
-					g_combatDismountData[j] = g_combatDismountData[j + 1];
-				}
-				g_combatDismountCount--;
-				return;
-			}
-		}
-	}
-	
-	// Update combat dismount status - call periodically to check for remount opportunities
-	void UpdateCombatDismountStatus(Actor* rider)
-	{
-		if (!rider) return;
-		
-		// Find combat dismount data for this rider
-		CombatDismountData* data = nullptr;
-		for (int i = 0; i < g_combatDismountCount; i++)
-		{
-			if (g_combatDismountData[i].isValid && g_combatDismountData[i].riderFormID == rider->formID)
-			{
-				data = &g_combatDismountData[i];
-				break;
-			}
-		}
-		
-		if (!data) return;
-		
-		// Check if cooldown has passed and we're still in combat
-		float currentTime = GetCurrentTime();
-		float timeSinceDismount = currentTime - data->dismountTime;
-		
-		if (timeSinceDismount >= COMBAT_DISMOUNT_REMOUNT_COOLDOWN && rider->IsInCombat())
-		{
-			// Look for the horse
-			TESForm* horseForm = LookupFormByID(data->horseFormID);
-			if (horseForm && horseForm->formType == kFormType_Character)
-			{
-				Actor* horse = static_cast<Actor*>(horseForm);
-				
-				// Check if horse is alive and not being ridden
-				if (!horse->IsDead(1))
-				{
-					NiPointer<Actor> currentRider;
-					if (!CALL_MEMBER_FN(horse, GetMountedBy)(currentRider) || !currentRider)
-					{
-						// Horse is available - check distance
-						if (CanRemountAfterCombatDismount(rider, horse))
-						{
-							ExecuteCombatRemount(rider, horse);
-						}
-					}
-				}
-			}
 		}
 	}
 	
@@ -1269,196 +804,9 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// HORSE TROT TURN MANEUVER (Obstruction Avoidance)
 	// ============================================
-	static void InitTrotIdles()
-	{
-		if (g_trotIdlesInitialized) return;
-		
-		_MESSAGE("SpecialMovesets: Loading horse trot turn animations from Skyrim.esm...");
-		
-		// Load trot left idle
-		TESForm* trotLeftForm = LookupFormByID(HORSE_TROT_LEFT_FORMID);
-		if (trotLeftForm)
-		{
-			g_horseTrotLeftIdle = DYNAMIC_CAST(trotLeftForm, TESForm, TESIdleForm);
-			if (g_horseTrotLeftIdle)
-			{
-				_MESSAGE("SpecialMovesets: Found HORSE_TROT_LEFT (FormID: %08X)", HORSE_TROT_LEFT_FORMID);
-			}
-			else
-			{
-				_MESSAGE("SpecialMovesets: ERROR - FormID %08X is not a TESIdleForm!", HORSE_TROT_LEFT_FORMID);
-			}
-		}
-		else
-		{
-			_MESSAGE("SpecialMovesets: ERROR - LookupFormByID failed for HORSE_TROT_LEFT %08X", HORSE_TROT_LEFT_FORMID);
-		}
-		
-		// Load trot right idle
-		TESForm* trotRightForm = LookupFormByID(HORSE_TROT_RIGHT_FORMID);
-		if (trotRightForm)
-		{
-			g_horseTrotRightIdle = DYNAMIC_CAST(trotRightForm, TESForm, TESIdleForm);
-			if (g_horseTrotRightIdle)
-			{
-				_MESSAGE("SpecialMovesets: Found HORSE_TROT_RIGHT (FormID: %08X)", HORSE_TROT_RIGHT_FORMID);
-			}
-			else
-			{
-				_MESSAGE("SpecialMovesets: ERROR - FormID %08X is not a TESIdleForm!", HORSE_TROT_RIGHT_FORMID);
-			}
-		}
-		else
-		{
-			_MESSAGE("SpecialMovesets: ERROR - LookupFormByID failed for HORSE_TROT_RIGHT %08X", HORSE_TROT_RIGHT_FORMID);
-		}
-		
-		g_trotIdlesInitialized = true;
-		_MESSAGE("SpecialMovesets: Horse trot turn animations initialized - Left: %s, Right: %s", 
-			g_horseTrotLeftIdle ? "SUCCESS" : "FAILED",
-			g_horseTrotRightIdle ? "SUCCESS" : "FAILED");
-	}
-	
-	static HorseTrotTurnData* GetOrCreateTrotTurnData(UInt32 horseFormID)
-	{
-		// Check if already tracked
-		for (int i = 0; i < g_horseTrotTurnCount; i++)
-		{
-			if (g_horseTrotTurnData[i].isValid && g_horseTrotTurnData[i].horseFormID == horseFormID)
-			{
-				return &g_horseTrotTurnData[i];
-			}
-		}
-		
-		// Create new entry
-		if (g_horseTrotTurnCount < MAX_TRACKED_HORSES)
-		{
-			HorseTrotTurnData* data = &g_horseTrotTurnData[g_horseTrotTurnCount];
-			data->horseFormID = horseFormID;
-			data->lastTrotTurnTime = -HORSE_TROT_TURN_COOLDOWN;  // Allow immediate first use
-			data->isValid = true;
-			g_horseTrotTurnCount++;
-			return data;
-		}
-		
-		return nullptr;
-	}
-	
-	bool TryHorseTrotTurnToAvoid(Actor* horse, bool turnRight)
-	{
-		if (!horse) return false;
-		
-		// Block if in stand ground
-		if (IsInStandGround(horse->formID)) return false;
-		
-		// Block if horse is charging
-		if (IsHorseCharging(horse->formID)) return false;
-		
-		// Initialize trot idles if needed
-		InitTrotIdles();
-		
-		// Select the appropriate idle
-		TESIdleForm* trotIdle = turnRight ? g_horseTrotRightIdle : g_horseTrotLeftIdle;
-		
-		if (!trotIdle)
-		{
-			return false;
-		}
-		
-		// Check cooldown
-		HorseTrotTurnData* data = GetOrCreateTrotTurnData(horse->formID);
-		if (!data) 
-		{
-			return false;
-		}
-		
-		float currentTime = GetCurrentTime();
-		float timeSinceLastTurn = currentTime - data->lastTrotTurnTime;
-		
-		if (timeSinceLastTurn < HORSE_TROT_TURN_COOLDOWN)
-		{
-			// Still on cooldown - silent fail
-			return false;
-		}
-		
-		// Get the animation event name
-		const char* eventName = trotIdle->animationEvent.c_str();
-		if (!eventName || strlen(eventName) == 0)
-		{
-			return false;
-		}
-		
-		// Send the animation event
-		bool result = SendHorseAnimationEvent(horse, eventName);
-		
-		if (result)
-		{
-			data->lastTrotTurnTime = currentTime;
-			_MESSAGE("SpecialMovesets: Horse %08X TROT TURN %s to avoid obstruction", 
-				horse->formID, turnRight ? "RIGHT" : "LEFT");
-		}
-		// Don't log rejections - they happen frequently when animation graph is busy
-		
-		return result;
-	}
-	
-	bool TryHorseTrotTurnFromObstruction(Actor* horse)
-	{
-		if (!horse) return false;
-		
-		// Block if in stand ground
-		if (IsInStandGround(horse->formID)) return false;
-		
-		// Block if horse is charging
-		if (IsHorseCharging(horse->formID)) return false;
-		
-		// Get the obstruction side from AILogging
-		ObstructionSide side = GetObstructionSide(horse->formID);
-		
-		// Only log occasionally to reduce spam (every 5 seconds per horse)
-		static UInt32 lastLoggedHorse = 0;
-		static float lastLogTime = 0;
-		float currentTime = GetGameTime();
-		
-		if (horse->formID != lastLoggedHorse || (currentTime - lastLogTime) > 5.0f)
-		{
-			_MESSAGE("SpecialMovesets: Horse %08X - ObstructionSide: %d", horse->formID, (int)side);
-			lastLoggedHorse = horse->formID;
-			lastLogTime = currentTime;
-		}
-		
-		switch (side)
-		{
-			case ObstructionSide::Left:
-				// Obstruction on LEFT ? Turn RIGHT to avoid
-				return TryHorseTrotTurnToAvoid(horse, true);
-				
-			case ObstructionSide::Right:
-				// Obstruction on RIGHT ? Turn LEFT to avoid
-				return TryHorseTrotTurnToAvoid(horse, false);
-				
-			case ObstructionSide::Front:
-				// Obstruction in FRONT ? Pick a random direction
-				{
-					EnsureRandomSeeded();
-					bool turnRight = (rand() % 2) == 0;
-					return TryHorseTrotTurnToAvoid(horse, turnRight);
-				}
-				
-			case ObstructionSide::Both:
-				// Both sides blocked - try random turn
-				{
-					EnsureRandomSeeded();
-				 bool turnRight = (rand() % 2) == 0;
-				 return TryHorseTrotTurnToAvoid(horse, turnRight);
-				}
-				
-			case ObstructionSide::Unknown:
-			default:
-				// Unknown side - don't turn
-				return false;
-		}
-	}
+	// REMOVED - Trot turn system is no longer in use
+	// Relying on jump system for obstruction escape instead
+	// Functions TryHorseTrotTurnToAvoid and TryHorseTrotTurnFromObstruction removed
 	
 	// ============================================
 	// TARGET MOUNT CHECK
@@ -1470,136 +818,6 @@ namespace MountedNPCCombatVR
 		
 		NiPointer<Actor> targetMount;
 		return CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount;
-	}
-	
-	// ============================================
-	// ADJACENT RIDING MANEUVER (Mounted vs Mounted)
-	// ============================================
-	
-	static HorseAdjacentRidingData* GetOrCreateAdjacentData(UInt32 horseFormID)
-	{
-		// Check if already tracked
-		for (int i = 0; i < g_horseAdjacentCount; i++)
-		{
-			if (g_horseAdjacentData[i].isValid && g_horseAdjacentData[i].horseFormID == horseFormID)
-			{
-				return &g_horseAdjacentData[i];
-			}
-		}
-		
-		// Create new entry
-		if (g_horseAdjacentCount < MAX_TRACKED_HORSES)
-		{
-			HorseAdjacentRidingData* data = &g_horseAdjacentData[g_horseAdjacentCount];
-			data->horseFormID = horseFormID;
-			data->ridingOnRightSide = false;
-			data->sideChosen = false;
-			data->isValid = true;
-			g_horseAdjacentCount++;
-			return data;
-		}
-		
-		return nullptr;
-	}
-	
-	bool GetAdjacentRidingSide(UInt32 horseFormID)
-	{
-		EnsureRandomSeeded();
-		
-		HorseAdjacentRidingData* data = GetOrCreateAdjacentData(horseFormID);
-		if (!data)
-		{
-			// Fallback to random if tracking is full
-			return (rand() % 2) == 0;
-		}
-		
-		// If we haven't chosen a side yet, pick one randomly
-		if (!data->sideChosen)
-		{
-			data->ridingOnRightSide = (rand() % 2) == 0;
-			data->sideChosen = true;
-			
-			_MESSAGE("SpecialMovesets: Horse %08X chose to ride on %s side of mounted target", 
-				horseFormID, data->ridingOnRightSide ? "RIGHT" : "LEFT");
-		}
-		
-		return data->ridingOnRightSide;
-	}
-	
-	float GetAdjacentRidingAngle(UInt32 horseFormID, const NiPoint3& targetPos, const NiPoint3& horsePos, float targetHeading)
-	{
-		// Get which side to ride on
-	 bool rideOnRight = GetAdjacentRidingSide(horseFormID);
-		
-		// Calculate angle from horse to target
-		float dx = targetPos.x - horsePos.x;
-		float dy = targetPos.y - horsePos.y;
-		float angleToTarget = atan2(dx, dy);
-		
-		// ============================================
-		// FIX FOR MOUNTED VS MOUNTED JITTER:
-		// Do NOT use targetHeading - it causes feedback loop when both
-		// mounted units are constantly recalculating based on each other's heading.
-		// Instead, use angle TO target with perpendicular offset (like 90-degree turn)
-		// This is stable because positions don't change as rapidly as headings.
-		// ============================================
-		
-		// Use perpendicular angle (90 degrees) to the target direction
-		// This positions the horse alongside the target for melee combat
-		const float PERPENDICULAR_ANGLE = 1.5708f;  // 90 degrees in radians
-		
-		float targetAngle;
-		if (rideOnRight)
-		{
-			// Ride on target's right side - face perpendicular to the right
-			targetAngle = angleToTarget + PERPENDICULAR_ANGLE;
-		}
-		else
-		{
-			// Ride on target's left side - face perpendicular to the left
-			targetAngle = angleToTarget - PERPENDICULAR_ANGLE;
-		}
-		
-		// Normalize angle to -PI to PI
-		while (targetAngle > 3.14159f) targetAngle -= 6.28318f;
-		while (targetAngle < -3.14159f) targetAngle += 6.28318f;
-		
-		return targetAngle;
-	}
-	
-	void NotifyHorseLeftAdjacentRange(UInt32 horseFormID)
-	{
-		for (int i = 0; i < g_horseAdjacentCount; i++)
-		{
-			if (g_horseAdjacentData[i].isValid && g_horseAdjacentData[i].horseFormID == horseFormID)
-			{
-				if (g_horseAdjacentData[i].sideChosen)
-					{
-					_MESSAGE("SpecialMovesets: Horse %08X LEFT adjacent range - will pick new side on next approach", 
-						horseFormID);
-					g_horseAdjacentData[i].sideChosen = false;
-				}
-				return;
-			}
-		}
-	}
-	
-	void ClearAdjacentRidingData(UInt32 horseFormID)
-	{
-		for (int i = 0; i < g_horseAdjacentCount; i++)
-		{
-			if (g_horseAdjacentData[i].isValid && g_horseAdjacentData[i].horseFormID == horseFormID)
-			{
-				// Shift remaining entries
-				for (int j = i; j < g_horseAdjacentCount - 1; j++)
-				{
-					g_horseAdjacentData[j] = g_horseAdjacentData[j + 1];
-				}
-				g_horseAdjacentCount--;
-				_MESSAGE("SpecialMovesets: Cleared adjacent riding data for horse %08X", horseFormID);
-				return;
-			}
-		}
 	}
 	
 	// ============================================
@@ -1875,11 +1093,11 @@ namespace MountedNPCCombatVR
 				data->targetFormID = target->formID;
 				
 				// // Rate-limit this log message too
-				static UInt32 lastLoggedHorseApproach = 0;
+			 static UInt32 lastLoggedHorseApproach = 0;
 				static float lastLogTimeApproach = 0;
 				float currentTime = GetGameTime();
 				
-				if (horseFormID != lastLoggedHorseApproach || (currentTime - lastLogTimeApproach) > 3.0f)
+				if (horseFormID != lastLoggedHorseApproach || ( currentTime - lastLogTimeApproach) > 3.0f)
 				{
 					_MESSAGE("SpecialMovesets: Horse %08X chose to approach mobile target from %s",
 						horseFormID, data->approachFromRight ? "RIGHT" : "LEFT");
@@ -2034,7 +1252,7 @@ namespace MountedNPCCombatVR
 		
 		float currentTime = GetCurrentTime();
 		
-		// Check cooldown since last charge (using config value)
+		// Check cooldown for last charge (using config value)
 		if ((currentTime - data->lastChargeCompleteTime) < ChargeCooldown)
 		{
 			return false;  // Still on cooldown from last charge
@@ -2331,21 +1549,25 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
+		// Check if rider is a mage
+		bool isMage = (combatClass == MountedCombatClass::MageCaster);
+		
+		// ============================================
+		// MUST HAVE BOW ALREADY EQUIPPED (or be a mage)
+		// Don't force equip - rely on dynamic weapon switching
+		// Mages don't need bows - they cast Ice Spike instead
+		// ============================================
+		if (!isMage && !IsBowEquipped(rider))
+		{
+			return false;  // No bow equipped - can't do rapid fire
+		}
+
 		// ============================================
 		// MAXIMUM DISTANCE CHECK - Don't trigger if target too far
 		// ============================================
 		if (distanceToTarget > SPECIAL_MOVESET_MAX_DISTANCE)
 		{
 			return false;
-		}
-		
-		// ============================================
-		// MUST HAVE BOW ALREADY EQUIPPED
-		// Don't force equip - rely on dynamic weapon switching
-		// ============================================
-		if (!IsBowEquipped(rider))
-		{
-			return false;  // No bow equipped - can't do rapid fire
 		}
 		
 		// ============================================
@@ -2382,10 +1604,19 @@ namespace MountedNPCCombatVR
 		
 		float currentTime = GetCurrentTime();
 		
-		// Check cooldown since last rapid fire (using config value)
+		// ============================================
+		// GLOBAL COOLDOWN CHECK - Prevent synchronized rapid fires
+		// No horse can rapid fire if ANY horse rapid fired recently
+		// ============================================
+		if ((currentTime - g_lastGlobalRapidFireTime) < RAPID_FIRE_GLOBAL_COOLDOWN)
+		{
+			return false;  // Another horse rapid fired recently - blocked
+		}
+		
+		// Check cooldown since last rapid fire for THIS horse (using config value)
 		if ((currentTime - data->lastCompleteTime) < RapidFireCooldown)
 		{
-			return false;  // Still on cooldown
+			return false;  // This horse still on cooldown
 		}
 		
 		// Check 10-second interval between checks
@@ -2404,8 +1635,11 @@ namespace MountedNPCCombatVR
 		}
 		
 		// SUCCESS - Initiate rapid fire!
-		_MESSAGE("SpecialMovesets: Horse %08X RAPID FIRE INITIATED! (rolled %d < %d%%) - Horse will STOP for %.1f seconds",
-			horse->formID, roll, RapidFireChancePercent, RapidFireDuration);
+		_MESSAGE("SpecialMovesets: Horse %08X RAPID FIRE INITIATED! (rolled %d < %d%%) - Horse will STOP for %.1f seconds (global cooldown: %.1fs)",
+			horse->formID, roll, RapidFireChancePercent, RapidFireDuration, RAPID_FIRE_GLOBAL_COOLDOWN);
+		
+		// Set global cooldown
+		g_lastGlobalRapidFireTime = currentTime;
 		
 		data->riderFormID = rider->formID;
 		data->state = RapidFireState::Active;
@@ -2424,22 +1658,34 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// BOW IS ALREADY EQUIPPED - Just start rapid fire
 		// No forced equip - weapon detection handles equipping
+		// For mages: Skip bow-related setup, just start spell casting
 		// ============================================
 		
-		// Reset any existing bow attack state
-		ResetBowAttackState(rider->formID);
-		
-		// Make sure weapon is drawn
-		if (!IsWeaponDrawn(rider))
+		// Reset any existing bow attack state (only for non-mages)
+		if (!isMage)
 		{
-			rider->DrawSheatheWeapon(true);
+			ResetBowAttackState(rider->formID);
+			
+			// Make sure weapon is drawn
+			if (!IsWeaponDrawn(rider))
+			{
+				rider->DrawSheatheWeapon(true);
+			}
 		}
 		
-		// Start the rapid fire bow attack sequence
-		StartRapidFireBowAttack(rider->formID);
+		// Start the rapid fire attack sequence (bow for archers, Ice Spike for mages)
+		StartRapidFireBowAttack(rider->formID, isMage);
 		
-		_MESSAGE("SpecialMovesets: Rider %08X RAPID FIRE bow attack started (%d shots)", 
-			rider->formID, RapidFireShotCount);
+		if (isMage)
+		{
+			_MESSAGE("SpecialMovesets: Rider %08X MAGE RAPID FIRE started (%d Ice Spikes)", 
+				rider->formID, RapidFireShotCount);
+		}
+		else
+		{
+			_MESSAGE("SpecialMovesets: Rider %08X RAPID FIRE bow attack started (%d shots)", 
+				rider->formID, RapidFireShotCount);
+		}
 		
 		return true;
 	}
@@ -2837,6 +2083,7 @@ namespace MountedNPCCombatVR
 		// Set target angle for 90-degree turn (if not skipping rotation)
 		if (!data->noRotation)
 		{
+			// always use horse->formID here
 			data->target90DegreeAngle = Get90DegreeTurnAngle(horse->formID, GetAngleToTarget(horse, target));
 			data->target90DegreeAngleSet = true;
 		}
@@ -2847,19 +2094,15 @@ namespace MountedNPCCombatVR
 		
 		data->state = StandGroundState::Active;
 		data->stateStartTime = currentTime;
-		
+
 		_MESSAGE("SpecialMovesets: Horse %08X STANDING GROUND for %.1f seconds %s (rolled %d < %d%%, dist: %.0f)",
 			horse->formID, data->standDuration, 
 			data->noRotation ? "(NO ROTATION)" : "(with 90-deg turn)",
 			roll, StandGroundChancePercent, distanceToTarget);
 		
-		// Stop horse movement
-		StopHorseSprint(horse);
-		Actor_ClearKeepOffsetFromActor(horse);
-		
-		return true;
+		return true;  // Stand ground initiated
 	}
-	
+
 	// NOTE: TryMountedVsMountedStandGround has been REMOVED
 	// Mounted vs mounted combat no longer uses stand ground maneuver
 	// The horses will continue to move and face each other directly
@@ -3194,6 +2437,17 @@ namespace MountedNPCCombatVR
 		if (IsHorseRiderFleeing(horse->formID)) return false;
 		
 		// ============================================
+		// 3-SECOND LOCK AT COMBAT START
+		// Don't trigger close range assault in the first 3 seconds of combat
+		// This prevents immediate aggressive behavior when combat begins
+		// ============================================
+		float combatTime = GetCombatElapsedTime();
+		if (combatTime < 3.0f)
+		{
+			return false;
+		}
+		
+		// ============================================
 		// EXCLUDE MAGE CASTERS AND CIVILIANS
 		// Mages and civilians don't use melee assault
 		// ============================================
@@ -3285,7 +2539,7 @@ namespace MountedNPCCombatVR
 		// Check if enough time has passed for another attack
 		float currentTime = GetCurrentTime();
 		float timeSinceLastAttack = currentTime - data->lastAttackTime;
-		
+			
 		if (timeSinceLastAttack < CloseRangeMeleeAssaultInterval)
 		{
 			return true; // Still in assault mode, waiting for next attack
@@ -3314,7 +2568,7 @@ namespace MountedNPCCombatVR
 		// Update last attack time
 		data->lastAttackTime = currentTime;
 		
-		_MESSAGE("SpecialMovesets: Horse %08X close range assault ATTACK (%s side, dist: %.0f)",
+		_MESSAGE("Special Movesets: Horse %08X close range assault ATTACK (%s side, dist: %.0f)",
 			horse->formID, targetSide, distanceToTarget);
 		
 		return true;
@@ -3367,22 +2621,19 @@ namespace MountedNPCCombatVR
 		// Clear jump cooldown
 		ClearHorseJumpData(horseFormID);
 		
-		// Clear trot turn cooldown
-		for (int i = 0; i < g_horseTrotTurnCount; i++)
+		// Clear 90-degree turn direction data
+		for (int i = 0; i < g_horseTurnCount; i++)
 		{
-			if (g_horseTrotTurnData[i].isValid && g_horseTrotTurnData[i].horseFormID == horseFormID)
+			if (g_horseTurnData[i].isValid && g_horseTurnData[i].horseFormID == horseFormID)
 			{
-				for (int j = i; j < g_horseTrotTurnCount - 1; j++)
+				for (int j = i; j < g_horseTurnCount - 1; j++)
 				{
-					g_horseTrotTurnData[j] = g_horseTrotTurnData[j + 1];
+					g_horseTurnData[j] = g_horseTurnData[j + 1];
 				}
-				g_horseTrotTurnCount--;
+				g_horseTurnCount--;
 				break;
 			}
 		}
-		
-		// Clear adjacent riding data
-		ClearAdjacentRidingData(horseFormID);
 		
 		// Clear mobile target intercept data
 		ClearMobileInterceptData(horseFormID);
@@ -3415,6 +2666,9 @@ namespace MountedNPCCombatVR
 		// Reset global rear up cooldown
 		g_lastGlobalRearUpTime = -REAR_UP_GLOBAL_COOLDOWN;
 		
+		// Reset global rapid fire cooldown
+		g_lastGlobalRapidFireTime = -RAPID_FIRE_GLOBAL_COOLDOWN;
+		
 		// Clear rear up tracking data
 		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
 		{
@@ -3442,41 +2696,10 @@ namespace MountedNPCCombatVR
 			g_horseJumpData[i].isValid = false;
 			g_horseJumpData[i].horseFormID = 0;
 			g_horseJumpData[i].lastJumpTime = -HORSE_JUMP_COOLDOWN;
-			g_horseJumpData[i].jumpAttemptsInArea = 0;
-			g_horseJumpData[i].firstJumpPosition = NiPoint3();
-			g_horseJumpData[i].firstJumpTime = 0;
-			for (int j = 0; j < 3; j++)
-			{
-				g_horseJumpData[i].jumpTimestamps[j] = -STUCK_JUMP_TIME_WINDOW;
-			}
-			g_horseJumpData[i].jumpTimestampIndex = 0;
 		}
 		g_horseJumpCount = 0;
 		
-		// Clear combat dismount data
-		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
-		{
-			g_combatDismountData[i].isValid = false;
-			g_combatDismountData[i].riderFormID = 0;
-			g_combatDismountData[i].horseFormID = 0;
-			g_combatDismountData[i].dismountTime = 0;
-			g_combatDismountData[i].canRemount = false;
-		}
-		g_combatDismountCount = 0;
-		
-		// Clear trot turn cooldown data
-		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
-		{
-			g_horseTrotTurnData[i].isValid = false;
-		}
-		g_horseTrotTurnCount = 0;
-		
-		// Clear adjacent riding data
-		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
-		{
-			g_horseAdjacentData[i].isValid = false;
-		}
-		g_horseAdjacentCount = 0;
+		// Combat dismount data - REMOVED (system no longer exists)
 		
 		// Clear charge data
 		for (int i = 0; i < MAX_TRACKED_HORSES; i++)
@@ -3521,10 +2744,8 @@ namespace MountedNPCCombatVR
 		
 		// Reset initialization flags so idles can be re-cached if needed
 		g_jumpIdleInitialized = false;
-		g_trotIdlesInitialized = false;
 		g_horseJumpIdle = nullptr;
-		g_horseTrotLeftIdle = nullptr;
-		g_horseTrotRightIdle = nullptr;
+		// Trot turn idles removed - system no longer in use
 		
 		_MESSAGE("SpecialMovesets: All state reset complete");
 	}

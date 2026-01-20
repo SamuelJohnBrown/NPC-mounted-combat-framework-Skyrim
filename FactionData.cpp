@@ -255,6 +255,67 @@ namespace MountedNPCCombatVR
 	static const int HOSTILE_WEREWOLVES_COUNT = sizeof(HOSTILE_WEREWOLVES) / sizeof(HOSTILE_WEREWOLVES[0]);
 	
 	// ============================================
+	// DRAGONS (Skyrim.esm)
+	// All riders except civilians should engage dragons!
+	// ============================================
+	static const UInt32 HOSTILE_DRAGONS[] = {
+		// Special Named Dragons
+		0x0009192C,  // dunLabyrinthianUndeadDragon
+		0x0007EAC7,  // BlackreachDragon
+		
+		// Encounter Dragons - Snow/Tundra
+		0x0008BC7F,  // EncDragonSnow
+		0x0008BC7E,  // EncDragonTundra
+		0x000E8710,  // EncDragonSnowNoScript
+		
+		// Encounter Dragons - Fire/Frost Level 01
+		0x000F8115,  // EncDragon01FireNoScript
+		0x000F8116,  // EncDragon01FrostNoScript
+		0x000F80FA,  // EncDragon01Frost
+		
+		// Encounter Dragons - Fire/Frost Level 02
+		0x000F8117,  // EncDragon02FireNoScript
+		0x000F8118,// EncDragon02FrostNoScript
+		0x000F80FD,  // EncDragon02Fire
+		0x000F77F8,  // EncDragon02Frost
+		
+		// Encounter Dragons - Fire/Frost Level 03
+		0x000FEA9B,  // EncDragon03FireNoScript
+		0x000F8119,  // EncDragon03FrostNoScript
+		
+		// Encounter Dragons - Fire/Frost Level 04
+		0x000F811B,  // EncDragon04Fire
+		0x000F811A,  // EncDragon04Frost
+		0x000F8103,  // EncDragon04FireNoScript
+		0x000F8102,  // EncDragon04FrostNoScript
+		
+		// Encounter Dragons - Fire/Frost Level 05
+		0x000F811C,  // EncDragon05Fire
+		0x000F811E,  // EncDragon05Frost
+		0x000F811D,  // EncDragon05FireNoScript
+		0x000F811F,  // EncDragon05FrostNoScript
+		
+		// Leveled Dragons (dynamically placed)
+		0x0005EACE,  // lvlDragon
+		0x000FEA9A,  // lvlMQDragon
+		0x000FAE86,  // lvlMQ104Dragon
+		
+		// Main Quest Dragons
+		0x00101E6C,// MQ206Dragon2
+		0x00101E6D,  // MQ206Dragon3
+		0x00101E6E,  // MQ206Dragon4
+		0x0009E07A,  // MQ306DragonA
+		0x0009E07B,  // MQ306DragonB
+		0x0009E07C,  // MQ306DragonC
+		
+		// Resurrected Dragons
+		0x000FE430,  // MQResurrectDragon1
+		0x000FE431,  // MQResurrectDragon2
+		0x000FE432,  // MQResurrectDragon3
+	};
+	static const int HOSTILE_DRAGONS_COUNT = sizeof(HOSTILE_DRAGONS) / sizeof(HOSTILE_DRAGONS[0]);
+	
+	// ============================================
 	// SPIDERS (Skyrim.esm)
 	// ============================================
 	static const UInt32 HOSTILE_SPIDERS[] = {
@@ -451,6 +512,21 @@ namespace MountedNPCCombatVR
 	}
 	
 	// ============================================
+	// CHECK IF NPC IS A HOSTILE DRAGON (By BaseFormID)
+	// This supplements the race-based IsDragon() check
+	// ============================================
+	
+	bool IsHostileDragon(UInt32 baseFormID)
+	{
+		UInt32 baseID = baseFormID & 0x00FFFFFF;
+		for (int i = 0; i < HOSTILE_DRAGONS_COUNT; i++)
+		{
+			if (baseID == HOSTILE_DRAGONS[i]) return true;
+		}
+		return false;
+	}
+	
+	// ============================================
 	// MASTER HOSTILE CHECK
 	// Returns true if this NPC should be treated as
 	// hostile by guards/soldiers (target for follow/attack)
@@ -462,22 +538,37 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// DRAGON CHECK (by race - highest priority)
-		// Dragons are always hostile
+		// Dragons are always hostile to all riders (except civilians)
 		// ============================================
 		if (IsDragon(actor)) return true;
 		
-		// Get base form ID for NPC checks
-		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
+		// Get base form ID for NPC/creature checks
+		TESForm* baseForm = actor->baseForm;
+		if (!baseForm) return false;
+		
+		UInt32 baseFormID = baseForm->formID;
+		
+		// ============================================
+		// DRAGON CHECK (by base FormID - backup)
+		// Catches specific dragon actors that might not
+		// be detected by race alone
+		// ============================================
+		if (IsHostileDragon(baseFormID)) return true;
+		
+		// Try to cast to TESNPC for humanoid checks
+		TESNPC* actorBase = DYNAMIC_CAST(baseForm, TESForm, TESNPC);
 		if (!actorBase) 
 		{
-			// Not a humanoid NPC - could still be a hostile creature
-			// Check if it's in combat and hostile
+			// Not a humanoid NPC - still check creature lists
+			// (Dragons, spiders, etc. may not be TESNPC)
+			if (IsHostileSpider(baseFormID)) return true;
+			if (IsHostileCreature(baseFormID)) return true;
+			if (IsHostileDwarven(baseFormID)) return true;
+			if (IsHostileChaurus(baseFormID)) return true;
 			return false;
 		}
 		
-		UInt32 baseFormID = actorBase->formID;
-		
-		// Check all hostile categories
+		// Check all hostile categories (humanoid NPCs)
 		if (IsHostileBandit(baseFormID)) return true;
 		if (IsHostileWarlock(baseFormID)) return true;
 		if (IsHostileVampire(baseFormID)) return true;
@@ -511,11 +602,28 @@ namespace MountedNPCCombatVR
 		// Check dragon first (by race)
 		if (IsDragon(actor)) return "Dragon";
 		
-		TESNPC* actorBase = DYNAMIC_CAST(actor->baseForm, TESForm, TESNPC);
-		if (!actorBase) return "Unknown";
+		// Get base form for ID checks
+		TESForm* baseForm = actor->baseForm;
+		if (!baseForm) return "Unknown";
 		
-		UInt32 baseFormID = actorBase->formID;
+		UInt32 baseFormID = baseForm->formID;
 		
+		// Check dragon by base FormID (backup)
+		if (IsHostileDragon(baseFormID)) return "Dragon";
+		
+		// Check if it's an TESNPC
+		TESNPC* actorBase = DYNAMIC_CAST(baseForm, TESForm, TESNPC);
+		if (!actorBase)
+		{
+			// Not humanoid - check creature types
+			if (IsHostileSpider(baseFormID)) return "Frostbite Spider";
+			if (IsHostileDwarven(baseFormID)) return "Dwarven Automaton";
+			if (IsHostileChaurus(baseFormID)) return "Chaurus";
+			if (IsHostileCreature(baseFormID)) return "Hostile Creature";
+			return "Unknown Creature";
+		}
+		
+		// Humanoid NPC checks
 		if (IsHostileBandit(baseFormID)) return "Bandit";
 		if (IsHostileWarlock(baseFormID)) return "Warlock/Necromancer";
 		if (IsHostileVampire(baseFormID)) return "Vampire";

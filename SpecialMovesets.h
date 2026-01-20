@@ -82,29 +82,9 @@ namespace MountedNPCCombatVR
 	void ClearAllHorseTurnDirections();
 	
 	// ============================================
-	// Adjacent Riding Maneuver (vs Mounted Target)
+	// Adjacent Riding Maneuver - REMOVED
+	// This system is no longer in use
 	// ============================================
-	// When fighting a mounted target, the NPC horse tries to
-	// ride alongside the target's horse for melee combat.
-	// Uses a flanking angle instead of perpendicular.
-	
-	// Get the target angle for adjacent riding (mounted vs mounted combat)
-	// Returns the angle the horse should face to ride alongside target
-	// horseFormID: the NPC's horse
-	// targetPos: position of the target
-	// horsePos: position of the NPC's horse
-	// targetHeading: direction the target is facing (rot.z)
-	float GetAdjacentRidingAngle(UInt32 horseFormID, const NiPoint3& targetPos, const NiPoint3& horsePos, float targetHeading);
-	
-	// Get which side the horse should ride on (true = right side, false = left side)
-	// Once chosen, stays consistent until target is lost
-	bool GetAdjacentRidingSide(UInt32 horseFormID);
-	
-	// Notify that horse is no longer in adjacent riding range
-	void NotifyHorseLeftAdjacentRange(UInt32 horseFormID);
-	
-	// Clear adjacent riding data for a horse
-	void ClearAdjacentRidingData(UInt32 horseFormID);
 	
 	// ============================================
 	// Rear Up Moveset
@@ -144,55 +124,6 @@ namespace MountedNPCCombatVR
 	// Clear jump cooldown data for a horse
 	void ClearHorseJumpData(UInt32 horseFormID);
 	
-	// ============================================
-	// Horse Trot Turn Maneuver (Obstruction Avoidance)
-	// ============================================
-	// When horse is obstructed on one side, turn away from
-	// the obstruction using trot turn animations.
-	
-	// Try to play trot turn animation based on direction
-	// turnRight: true = trot right, false = trot left
-	// Returns true if turn was triggered
-	bool TryHorseTrotTurnToAvoid(Actor* horse, bool turnRight);
-	
-	// Automatically determine turn direction based on obstruction side and execute
-	// Returns true if turn was triggered
-	bool TryHorseTrotTurnFromObstruction(Actor* horse);
-	
-	// ============================================
-	// Elevated Target Detection & Combat Dismount
-	// ============================================
-	// When rider is stuck below target (e.g., target in fort wall),
-	// and has tried jumping twice without success, allow dismount
-	// to continue fighting on foot. Can remount after 45 seconds.
-	
-	// Check if target is significantly above the horse (150+ units)
-	bool IsTargetElevatedAboveHorse(Actor* horse, Actor* target);
-	
-	// Track a jump attempt for elevated target detection
-	void TrackJumpAttemptForElevatedTarget(Actor* horse, Actor* target);
-	
-	// Check if rider should dismount due to elevated target
-	bool ShouldDismountForElevatedTarget(Actor* horse, Actor* target);
-	
-	// Check if rider should dismount due to being generally stuck (3 jumps in 20 seconds)
-	bool ShouldDismountForGeneralStuck(Actor* horse);
-	
-	// Execute combat dismount - rider gets off horse to pursue target on foot
-	bool ExecuteCombatDismount(Actor* rider, Actor* horse);
-	
-	// Check if rider can remount their horse after combat dismount
-	bool CanRemountAfterCombatDismount(Actor* rider, Actor* horse);
-	
-	// Execute remount after combat dismount
-	bool ExecuteCombatRemount(Actor* rider, Actor* horse);
-	
-	// Clear combat dismount data for a rider
-	void ClearCombatDismountData(UInt32 riderFormID);
-	
-	// Update combat dismount status - call periodically to check for remount
-	void UpdateCombatDismountStatus(Actor* rider);
-
 	// ============================================
 	// Horse Charge Maneuver (Long Distance Charge)
 	// ============================================
@@ -329,7 +260,7 @@ namespace MountedNPCCombatVR
 	void StopCloseRangeMeleeAssault(UInt32 horseFormID);
 	
 	// Clear close range melee assault data for a horse
-	void ClearCloseRangeMeleeAssaultData(UInt32 horseFormID);
+	void ClearCloseRangeMeleeAssault(UInt32 horseFormID);
 
 	// ============================================
 	// Clear All Moveset Data for a Horse

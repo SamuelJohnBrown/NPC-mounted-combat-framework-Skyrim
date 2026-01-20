@@ -1,8 +1,6 @@
 #include "FleeingBehavior.h"
-#include "MountedCombat.h"
 #include "DynamicPackages.h"
 #include "CombatStyles.h"
-#include "MultiMountedCombat.h"
 #include "CompanionCombat.h"
 #include "Helper.h"
 #include "config.h"
@@ -196,27 +194,13 @@ namespace MountedNPCCombatVR
 	
 	void ResetTacticalFlee()
 	{
-		_MESSAGE("TacticalFlee: Resetting all state...");
+		_MESSAGE("TacticalFlee: Resetting all state (data only - no form lookups)...");
 		
-		if (g_currentFleeingRider.isFleeing && g_currentFleeingRider.riderFormID != 0)
-		{
-			TESForm* riderForm = LookupFormByID(g_currentFleeingRider.riderFormID);
-			TESForm* horseForm = LookupFormByID(g_currentFleeingRider.horseFormID);
-			
-			if (riderForm && horseForm)
-			{
-				Actor* rider = DYNAMIC_CAST(riderForm, TESForm, Actor);
-				Actor* horse = DYNAMIC_CAST(horseForm, TESForm, Actor);
-				
-				if (rider && horse && !rider->IsDead(1))
-				{
-					ClearInjectedPackages(horse);
-					Actor_ClearKeepOffsetFromActor(horse);
-					Actor_EvaluatePackage(rider, false, false);
-					Actor_EvaluatePackage(horse, false, false);
-				}
-			}
-		}
+		// ============================================
+		// CRITICAL: Do NOT call LookupFormByID during reset!
+		// During game load/death/transition, forms may be invalid
+		// Just clear the tracking data - let game handle actual actor cleanup
+		// ============================================
 		
 		g_currentFleeingRider.Reset();
 		_MESSAGE("TacticalFlee: State reset complete");
@@ -286,7 +270,7 @@ namespace MountedNPCCombatVR
 			if (dist > 0)
 			{
 				dx = (dx / dist) * 1500.0f;
-				dy = (dy / dist) * 1500.0f;
+			 dy = (dy / dist) * 1500.0f;
 				
 				NiPoint3 offset;
 				offset.x = dx;
@@ -820,7 +804,7 @@ namespace MountedNPCCombatVR
 			if (horse->IsDead(1))
 			{
 				_MESSAGE("CivilianFlee: Horse died - stopping flee");
-				data->Reset();
+			 data->Reset();
 				g_fleeingCivilianCount--;
 				continue;
 			}
@@ -829,7 +813,7 @@ namespace MountedNPCCombatVR
 			if (!CALL_MEMBER_FN(rider, GetMount)(currentMount) || !currentMount)
 			{
 				_MESSAGE("CivilianFlee: Civilian dismounted - stopping flee");
-				data->Reset();
+			 data->Reset();
 				g_fleeingCivilianCount--;
 				continue;
 			}

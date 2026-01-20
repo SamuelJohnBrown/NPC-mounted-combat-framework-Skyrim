@@ -167,9 +167,9 @@ namespace MountedNPCCombatVR
 	enum class RapidFireBowState
 	{
 		None = 0,
-		Drawing,       // Drawing bow
+		Drawing,       // Drawing bow (or charging spell for mages)
 		Holding,// Holding at full draw
-		Releasing,     // Releasing arrow
+		Releasing,     // Releasing arrow (or casting spell for mages)
 		BetweenShots,  // Brief cooldown between shots
 		Complete // All shots fired
 	};
@@ -184,12 +184,24 @@ namespace MountedNPCCombatVR
 		float holdDuration;       // Random time to hold at full draw
 		bool firedThisRelease;    // Track if arrow was fired in current release state
 		bool drewThisDraw;        // Track if bow was drawn in current draw state
+		bool isMage;              // True if this rider is a mage (uses Ice Spike instead of arrows)
 		bool isValid;
 	};
 	
 	const int MAX_RAPID_FIRE_RIDERS = 10;
 	static RapidFireBowData g_rapidFireBowData[MAX_RAPID_FIRE_RIDERS];
 	static int g_rapidFireBowCount = 0;
+	
+	// ============================================
+	// MAGE RAPID FIRE - ICE SPIKE SPELL
+	// ============================================
+	const UInt32 RAPID_FIRE_ICE_SPIKE_FORMID = 0x0002B96C;  // Ice Spike from Skyrim.esm
+	static SpellItem* g_rapidFireIceSpikeSpell = nullptr;
+	static bool g_rapidFireIceSpikeInitialized = false;
+	
+	// Mage rapid fire timing - faster than bow since no animations needed
+	const float MAGE_RAPID_FIRE_CAST_TIME = 0.8f;     // Time between spell casts (faster than bow)
+	const float MAGE_RAPID_FIRE_RELEASE_TIME = 0.2f;  // Brief pause after casting
 	
 	// Local static animation event function (to avoid conflict with CombatStyles)
 	static bool SendBowAnimationEvent(Actor* actor, const char* eventName)
@@ -1075,9 +1087,70 @@ namespace MountedNPCCombatVR
 	}
 	
 	// ============================================
+	// FIRE ICE SPIKE SPELL FOR MAGE RAPID FIRE
+	// ============================================
+	
+	static bool FireIceSpikeAtTarget(Actor* shooter, Actor* target)
+	{
+		if (!shooter || !target || !g_task) return false;
+		
+		// Initialize Ice Spike spell if needed
+		if (!g_rapidFireIceSpikeInitialized)
+		{
+			TESForm* spellForm = LookupFormByID(RAPID_FIRE_ICE_SPIKE_FORMID);
+			if (spellForm)
+			{
+				g_rapidFireIceSpikeSpell = DYNAMIC_CAST(spellForm, TESForm, SpellItem);
+				if (g_rapidFireIceSpikeSpell)
+				{
+					_MESSAGE("ArrowSystem: Cached Ice Spike spell for mage rapid fire (FormID: %08X)", RAPID_FIRE_ICE_SPIKE_FORMID);
+				}
+			}
+			g_rapidFireIceSpikeInitialized = true;
+		}
+		
+		if (!g_rapidFireIceSpikeSpell)
+		{
+			_MESSAGE("ArrowSystem: ERROR - Ice Spike spell not available for mage rapid fire!");
+			return false;
+		}
+		
+		// Install projectile hook for redirection
+		InstallProjectileHook();
+		
+		// Calculate target aim position
+		NiPoint3 targetPos = target->pos;
+		float targetAimZ;
+		
+		NiPointer<Actor> targetMount;
+		if (CALL_MEMBER_FN(target, GetMount)(targetMount) && targetMount)
+			targetAimZ = targetPos.z + ArrowTargetMountedHeight;
+		else
+			targetAimZ = targetPos.z + ArrowTargetFootHeight;
+		
+		// Register projectile for redirection
+		NiPoint3 aimPos;
+		aimPos.x = targetPos.x;
+		aimPos.y = targetPos.y;
+		aimPos.z = targetAimZ;
+		RegisterProjectileForRedirect(shooter->formID, target->formID, aimPos);
+		
+		// Cast the spell
+		VMClassRegistry* registry = (*g_skyrimVM) ? (*g_skyrimVM)->GetClassRegistry() : nullptr;
+		if (!registry) return false;
+		
+		const char* shooterName = CALL_MEMBER_FN(shooter, GetReferenceName)();
+		_MESSAGE("ArrowSystem: MAGE RAPID FIRE - Casting Ice Spike from '%s' (%08X)",
+			shooterName ? shooterName : "Unknown", shooter->formID);
+		
+		RemoteCast(registry, 0, g_rapidFireIceSpikeSpell, shooter, shooter, target);
+		return true;
+	}
+	
+	// ============================================
 	// RAPID FIRE BOW ATTACK SYSTEM
 	// Clean state machine: Draw (1.2s) -> Release (instant arrow) -> repeat
-	// Total ~1.5s per shot
+	// For mages: Cast (0.8s) -> Release (instant Ice Spike) -> repeat
 	// ============================================
 	
 	static RapidFireBowData* GetOrCreateRapidFireBowData(UInt32 riderFormID)
@@ -1102,6 +1175,7 @@ namespace MountedNPCCombatVR
 			data->stateStartTime = 0;
 			data->firedThisRelease = false;
 			data->drewThisDraw = false;
+			data->isMage = false;
 			data->isValid = true;
 			g_rapidFireBowCount++;
 			return data;
@@ -1110,7 +1184,7 @@ namespace MountedNPCCombatVR
 		return nullptr;
 	}
 	
-	void StartRapidFireBowAttack(UInt32 riderFormID)
+	void StartRapidFireBowAttack(UInt32 riderFormID, bool isMage)
 	{
 		RapidFireBowData* data = GetOrCreateRapidFireBowData(riderFormID);
 		if (!data) return;
@@ -1124,8 +1198,16 @@ namespace MountedNPCCombatVR
 		data->stateStartTime = currentTime;
 		data->firedThisRelease = false;
 		data->drewThisDraw = false;
+		data->isMage = isMage;
 		
-		_MESSAGE("ArrowSystem: === RAPID FIRE START === Rider %08X firing %d shots", riderFormID, RapidFireShotCount);
+		if (isMage)
+		{
+			_MESSAGE("ArrowSystem: === MAGE RAPID FIRE START === Rider %08X firing %d Ice Spikes", riderFormID, RapidFireShotCount);
+		}
+		else
+		{
+			_MESSAGE("ArrowSystem: === RAPID FIRE START === Rider %08X firing %d arrows", riderFormID, RapidFireShotCount);
+		}
 	}
 	
 	bool UpdateRapidFireBowAttack(Actor* rider, Actor* target)
@@ -1144,6 +1226,82 @@ namespace MountedNPCCombatVR
 		float currentTime = GetGameTimeSeconds();
 		float timeInState = currentTime - data->stateStartTime;
 		
+		// ============================================
+		// MAGE RAPID FIRE - Cast Ice Spike spells (no bow animations)
+		// ============================================
+		if (data->isMage)
+		{
+			switch (data->state)
+			{
+				case RapidFireBowState::Drawing:
+				{
+					// For mages, "drawing" is just a brief charge time before casting
+					if (timeInState >= MAGE_RAPID_FIRE_CAST_TIME)
+					{
+						data->state = RapidFireBowState::Releasing;
+						data->stateStartTime = currentTime;
+						data->firedThisRelease = false;
+						
+						_MESSAGE("ArrowSystem: MAGE RAPID FIRE [%d/%d] - Charge complete, casting Ice Spike", 
+							data->shotsFired + 1, data->maxShots);
+					}
+					else if (timeInState >= 5.0f)
+					{
+						_MESSAGE("ArrowSystem: MAGE RAPID FIRE TIMEOUT - Rider %08X stuck, aborting", rider->formID);
+						data->state = RapidFireBowState::Complete;
+					}
+					return true;
+				}
+				
+				case RapidFireBowState::Releasing:
+				{
+					// Fire Ice Spike ONCE when entering this state
+					if (!data->firedThisRelease)
+					{
+						data->firedThisRelease = true;
+						data->shotsFired++;
+						
+						_MESSAGE("ArrowSystem: MAGE RAPID FIRE [%d/%d] - CASTING Ice Spike for rider %08X", 
+							data->shotsFired, data->maxShots, rider->formID);
+						
+						FireIceSpikeAtTarget(rider, target);
+					}
+					
+					// Brief pause after casting
+					if (timeInState >= MAGE_RAPID_FIRE_RELEASE_TIME)
+					{
+						if (data->shotsFired < data->maxShots)
+						{
+							// More shots to fire - go back to charging
+							data->state = RapidFireBowState::Drawing;
+							data->stateStartTime = currentTime;
+							data->drewThisDraw = false;
+							
+							_MESSAGE("ArrowSystem: MAGE RAPID FIRE - Shot %d complete, charging next", data->shotsFired);
+						}
+						else
+						{
+							// All shots fired - complete
+							data->state = RapidFireBowState::Complete;
+							
+							_MESSAGE("ArrowSystem: === MAGE RAPID FIRE COMPLETE === Rider %08X fired %d Ice Spikes", 
+								rider->formID, data->shotsFired);
+						}
+					}
+					return true;
+				}
+				
+				case RapidFireBowState::Complete:
+					return false;
+				
+				default:
+					return true;
+			}
+		}
+		
+		// ============================================
+		// ARCHER RAPID FIRE - Bow animations + arrows
+		// ============================================
 		switch (data->state)
 		{
 			// ============================================
@@ -1271,11 +1429,13 @@ namespace MountedNPCCombatVR
 			if (g_rapidFireBowData[i].isValid && g_rapidFireBowData[i].riderFormID == riderFormID)
 			{
 				// ============================================
-				// IF IN DRAWING STATE, PLAY RELEASE ANIMATION
+				// IF IN DRAWING STATE AND NOT A MAGE, PLAY RELEASE ANIMATION
 				// This properly transitions the animation back to idle
+				// Mages don't need this - they don't use bow animations
 				// ============================================
-				if (g_rapidFireBowData[i].state == RapidFireBowState::Drawing ||
-					g_rapidFireBowData[i].state == RapidFireBowState::Holding)
+				if (!g_rapidFireBowData[i].isMage &&
+					(g_rapidFireBowData[i].state == RapidFireBowState::Drawing ||
+					 g_rapidFireBowData[i].state == RapidFireBowState::Holding))
 				{
 					TESForm* riderForm = LookupFormByID(riderFormID);
 					if (riderForm)
@@ -1284,7 +1444,7 @@ namespace MountedNPCCombatVR
 						if (rider && !rider->IsDead(1))
 						{
 							_MESSAGE("ArrowSystem: Forcing bow release for rapid fire rider %08X to fix animation", riderFormID);
-							
+						
 							InitBowIdles();
 							if (g_bowAttackRelease)
 							{
@@ -1303,6 +1463,7 @@ namespace MountedNPCCombatVR
 				g_rapidFireBowData[i].stateStartTime = 0;
 				g_rapidFireBowData[i].firedThisRelease = false;
 				g_rapidFireBowData[i].drewThisDraw = false;
+				g_rapidFireBowData[i].isMage = false;
 				_MESSAGE("ArrowSystem: Rapid fire reset for rider %08X", riderFormID);
 				return;
 			}
@@ -1316,6 +1477,21 @@ namespace MountedNPCCombatVR
 			if (g_rapidFireBowData[i].isValid && g_rapidFireBowData[i].riderFormID == riderFormID)
 			{
 				return g_rapidFireBowData[i].state != RapidFireBowState::None && 
+				       g_rapidFireBowData[i].state != RapidFireBowState::Complete;
+			}
+		}
+		return false;
+	}
+	
+	bool IsMageRapidFireActive(UInt32 riderFormID)
+	{
+		for (int i = 0; i < g_rapidFireBowCount; i++)
+		{
+			if (g_rapidFireBowData[i].isValid && g_rapidFireBowData[i].riderFormID == riderFormID)
+			{
+				// Check if it's a mage AND actively in rapid fire
+				return g_rapidFireBowData[i].isMage && 
+				       g_rapidFireBowData[i].state != RapidFireBowState::None && 
 				       g_rapidFireBowData[i].state != RapidFireBowState::Complete;
 			}
 		}
@@ -1339,6 +1515,10 @@ namespace MountedNPCCombatVR
 		g_bowAttackRelease = nullptr;
 		g_bowIdlesInitialized = false;
 		
+		// Reset mage rapid fire Ice Spike cache
+		g_rapidFireIceSpikeSpell = nullptr;
+		g_rapidFireIceSpikeInitialized = false;
+		
 		// Clear pending projectile aims and tracking
 		ClearPendingProjectileAims();
 		
@@ -1360,18 +1540,18 @@ namespace MountedNPCCombatVR
 		g_riderBowCount = 0;
 		
 		// Reset rapid fire bow attack data
-		for (int i = 0; i < 5; i++)
+		for (int i = 0; i < MAX_RAPID_FIRE_RIDERS; i++)
 		{
 			g_rapidFireBowData[i].isValid = false;
 			g_rapidFireBowData[i].riderFormID = 0;
 			g_rapidFireBowData[i].state = RapidFireBowState::None;
 			g_rapidFireBowData[i].shotsFired = 0;
 			g_rapidFireBowData[i].stateStartTime = 0;
+			g_rapidFireBowData[i].isMage = false;
 		}
 		g_rapidFireBowCount = 0;
 		
 		// Reset initialization flags
 		g_arrowSystemInitialized = false;
-		// Note: Random seeding now handled by shared EnsureRandomSeeded() in Helper.h
 	}
 }

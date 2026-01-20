@@ -8,7 +8,8 @@
 #include "WeaponDetection.h"
 #include "ArrowSystem.h"
 #include "SpecialMovesets.h"
-#include "MagicCastingSystem.h"  // For ResetMageSpellState
+#include "CombatStyles.h" // For ClearRangedRoleForRider
+#include "MagicCastingSystem.h" // For resetting mage state on dismount
 #include "skse64/GameReferences.h"
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -481,16 +482,25 @@ namespace MountedNPCCombatVR
 		ResetBowAttackState(target->formID);
 		
 		// ============================================
-		// CRITICAL: Clear any pending mage spell casting
-		// Prevents stuck spell casting state after dismount
+		// CRITICAL: Clear ranged role assignment for pulled rider
+		// They are no longer mounted so can't be in ranged role
+		// ============================================
+		ClearRangedRoleForRider(target->formID);
+		
+		// ============================================
+		// CRITICAL: Clear mage-related state for pulled rider
+		// Prevents lingering spell charge/retreat state while dismounted
+		// Use per-mage resets (do not attempt to re-apply follow packages)
 		// ============================================
 		ResetMageSpellState(target->formID);
+		ResetMageCombatMode(target->formID);
+		ResetMageRetreat(target->formID);
 		
 		// ============================================
 		// CRITICAL: Clear horse's special movesets
-		// Clears charge, stand ground, rapid fire, 90-deg turns, etc.
+		// Clears charge, stand ground, rapid fire,90-deg turns, etc.
 		// ============================================
-		if (horseFormID != 0)
+		if (horseFormID !=0)
 		{
 			ClearAllMovesetData(horseFormID);
 		}

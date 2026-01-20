@@ -193,6 +193,29 @@ namespace MountedNPCCombatVR
 	// ALWAYS use this with explicit target - never default to player!
 	bool SetNPCRangedFollowFromTarget(Actor* actor, Actor* target);
 	
+	// Update ranged follow state - checks distance and switches between ranged/melee follow
+	// Call periodically for ranged NPCs. Returns true if a mode switch occurred.
+	// - Switches to MELEE when target is within 340 units
+	// - Switches back to RANGED when target exceeds 500 units
+	// - Has 2 second cooldown to prevent spam
+	bool UpdateRangedFollowState(Actor* actor, Actor* target);
+	
+	// Check if actor is currently in ranged follow mode (maintaining distance)
+	bool IsInRangedFollowMode(UInt32 actorFormID);
+	
+	// Clear ranged follow state for an actor (call on disengage/death)
+	void ClearRangedFollowState(UInt32 actorFormID);
+	
+	// Reset all ranged follow state (call on game load)
+	void ResetAllRangedFollowState();
+	
+	// Make NPC keep mage offset from target (MageRoleIdealDistance units for mage combat)
+	// - Closer than archer distance for staff/spell range
+	// - Faces target when stationary or traveling toward them
+	// - Faces travel direction when moving away (no backwards walking)
+	// ALWAYS use this with explicit target - never default to player!
+	bool SetNPCMageFollowFromTarget(Actor* actor, Actor* target);
+	
 	// Clear the keep-offset and force package re-evaluation
 	bool ClearNPCKeepOffset(Actor* actor);
 	

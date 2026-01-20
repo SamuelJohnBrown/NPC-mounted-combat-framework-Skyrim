@@ -222,23 +222,43 @@ namespace MountedNPCCombatVR {
 	// SPECIAL RIDER COMBAT SETTINGS (Captains & Companions)
 	// ============================================
 	
-	// Ranged combat role distance settings
-	extern float RangedRoleMinDistance;       // If closer than this, switch to melee
-	extern float RangedRoleIdealDistance;     // Ideal distance to hold position
+	// ARCHER/RANGED combat role distance settings (bows)
+	extern float RangedRoleMinDistance;    // If closer than this, switch to melee
+	extern float RangedRoleIdealDistance;// Ideal distance to hold position
 	extern float RangedRoleMaxDistanceMin;    // Minimum value for randomized max distance
 	extern float RangedRoleMaxDistanceMax;    // Maximum value for randomized max distance
-	extern float RangedPositionTolerance;     // How close to ideal is "close enough"
-	
-	// Mage combat distance settings (mages use shorter distances than archers)
-	extern float MageRangedMaxDistanceMin;    // Minimum value for randomized max distance (mages)
-	extern float MageRangedMaxDistanceMax;    // Maximum value for randomized max distance (mages)
+	extern float RangedPositionTolerance;// How close to ideal is "close enough"
 	
 	// Ranged fire distance settings
 	extern float RangedFireMinDistance;       // Minimum distance to fire bow
-	extern float RangedFireMaxDistance;  // Maximum distance to fire bow
+	extern float RangedFireMaxDistance;       // Maximum distance to fire bow
+
+	// ============================================
+	// MAGE COMBAT DISTANCE SETTINGS
+	// ============================================
+	// Mages stay closer than archers since staff/magic has different effective range
+	// Mages NEVER switch to melee - they stand ground if target gets too close
+	
+	extern float MageRoleMinDistance;         // If closer than this, mage stands ground
+	extern float MageRoleIdealDistance;       // Ideal distance for mages to hold position
+	extern float MageRoleMaxDistanceMin;// Minimum value for randomized max distance
+	extern float MageRoleMaxDistanceMax;    // Maximum value for randomized max distance
+
+	// ============================================
+	// DYNAMIC RANGED ROLE SETTINGS (3+ Riders)
+	// ============================================
+	// When 3+ riders are in battle, one is assigned to ranged role
+	// Leaders/Captains get priority, otherwise furthest rider from target
+	// Ranged role maintains distance and uses bow, switches to melee if target closes in
+	
+	extern float DynamicRangedRoleIdealDistance;    // Distance ranged role tries to maintain (default 800)
+	extern float DynamicRangedRoleMeleeThreshold;   // Below this, switch to melee mode (default 350)
+	extern float DynamicRangedRoleReturnThreshold;  // Above this, return to ranged mode (default 500)
+	extern float DynamicRangedRoleModeSwitchCooldown; // Cooldown between mode switches (default 3.0)
+	extern int DynamicRangedRoleMinRiders;  // Minimum riders for ranged role assignment (default 3)
 
 	// Role checking interval
-	extern float RoleCheckInterval;// Time in seconds to re-check roles
+	extern float RoleCheckInterval;       // Time in seconds to re-check roles
 
 	// ============================================
 	// HOSTILE DETECTION SETTINGS
@@ -356,61 +376,31 @@ namespace MountedNPCCombatVR {
 	
 	// Maximum distance for companions before disengaging (can be larger)
 	extern float MaxCompanionCombatDistance;
-
-	// ============================================
-	// MAGE SPELL ORIGIN OFFSET SETTINGS
-	// ============================================
-	// These offsets make spells appear to come from the staff tip
-	// Offsets are relative to caster facing direction
 	
-	// Forward offset (positive = toward target)
-	extern float SpellOriginForwardOffset;
-	
-	// Right offset (positive = right side of caster)
-	extern float SpellOriginRightOffset;
-	
-	// Up offset (positive = higher)
-	extern float SpellOriginUpOffset;
+	// Distance within which NPCs will re-engage with player after losing combat state
+	// Only applies to hostile NPCs
+	extern float ReEngageDistance;
 	
 	// ============================================
 	// MAGE SPELL CASTING SETTINGS
 	// ============================================
 	
-	// Minimum charge time before casting (seconds)
-	extern float SpellChargeMinTime;
+	// Spell Origin Offsets - where the spell appears to originate from
+	// These make spells appear to come from the staff/hand position
+	extern float SpellOriginForwardOffset;  // Forward toward target (staff tip reach)
+	extern float SpellOriginRightOffset;    // Slightly right (staff held in right hand)
+	extern float SpellOriginUpOffset;       // Up to staff height (mounted rider)
 	
-	// Maximum charge time before casting (seconds)
-	extern float SpellChargeMaxTime;
+	// Spell Casting Timing
+	extern float SpellChargeMinTime;        // Minimum charge time before casting (seconds)
+	extern float SpellChargeMaxTime;      // Maximum charge time before casting (seconds)
+	extern float SpellCooldownTime;         // Cooldown after cast before next spell (seconds)
 	
-	// Cooldown after cast before next spell (seconds)
-	extern float SpellCooldownTime;
+	// Spell Range Settings
+	extern float SpellRangeMin;             // Minimum distance to cast spells
+	extern float SpellRangeMax;             // Maximum distance to cast spells (2000)
 	
-	// Minimum distance for fire-and-forget spells
-	extern float SpellRangeMin;
-	
-	// Maximum distance for fire-and-forget spells
-	extern float SpellRangeMax;
-	
-	// Target height offset when on foot
-	extern float SpellTargetFootHeight;
-	
-	// Target height offset when mounted
-	extern float SpellTargetMountedHeight;
-	
-	// ============================================
-	// MAGE CONCENTRATION SPELL SETTINGS (Close Range)
-	// ============================================
-	
-	// Minimum burst duration for concentration spells (seconds)
-	extern float ConcentrationBurstMinTime;
-	
-	// Maximum burst duration for concentration spells (seconds)
-	extern float ConcentrationBurstMaxTime;
-	
-	// Cooldown between concentration spell bursts (seconds)
-	extern float ConcentrationCooldownTime;
-	
-	// Maximum range for concentration spells (use when closer than SpellRangeMin)
-	extern float ConcentrationRangeMax;
-
+	// Spell Target Height Offsets
+	extern float SpellTargetFootHeight;     // Target height offset when on foot
+	extern float SpellTargetMountedHeight;  // Target height offset when mounted
 }

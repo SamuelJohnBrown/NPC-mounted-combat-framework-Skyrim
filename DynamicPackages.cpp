@@ -3,15 +3,17 @@
 #include "WeaponDetection.h"
 #include "MountedCombat.h"
 #include "ArrowSystem.h"
-#include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "FleeingBehavior.h"
+#include "MagicCastingSystem.h"
 #include "AILogging.h"
+#include "config.h"  // For DynamicRangedRole settings
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <mutex>
 
 namespace MountedNPCCombatVR
 {
@@ -78,8 +80,95 @@ namespace MountedNPCCombatVR
 	
 	const float STUCK_THRESHOLD_DISTANCE = 10.0f;   // Must move at least 10 units
 	const float STUCK_TIMEOUT = 5.0f;      // If no movement for 5 seconds, reset
-	const float STUCK_CHECK_INTERVAL = 0.5f;        // Check every 500ms
+	const float STUCK_CHECK_INTERVAL = 0.5f;      // Check every 500ms
 	const float RESET_COOLDOWN = 10.0f;    // Don't reset same horse more than once per 10 seconds	
+	
+	// ============================================
+	// RANGED FOLLOW STATE TRACKING
+	// ============================================
+	// Tracks whether a ranged NPC is in ranged or melee follow mode
+	// Switches to melee when target gets within RANGED_TO_MELEE_DISTANCE
+	// Switches back to ranged when target exceeds MELEE_TO_RANGED_DISTANCE
+	// THREAD SAFE: Uses mutex for multi-rider scenarios
+	
+	const float RANGED_TO_MELEE_DISTANCE = 340.0f;    // Switch to melee follow when closer than this
+	const float MELEE_TO_RANGED_DISTANCE = 500.0f;    // Switch back to ranged when further than this
+	const float RANGED_SWITCH_COOLDOWN = 2.0f;  // Minimum time between switches to prevent spam
+	
+	struct RangedFollowStateData
+	{
+		UInt32 actorFormID;
+		bool isInRangedMode;        // true = maintaining distance, false = melee follow
+		float lastSwitchTime;       // Time of last mode switch
+		bool isValid;
+	};
+	
+	static const int MAX_RANGED_FOLLOW_TRACKED = 10;
+	static RangedFollowStateData g_rangedFollowState[MAX_RANGED_FOLLOW_TRACKED];
+	static int g_rangedFollowStateCount = 0;
+	static std::mutex g_rangedFollowMutex;  // Thread safety for multi-rider scenarios
+	
+	// Get or create ranged follow state data for an actor
+	// NOTE: Caller must hold g_rangedFollowMutex lock
+	static RangedFollowStateData* GetOrCreateRangedFollowState_Unlocked(UInt32 actorFormID)
+	{
+		// Check if already tracked
+		for (int i = 0; i < g_rangedFollowStateCount; i++)
+		{
+			if (g_rangedFollowState[i].isValid && g_rangedFollowState[i].actorFormID == actorFormID)
+			{
+				return &g_rangedFollowState[i];
+			}
+		}
+		
+		// Create new entry
+		if (g_rangedFollowStateCount < MAX_RANGED_FOLLOW_TRACKED)
+		{
+			RangedFollowStateData* data = &g_rangedFollowState[g_rangedFollowStateCount];
+			data->actorFormID = actorFormID;
+			data->isInRangedMode = true;  // Start in ranged mode
+			data->lastSwitchTime = -RANGED_SWITCH_COOLDOWN;  // Allow immediate first switch
+			data->isValid = true;
+			g_rangedFollowStateCount++;
+			return data;
+		}
+		
+		return nullptr;
+	}
+	
+	// Clear ranged follow state for an actor
+	// THREAD SAFE: Uses mutex lock
+	void ClearRangedFollowState(UInt32 actorFormID)
+	{
+		std::lock_guard<std::mutex> lock(g_rangedFollowMutex);
+		
+		for (int i = 0; i < g_rangedFollowStateCount; i++)
+		{
+			if (g_rangedFollowState[i].isValid && g_rangedFollowState[i].actorFormID == actorFormID)
+			{
+				// Shift remaining entries
+				for (int j = i; j < g_rangedFollowStateCount - 1; j++)
+				{
+					g_rangedFollowState[j] = g_rangedFollowState[j + 1];
+				}
+				g_rangedFollowStateCount--;
+				return;
+			}
+		}
+	}
+	
+	// Reset all ranged follow state (call on game load)
+	// THREAD SAFE: Uses mutex lock
+	void ResetAllRangedFollowState()
+	{
+		std::lock_guard<std::mutex> lock(g_rangedFollowMutex);
+		
+		for (int i = 0; i < MAX_RANGED_FOLLOW_TRACKED; i++)
+		{
+			g_rangedFollowState[i].isValid = false;
+		}
+		g_rangedFollowStateCount = 0;
+	}
 	
 	HorseMovementData* GetOrCreateMovementData(UInt32 horseFormID)
 	{
@@ -262,7 +351,6 @@ namespace MountedNPCCombatVR
 
 		// Initialize combat subsystems
 		InitSingleMountedCombat();
-		InitMultiMountedCombat();
 
 		g_dynamicPackageSystemInitialized = true;
 		_MESSAGE("DynamicPackages: System initialized successfully");
@@ -336,68 +424,11 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// CHECK IF THIS RIDER IS IN RANGED ROLE
-		// Ranged riders are handled ENTIRELY by ExecuteRangedRoleBehavior
-		// Do NOT inject any follow package for them!
+		// CHECK COMBAT CLASS FOR SPECIAL BEHAVIOR
 		// ============================================
-		if (IsRiderInRangedRole(actor->formID))
-		{
-			// Ranged riders don't get follow packages - return success without doing anything
-			if (outAttackState) *outAttackState = 6;// Ranged role
-			return true;
-		}
-
-		// ============================================
-		// CHECK DISTANCE - STOP FOLLOW OFFSET IF WITHIN 150 UNITS
-		// Within close range, we let the 90-degree turn system handle positioning
-		// The offset follow can cause the horse to walk into the target
-		// ============================================
-		float dx = target->pos.x - actor->pos.x;
-		float dy = target->pos.y - actor->pos.y;
-		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		MountedCombatClass combatClass = DetermineCombatClass(actor);
 		
-		const float STOP_OFFSET_DISTANCE = 100.0f;
-		if (distanceToTarget < STOP_OFFSET_DISTANCE)
-		{
-			// Within close range - clear any follow offset and let 90-degree turn handle it
-			Actor_ClearKeepOffsetFromActor(actor);
-			return true;
-		}
-
-		// Pause any current dialogue
-		get_vfunc<_Actor_PauseCurrentDialogue>(actor, 0x4F)(actor);
-
-		// Create package type 1 (Follow)
-		TESPackage* package = CreatePackageByType(kPackageType_Follow);
-		if (!package)
-		{
-			_MESSAGE("DynamicPackages: ERROR - Failed to create follow package!");
-			return false;
-		}
-
-		package->packageFlags |= 6;
-
-		PackageLocation packageLocation;
-		PackageLocation_CTOR(&packageLocation);
-		PackageLocation_SetNearReference(&packageLocation, actor);
-		TESPackage_SetPackageLocation(package, &packageLocation);
-
-		PackageTarget packageTarget;
-		PackageTarget_CTOR(&packageTarget);
-		TESPackage_SetPackageTarget(package, &packageTarget);
-		PackageTarget_ResetValueByTargetType((PackageTarget*)package->unk40, 0);
-		PackageTarget_SetFromReference((PackageTarget*)package->unk40, target);
-
-		TESPackage_sub_140439BE0(package, 0);
-
-		if (TESPackage* currentPackage = process->unk18.package)
-		{
-			TESPackage_CopyFlagsFromOtherPackage(package, currentPackage);
-		}
-
-		get_vfunc<_Actor_PutCreatedPackage>(actor, 0xE1)(actor, package, true, 1);
-
-		// Force the HORSE TO FOLLOW TARGET (use actual target, not player!)
+		// Get the actor's mount
 		NiPointer<Actor> mount;
 		if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
 		{
@@ -406,17 +437,138 @@ namespace MountedNPCCombatVR
 			// ============================================
 			if (mount->loadedState && mount->GetNiNode() && mount->processManager)
 			{
-				// Double-check: Don't apply follow to ranged role horses
-				if (!IsHorseRiderInRangedRole(mount->formID))
+				// ============================================
+				// SKIP FOLLOW PACKAGE DURING SPECIAL MANEUVERS
+				// Rapid fire, charge, and stand ground have their own movement control
+				// Injecting follow packages during these causes CTD in MovementPathManager
+				// ============================================
+				if (IsInRapidFire(mount->formID))
 				{
-					ForceHorseCombatWithTarget(mount.get(), target);
+					// Rapid fire active - skip follow package, let rapid fire handle movement
 					int attackState = InjectTravelPackageToHorse(mount.get(), target);
 					if (outAttackState) *outAttackState = attackState;
+					return true;
 				}
-				else
+				
+				if (IsHorseCharging(mount->formID))
 				{
-					if (outAttackState) *outAttackState = 6;  // Ranged role
+					// Charge active - skip follow package, let charge handle movement
+					int attackState = InjectTravelPackageToHorse(mount.get(), target);
+					if (outAttackState) *outAttackState = attackState;
+					return true;
 				}
+				
+				if (IsInStandGround(mount->formID))
+				{
+					// Stand ground active - skip follow package
+					int attackState = InjectTravelPackageToHorse(mount.get(), target);
+					if (outAttackState) *outAttackState = attackState;
+					return true;
+				}
+				
+				// ============================================
+				// MAGE CLASS - SPECIAL HANDLING
+				// Mages use different follow packages based on combat mode:
+				// - SPELL MODE: Maintain MageRoleIdealDistance, stand ground if closer
+				// - MELEE MODE: Use standard melee follow (close in on target)
+				// ============================================
+				if (combatClass == MountedCombatClass::MageCaster)
+				{
+					// Ensure mage has staff equipped (one-time setup)
+					if (!IsStaffEquipped(actor))
+					{
+						RequestWeaponSwitch(actor, WeaponRequest::Staff);
+						_MESSAGE("InjectFollowPackage: MAGE %08X - equipping staff", actor->formID);
+					}
+					
+					// Calculate distance to target
+					float dx = target->pos.x - mount->pos.x;
+					float dy = target->pos.y - mount->pos.y;
+					float distToTarget = sqrt(dx * dx + dy * dy);
+					
+					// Update combat mode (handles buffer zone and cooldown)
+					MageCombatMode combatMode = UpdateMageCombatMode(actor->formID, distToTarget);
+					
+					if (combatMode == MageCombatMode::Spell)
+					{
+						// SPELL MODE: Maintain distance
+						// Only call ForceHorseCombatWithTarget if mage is TOO FAR
+						// When within range, InjectTravelPackageToHorse handles everything
+						if (distToTarget > MageRoleIdealDistance)
+						{
+							ForceHorseCombatWithTarget(mount.get(), target);
+						}
+						else
+						{
+							// Within range - do nothing, let horse stay where it is
+						}
+					}
+					else
+					{
+						// MELEE MODE: Close in on target like a normal melee fighter
+						ForceHorseCombatWithTarget(mount.get(), target);
+					}
+					
+					// Process travel package - mage stance handled there
+					int attackState = InjectTravelPackageToHorse(mount.get(), target);
+					if (outAttackState) *outAttackState = attackState;
+					return true;
+				}
+				
+				// ============================================
+				// RANGED ROLE - SPECIAL HANDLING
+				// Uses EXACT same follow logic as mages - ALWAYS maintains distance
+				// Ranged role riders NEVER chase with melee, they stand ground
+				// NOW USES WEAPON SWITCHING STATE MACHINE FOR BOW/MELEE
+				// ============================================
+				if (IsInRangedRole(actor->formID))
+				{
+					// Calculate distance to target
+					float dx = target->pos.x - mount->pos.x;
+					float dy = target->pos.y - mount->pos.y;
+					float distToTarget = sqrt(dx * dx + dy * dy);
+					
+					// ============================================
+					// CHECK IF TARGET IS MOUNTED FOR WEAPON SWITCHING
+					// ============================================
+					bool targetIsMountedForRanged = false;
+					NiPointer<Actor> targetMountCheck;
+					if (CALL_MEMBER_FN(target, GetMount)(targetMountCheck) && targetMountCheck)
+					{
+						targetIsMountedForRanged = true;
+					}
+					
+					// ============================================
+					// WEAPON SWITCHING FOR RANGED ROLE - CRITICAL!
+					// Ranged role uses the same distance-based weapon switching
+					// as all other riders via UpdateRiderWeaponForDistance
+					// This handles bow at range, melee when target gets close
+					// - Bow when distance > WeaponSwitchDistance (default 250)
+					// - Melee when distance <= WeaponSwitchDistance
+					// ============================================
+					UpdateRiderWeaponForDistance(actor, distToTarget, targetIsMountedForRanged);
+					
+					// RANGED ROLE: ALWAYS maintain distance (like mages in spell mode)
+					// Only call ForceHorseCombatWithTarget if too far
+					// When within range, just skip - let horse stay where it is
+					if (distToTarget > DynamicRangedRoleIdealDistance)
+					{
+						ForceHorseCombatWithTarget(mount.get(), target);
+					}
+					// Within range - do nothing, let horse stay where it is
+					// Rider will use bow at any range, or melee if target gets very close
+					
+					// Process travel package
+					int attackState = InjectTravelPackageToHorse(mount.get(), target);
+					if (outAttackState) *outAttackState = attackState;
+					return true;
+				}
+				
+				// All other classes use standard close-range follow
+				ForceHorseCombatWithTarget(mount.get(), target);
+				
+				int attackState = InjectTravelPackageToHorse(mount.get(), target);
+				if (outAttackState) *outAttackState = attackState;
 			}
 		}
 
@@ -557,10 +709,10 @@ namespace MountedNPCCombatVR
 	}
 	
 	// ============================================
-	// SET NPC RANGED FOLLOW (500 units from target)
+	// SET NPC RANGED FOLLOW (DynamicRangedRoleIdealDistance units from target)
 	// ============================================
 	// Similar to regular follow but maintains greater distance
-	// Used for ranged combat positioning
+	// Used for ranged combat positioning (archers/bows in dynamic ranged role)
 	// - Faces target when stationary
 	// - Faces target when traveling toward them
 	// - Faces travel direction when moving away (no backwards walking)
@@ -579,10 +731,10 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 
-		// Offset 500 units away from target
+		// Offset using DynamicRangedRole config value (default 800 units away from target)
 		NiPoint3 offset;
 		offset.x = 0;
-		offset.y = -500.0f;// 500 units behind/away from target
+		offset.y = -DynamicRangedRoleIdealDistance;  // Use dynamic ranged role config value
 		offset.z = 0;
 
 		NiPoint3 offsetAngle;
@@ -590,10 +742,193 @@ namespace MountedNPCCombatVR
 		offsetAngle.y = 0;
 		offsetAngle.z = 0;
 
-		// catchUpRadius = 800, followRadius = 500 (maintain ~500 unit distance)
-		Actor_KeepOffsetFromActor(actor, targetHandle, offset, offsetAngle, 800.0f, 500.0f);
+		// catchUpRadius slightly larger than ideal, followRadius = ideal distance
+		float catchUp = DynamicRangedRoleIdealDistance + 200.0f;
+		Actor_KeepOffsetFromActor(actor, targetHandle, offset, offsetAngle, catchUp, DynamicRangedRoleIdealDistance);
 		
-		_MESSAGE("DynamicPackages: Set ranged follow for actor %08X (500 units from target %08X)", actor->formID, target->formID);
+		_MESSAGE("DynamicPackages: Set RANGED follow for actor %08X (%.0f units from target %08X)", 
+			actor->formID, DynamicRangedRoleIdealDistance, target->formID);
+		return true;
+	}
+	
+	// ============================================
+	// UPDATE RANGED FOLLOW STATE (Distance-based mode switching)
+	// ============================================
+	// Call this periodically for ranged NPCs to check if they should switch
+	// between ranged follow (maintaining distance) and melee follow (close combat).
+	// - Switches to MELEE when target is within RANGED_TO_MELEE_DISTANCE (340 units)
+	// - Switches back to RANGED when target exceeds MELEE_TO_RANGED_DISTANCE (500 units)
+	// - Has cooldown to prevent rapid switching spam
+	// Returns: true if a switch occurred, false otherwise
+	// THREAD SAFE: Uses mutex lock for state access
+	
+	bool UpdateRangedFollowState(Actor* actor, Actor* target)
+	{
+		if (!actor || !target)
+		{
+			return false;
+		}
+		
+		// Calculate current distance to target (no lock needed - just reading actor positions)
+		float dx = target->pos.x - actor->pos.x;
+		float dy = target->pos.y - actor->pos.y;
+		float distanceToTarget = sqrt(dx * dx + dy * dy);
+		
+		// Get current time for cooldown check
+		float currentTime = GetGameTime();
+		
+		// Variables to capture state under lock
+		bool isInRangedMode = true;
+		float lastSwitchTime = 0.0f;
+		bool dataFound = false;
+		
+		// Lock to read current state
+		{
+			std::lock_guard<std::mutex> lock(g_rangedFollowMutex);
+			RangedFollowStateData* data = GetOrCreateRangedFollowState_Unlocked(actor->formID);
+			if (data)
+			{
+				isInRangedMode = data->isInRangedMode;
+				lastSwitchTime = data->lastSwitchTime;
+				dataFound = true;
+			}
+		}
+		
+		if (!dataFound)
+		{
+			return false;
+		}
+		
+		float timeSinceLastSwitch = currentTime - lastSwitchTime;
+		
+		// Check cooldown - prevent spam switching
+		if (timeSinceLastSwitch < RANGED_SWITCH_COOLDOWN)
+		{
+			return false;// Still on cooldown
+		}
+		
+		bool switchOccurred = false;
+		bool newRangedMode = isInRangedMode;
+		
+		// Currently in RANGED mode - check if should switch to MELEE
+		if (isInRangedMode)
+		{
+			if (distanceToTarget < RANGED_TO_MELEE_DISTANCE)
+			{
+				// Target is too close - switch to melee follow
+				// Get actor's mount to apply the follow package
+				NiPointer<Actor> mount;
+				if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
+				{
+					if (mount->loadedState && mount->GetNiNode() && mount->processManager)
+					{
+						// Switch to standard melee follow (no lock - game call)
+						ForceHorseCombatWithTarget(mount.get(), target);
+						
+						newRangedMode = false;
+						switchOccurred = true;
+						
+						_MESSAGE("DynamicPackages: Ranged actor %08X switched to MELEE follow (distance: %.0f < %.0f)",
+							actor->formID, distanceToTarget, RANGED_TO_MELEE_DISTANCE);
+					}
+				}
+			}
+		}
+		// Currently in MELEE mode - check if should switch back to RANGED
+		else
+		{
+			if (distanceToTarget > MELEE_TO_RANGED_DISTANCE)
+			{
+				// Target is far enough - switch back to ranged follow
+				NiPointer<Actor> mount;
+				if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
+				{
+					if (mount->loadedState && mount->GetNiNode() && mount->processManager)
+					{
+						// Switch back to ranged follow (no lock - game call)
+						SetNPCRangedFollowFromTarget(mount.get(), target);
+						
+						newRangedMode = true;
+					 switchOccurred = true;
+						
+						_MESSAGE("DynamicPackages: Ranged actor %08X switched back to RANGED follow (distance: %.0f > %.0f)",
+							actor->formID, distanceToTarget, MELEE_TO_RANGED_DISTANCE);
+					}
+				}
+			}
+		}
+		
+		// If a switch occurred, update state under lock
+		if (switchOccurred)
+		{
+			std::lock_guard<std::mutex> lock(g_rangedFollowMutex);
+			RangedFollowStateData* data = GetOrCreateRangedFollowState_Unlocked(actor->formID);
+			if (data)
+			{
+				data->isInRangedMode = newRangedMode;
+				data->lastSwitchTime = currentTime;
+			}
+		}
+		
+		return switchOccurred;
+	}
+	
+	// Check if actor is currently in ranged follow mode
+	// THREAD SAFE: Uses mutex lock
+	bool IsInRangedFollowMode(UInt32 actorFormID)
+	{
+		std::lock_guard<std::mutex> lock(g_rangedFollowMutex);
+		
+		for (int i = 0; i < g_rangedFollowStateCount; i++)
+		{
+			if (g_rangedFollowState[i].isValid && g_rangedFollowState[i].actorFormID == actorFormID)
+			{
+				return g_rangedFollowState[i].isInRangedMode;
+			}
+		}
+		return true;  // Default to ranged mode if not tracked
+	}
+	
+	// ============================================
+	// SET NPC MAGE FOLLOW (MageRoleIdealDistance units from target)
+	// ============================================
+	// Similar to ranged follow but maintains closer distance for mages
+	// Used for mage/staff combat positioning
+	// - Faces target when stationary
+	// - Faces target when traveling toward them
+	// - Faces travel direction when moving away (no backwards walking)
+	
+	bool SetNPCMageFollowFromTarget(Actor* actor, Actor* target)
+	{
+		if (!actor || !target)
+		{
+			return false;
+		}
+
+		UInt32 targetHandle = target->CreateRefHandle();
+
+		if (targetHandle == 0 || targetHandle == *g_invalidRefHandle)
+		{
+			return false;
+		}
+
+		// Offset using config value (default 500 units away from target)
+		NiPoint3 offset;
+		offset.x = 0;
+		offset.y = -MageRoleIdealDistance;  // Use config value (closer than archers)
+		offset.z = 0;
+
+		NiPoint3 offsetAngle;
+		offsetAngle.x = 0;
+		offsetAngle.y = 0;
+		offsetAngle.z = 0;
+
+		// catchUpRadius slightly larger than ideal, followRadius = ideal distance
+		float catchUp = MageRoleIdealDistance + 150.0f;
+		Actor_KeepOffsetFromActor(actor, targetHandle, offset, offsetAngle, catchUp, MageRoleIdealDistance);
+		
+		_MESSAGE("DynamicPackages: Set MAGE follow for actor %08X (%.0f units from target %08X)", 
+			actor->formID, MageRoleIdealDistance, target->formID);
 		return true;
 	}
 	
@@ -723,6 +1058,59 @@ namespace MountedNPCCombatVR
 			return false;
 		}
 		
+		// ============================================
+		// CRITICAL: VALIDATE FORMIDS
+		// Ensure both actors have valid FormIDs before proceeding
+		// ============================================
+		if (horse->formID == 0 || horse->formID == 0xFFFFFFFF)
+		{
+			_MESSAGE("ForceHorseCombatWithTarget: Invalid horse formID - skipping");
+			return false;
+		}
+		
+		if (target->formID == 0 || target->formID == 0xFFFFFFFF)
+		{
+			_MESSAGE("ForceHorseCombatWithTarget: Invalid target formID - skipping");
+			return false;
+		}
+		
+		// ============================================
+		// CRITICAL: VERIFY FORMIDS BY LOOKUP
+		// Ensure the FormIDs are still valid in the game
+		// ============================================
+		TESForm* horseForm = LookupFormByID(horse->formID);
+		TESForm* targetForm = LookupFormByID(target->formID);
+		
+		if (!horseForm || horseForm != (TESForm*)horse)
+		{
+			_MESSAGE("ForceHorseCombatWithTarget: Horse %08X form mismatch - skipping", horse->formID);
+			return false;
+		}
+		
+		if (!targetForm || targetForm != (TESForm*)target)
+		{
+			_MESSAGE("ForceHorseCombatWithTarget: Target %08X form mismatch - skipping", target->formID);
+			return false;
+		}
+		
+		
+		// ============================================
+		// CRITICAL: CHECK DISENGAGE COOLDOWN
+		// Don't inject follow package for actors that are disengaging
+		// This prevents the BGSProcedureFollowExecState CTD
+		// ============================================
+		// Check if the rider (who owns the horse) is on disengage cooldown
+		NiPointer<Actor> rider;
+		bool hasRider = CALL_MEMBER_FN(horse, GetMountedBy)(rider);
+		if (hasRider && rider)
+		{
+			if (IsNPCOnDisengageCooldown(rider->formID))
+			{
+				_MESSAGE("ForceHorseCombatWithTarget: Rider %08X on disengage cooldown - skipping follow injection", rider->formID);
+				return false;
+			}
+		}
+		
 		// Verify horse has required components for movement
 		if (!horse->processManager || !horse->processManager->middleProcess)
 		{
@@ -797,33 +1185,75 @@ namespace MountedNPCCombatVR
 		horse->flags2 |= Actor::kFlag_kAttackOnSight;
 
 		// ============================================
-		// CHECK IF THIS HORSE'S RIDER IS IN RANGED ROLE
-		// If so, don't apply standard follow - ranged behavior handles movement
-		// ============================================
-		if (IsHorseRiderInRangedRole(horse->formID))
-		{
-			// Ranged horses are handled by ExecuteRangedRoleBehavior
-			// Don't apply any follow package here - just return
-			return true;
-		}
-
-		// ============================================
-		// CHECK DISTANCE - STOP FOLLOW OFFSET IF WITHIN 150 UNITS
+		// CHECK DISTANCE - SKIP FOLLOW OFFSET IF WITHIN 150 UNITS
 		// Within close range, we let the 90-degree turn system handle positioning
 		// The offset follow can cause the horse to walk into the target
+		// DO NOT call Actor_ClearKeepOffsetFromActor - it causes CTD!
 		// ============================================
 		const float STOP_OFFSET_DISTANCE = 150.0f;
 		if (distanceToTarget < STOP_OFFSET_DISTANCE)
 		{
-			// Within close range - clear any follow offset and let 90-degree turn handle it
-			Actor_ClearKeepOffsetFromActor(horse);
+			// Within close range - just return true without setting any offset
+			// The 90-degree turn system handles positioning at this range
 			return true;
+		}
+
+		// ============================================
+		// DETERMINE FOLLOW DISTANCE BASED ON RIDER'S COMBAT CLASS
+		// - MageCaster: Uses MageRoleIdealDistance (default 550) - maintains distance, stands ground if closer
+		// - All others: Standard melee follow (300 units)
+		// ============================================
+		float followDistance = 300.0f;  // Default melee follow distance
+		float offsetX = 200.0f;   // Default side offset
+		float catchUpRadius = 1000.0f;  // Default catch-up radius
+		
+		// Check rider's combat class if we have a rider
+		if (hasRider && rider)
+		{
+			MountedCombatClass combatClass = DetermineCombatClass(rider.get());
+			
+			if (combatClass == MountedCombatClass::MageCaster)
+			{
+				// Mages maintain MageRoleIdealDistance from target
+				// They stand ground if target gets closer (handled elsewhere)
+				followDistance = MageRoleIdealDistance;
+				offsetX = 0.0f;  // No side offset for mages - they want direct line of sight
+				catchUpRadius = MageRoleIdealDistance + 200.0f;
+				
+				// Only log once per mage (use static to track)
+				static UInt32 lastLoggedMage = 0;
+				if (lastLoggedMage != rider->formID)
+				{
+					lastLoggedMage = rider->formID;
+					_MESSAGE("ForceHorseCombatWithTarget: MAGE rider %08X - using follow distance %.0f", 
+						rider->formID, followDistance);
+				}
+			}
+			// ============================================
+			// RANGED ROLE - ALWAYS uses distant follow like mages
+			// Ranged role riders NEVER use melee follow - they maintain distance
+			// ============================================
+			else if (IsInRangedRole(rider->formID))
+			{
+				// ALWAYS use ranged distance - no melee mode check
+				followDistance = DynamicRangedRoleIdealDistance;
+				offsetX = 0.0f;  // No side offset - direct line of sight for bow
+				catchUpRadius = DynamicRangedRoleIdealDistance + 200.0f;
+				
+				static UInt32 lastLoggedRanged = 0;
+				if (lastLoggedRanged != rider->formID)
+				{
+					lastLoggedRanged = rider->formID;
+					_MESSAGE("ForceHorseCombatWithTarget: RANGED ROLE rider %08X - using follow distance %.0f", 
+						rider->formID, followDistance);
+				}
+			}
 		}
 
 		// Standard melee follow - close in on target
 		NiPoint3 offset;
-		offset.x = 200.0f;
-		offset.y = -300.0f;
+		offset.x = offsetX;
+		offset.y = -followDistance;
 		offset.z = 0;
 
 		NiPoint3 offsetAngle;
@@ -831,7 +1261,7 @@ namespace MountedNPCCombatVR
 		offsetAngle.y = 0;
 		offsetAngle.z = 0;
 
-		Actor_KeepOffsetFromActor(horse, targetHandle, offset, offsetAngle, 1000.0f, 300.0f);
+		Actor_KeepOffsetFromActor(horse, targetHandle, offset, offsetAngle, catchUpRadius, followDistance);
 		Actor_EvaluatePackage(horse, false, false);
 
 		return true;
@@ -884,7 +1314,7 @@ namespace MountedNPCCombatVR
 		
 		return false;
 	}
-	
+
 	int InjectTravelPackageToHorse(Actor* horse, Actor* target)
 	{
 		// ============================================
@@ -1168,34 +1598,117 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// GET RIDER AND REGISTER WITH MULTI-COMBAT SYSTEM
+		// MAGE COMBAT STANCE - EARLY EXIT
+		// Mages in SPELL mode maintain distance and STOP when within MageRoleIdealDistance
+		// Mages in MELEE mode use normal melee combat (handled below)
+		// Also handles mage tactical retreat (25% chance every 15 seconds)
 		// ============================================
+		NiPointer<Actor> riderForMageCheck;
+		if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForMageCheck) && riderForMageCheck)
+		{
+			MountedCombatClass riderClass = DetermineCombatClass(riderForMageCheck.get());
+			
+			if (riderClass == MountedCombatClass::MageCaster)
+			{
+				// Check for mage tactical retreat (25% chance every 15 seconds)
+				if (CheckAndTriggerMageRetreat(riderForMageCheck.get(), horse, target, distanceToTarget))
+				{
+					// Mage is retreating - skip all other processing
+					return 9;  // Mage retreating state
+				}
+				
+				// Check current combat mode (updated earlier in this function)
+				MageCombatMode combatMode = UpdateMageCombatMode(riderForMageCheck->formID, distanceToTarget);
+				
+				if (combatMode == MageCombatMode::Spell)
+				{
+					// SPELL MODE: Maintain distance, stop when within ideal range
+					if (distanceToTarget <= MageRoleIdealDistance)
+					{
+						// Within ideal distance - STOP movement only
+						StopHorseSprint(horse);
+						
+						// DO NOT clear follow package - let it handle rotation naturally
+						// DO NOT apply any rotation here
+						
+						// EARLY RETURN - skip all other code paths
+						return 8;  // Mage stance (spell mode)
+					}
+				}
+				// MELEE MODE: Fall through to normal melee combat logic below
+			}
+			
+			// ============================================
+			// RANGED ROLE - EARLY EXIT (SAME AS MAGE SPELL MODE)
+			// Ranged role riders maintain distance and NEVER chase with melee
+			// They stand ground at DynamicRangedRoleIdealDistance
+			// BUT they still use distance-based weapon switching!
+			// ============================================
+			if (IsInRangedRole(riderForMageCheck->formID))
+			{
+				// ============================================
+				// WEAPON SWITCHING FOR RANGED ROLE - CRITICAL!
+				// Ranged role riders switch between bow and melee based on distance
+				// - Bow when distanceToTarget > WeaponSwitchDistance
+				// - Melee when distanceToTarget <= WeaponSwitchDistance
+				// This MUST happen before any early returns!
+				// ============================================
+				UpdateRiderWeaponForDistance(riderForMageCheck.get(), distanceToTarget, targetIsMountedCheck);
+				
+				// If bow is equipped and at range, fire it
+				// Use WeaponSwitchDistance as the threshold for firing (not ideal distance)
+				if (IsBowEquipped(riderForMageCheck.get()) && distanceToTarget > WeaponSwitchDistance)
+				{
+					UpdateBowAttack(riderForMageCheck.get(), true, target);
+				}
+				
+				// Ranged role ALWAYS maintains distance - no melee mode
+				if (distanceToTarget <= DynamicRangedRoleIdealDistance)
+				{
+					// Within ideal distance - STOP movement
+					StopHorseSprint(horse);
+					
+					// If target is very close (within melee range), allow melee attacks
+					// but DON'T chase - just attack from current position
+					if (distanceToTarget < meleeRange)
+					{
+						// Determine attack side
+						float horseRightX = cos(horse->rot.z);
+						float horseRightY = -sin(horse->rot.z);
+						float toTargetX = target->pos.x - horse->pos.x;
+						float toTargetY = target->pos.y - horse->pos.y;
+						float dotRight = (toTargetX * horseRightX) + (toTargetY * horseRightY);
+						const char* targetSide = (dotRight > 0) ? "RIGHT" : "LEFT";
+						
+						// Play melee attack if melee weapon equipped
+						if (IsMeleeEquipped(riderForMageCheck.get()))
+						{
+							PlayMountedAttackAnimation(riderForMageCheck.get(), targetSide);
+							if (IsRiderAttacking(riderForMageCheck.get()))
+							{
+								UpdateMountedAttackHitDetection(riderForMageCheck.get(), target);
+							}
+						}
+					}
+					
+					// EARLY RETURN - skip all other code paths
+					// This prevents the travel package from being created
+					return 6;  // Ranged role stance
+				}
+				// If too far, fall through to allow normal approach
+				// But ForceHorseCombatWithTarget already set the ranged follow distance
+			}
+		}
+		
+		// ============================================
+		// GET RIDER FOR WEAPON SWITCHING AND ATTACKS
+		// ============================================
+
 		NiPointer<Actor> rider;
 		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
 		{
-			// Register rider with multi-combat system (assigns role)
-			MultiCombatRole role = RegisterMultiRider(rider.get(), horse, target);
-			
-			// ============================================
-			// CHECK IF THIS RIDER IS IN RANGED ROLE
-			// Ranged riders are handled ENTIRELY by ExecuteRangedRoleBehavior
-			// We just update distance and return - no rotation here!
-			// ============================================
-			if (IsHorseRiderInRangedRole(horse->formID))
-			{
-				// Update distance for the multi-rider data
-				MultiRiderData* data = GetMultiRiderDataByHorse(horse->formID);
-				if (data)
-				{
-					data->distanceToTarget = distanceToTarget;
-					
-					// Execute ranged behavior (handles rotation, bow equip, firing)
-					ExecuteRangedRoleBehavior(data, rider.get(), horse, target);
-				}
-				
-				// Return 6 to skip all other behavior
-				return 6;
-			}
+			// All riders use standard melee/ranged behavior now
+			// No special ranged role handling
 		}
 		
 		// ============================================
@@ -1272,15 +1785,26 @@ namespace MountedNPCCombatVR
 				NiPointer<Actor> riderForAttack;
 				if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
 				{
-					PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+					// ============================================
+					// MAGES USE MELEE ATTACKS WHEN IN MELEE MODE
+					// Mode is determined by UpdateMageCombatMode with buffer zone
+					// ============================================
+					MountedCombatClass attackerClass = DetermineCombatClass(riderForAttack.get());
+					bool mageInMeleeMode = (attackerClass == MountedCombatClass::MageCaster && IsMageInMeleeMode(riderForAttack->formID));
 					
-					if (IsRiderAttacking(riderForAttack.get()))
+					if (attackerClass != MountedCombatClass::MageCaster || mageInMeleeMode)
 					{
-						UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+						PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						
+						if (IsRiderAttacking(riderForAttack.get()))
+						{
+							UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+						}
 					}
 				}
 				
-				return 2;  // In attack position
+				// CRITICAL: Return immediately to skip ALL OTHER rotation code
+				return 7;  // Stand ground with locked rotation
 			}
 			
 			return 1;  // In melee range, turning
@@ -1295,7 +1819,6 @@ namespace MountedNPCCombatVR
 		if (!IsInStandGround(horse->formID))
 		{
 			if (!IsInRapidFire(horse->formID) && 
-				!IsHorseRiderInRangedRole(horse->formID) &&
 				!IsInStandGround(horse->formID) &&
 				!IsHorseCharging(horse->formID))
 			{
@@ -1322,59 +1845,14 @@ namespace MountedNPCCombatVR
 					else
 					{
 						// ============================================
-						// CHECK FOR ELEVATED TARGET - TRACK JUMP ATTEMPTS
-						// If target is significantly above horse and we're stuck,
-						// track failed jump attempts for potential dismount
+						// ELEVATED TARGET / COMBAT DISMOUNT SYSTEM REMOVED
+						// NPCs will stay mounted and use jump for obstruction escape
 						// ============================================
-						bool targetIsElevated = IsTargetElevatedAboveHorse(horse, target);
-						
-						if (targetIsElevated)
-						{
-							_MESSAGE("DynamicPackages: Horse %08X target is ELEVATED (%.0f units above) - tracking jump attempts",
-								horse->formID, target->pos.z - horse->pos.z);
-						}
 						
 						if (TryHorseJumpToEscape(horse))
 						{
-							// Jump triggered - track for stuck/elevated target detection
-							TrackJumpAttemptForElevatedTarget(horse, target);
-							
-							// ============================================
-							// CHECK FOR DISMOUNT CONDITIONS
-							// 1. Elevated target: 2 jumps in same area
-							// 2. General stuck: 3 jumps in 20 seconds in same area
-							// ============================================
-							bool shouldDismount = false;
-							const char* dismountReason = nullptr;
-							
-							if (targetIsElevated && ShouldDismountForElevatedTarget(horse, target))
-							{
-								shouldDismount = true;
-								dismountReason = "elevated target";
-							}
-							else if (ShouldDismountForGeneralStuck(horse))
-							{
-								shouldDismount = true;
-								dismountReason = "general stuck (3 jumps in short time)";
-							}
-							
-							if (shouldDismount)
-							{
-								NiPointer<Actor> riderForDismount;
-								if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForDismount) && riderForDismount)
-								{
-									_MESSAGE("DynamicPackages: Triggering combat dismount for rider %08X - reason: %s",
-										riderForDismount->formID, dismountReason);
-									ExecuteCombatDismount(riderForDismount.get(), horse);
-								}
-							}
-						}
-						else
-						{
-							if (TryHorseTrotTurnFromObstruction(horse))
-							{
-								// Trot turn triggered - log in SpecialMovesets
-							}
+							// Jump triggered - log only
+							_MESSAGE("DynamicPackages: Horse %08X jumped to escape obstruction", horse->formID);
 						}
 					}
 				}
@@ -1394,33 +1872,56 @@ namespace MountedNPCCombatVR
 		
 		// ============================================
 		// WEAPON SWITCHING - ALL RIDERS USE CENTRALIZED SYSTEM
-		// Single/Multi, Melee/Ranged - everyone uses UpdateRiderWeaponForDistance
+		// SINGLE/MULTI, MELEE/RANGED - EVERYONE USES UPDATERIDERWEAPONFORDISTANCE
+		// EXCEPTION: MAGES NEVER SWITCH WEAPONS - THEY KEEP STAFF EQUIPPED
 		// ============================================
-
 		// Re-get rider reference
 		if (CALL_MEMBER_FN(horse, GetMountedBy)(rider) && rider)
 		{
-			// Skip weapon switching during special maneuvers
-			if (!IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID))
+			// Check if rider is a mage - mages NEVER switch weapons or use melee/bow
+			MountedCombatClass riderCombatClass = DetermineCombatClass(rider.get());
+			bool isMage = (riderCombatClass == MountedCombatClass::MageCaster);
+			
+			// Skip weapon switching during special maneuvers OR if rider is a mage
+			if (!IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID) && !isMage)
 			{
 				// ALL riders use the same distance-based weapon switching
 				// Pass targetIsMountedCheck to use appropriate switch distance
 				UpdateRiderWeaponForDistance(rider.get(), distanceToTarget, targetIsMountedCheck);
-				
+
 				// If bow is equipped and at range, fire it
 				if (IsBowEquipped(rider.get()) && distanceToTarget > WeaponSwitchDistance)
 				{
 					UpdateBowAttack(rider.get(), true, target);
 				}
 			}
+			
+			// ============================================
+			// MAGE SPELL CASTING - Fire and Forget spells
+			// Mages cast spells at targets up to SpellRangeMax (2000 units)
+			// This is called every frame for mages to handle charge/cast/cooldown
+			// Also updates mage combat mode (melee vs spell)
+			// ============================================
+			if (isMage)
+			{
+				// Update mage combat mode (handles buffer zone and cooldown)
+				MageCombatMode combatMode = UpdateMageCombatMode(rider->formID, distanceToTarget);
+				
+				// Only cast spells when in Spell mode
+				if (combatMode == MageCombatMode::Spell)
+				{
+					UpdateMageSpellCasting(rider.get(), target, distanceToTarget);
+				}
+			}
 		}
 		
 		int attackState = 0;
-		
+
 		// ============================================
 		// CHECK IF TARGET IS MOUNTED
 		// (Already checked above for melee range - reuse the result)
 		// ============================================
+
 		bool targetIsMounted = targetIsMountedCheck;
 		
 		// ============================================
@@ -1438,8 +1939,8 @@ namespace MountedNPCCombatVR
 					
 					float currentAngle = horse->rot.z;
 					float angleDiff = targetAngle - currentAngle;
-				 while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-				 while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 					
 					float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 					horse->rot.z = newAngle;
@@ -1455,8 +1956,8 @@ namespace MountedNPCCombatVR
 					
 					float currentAngle = horse->rot.z;
 					float angleDiff = targetAngle - currentAngle;
-				 while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-				 while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 					
 					float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 					horse->rot.z = newAngle;
@@ -1477,16 +1978,16 @@ namespace MountedNPCCombatVR
 					// Rapid fire just triggered - stop horse movement immediately
 					Actor_ClearKeepOffsetFromActor(horse);
 					ClearInjectedPackages(horse);
-					Actor_EvaluatePackage(horse, false, false);
-					
+		Actor_EvaluatePackage(horse, false, false);
+
 					_MESSAGE("DynamicPackages: RAPID FIRE TRIGGERED - Horse %08X movement STOPPED (rotation continues)", horse->formID);
 					
-					targetAngle = angleToTarget;
+				 targetAngle = angleToTarget;
 					
 					float currentAngle = horse->rot.z;
 					float angleDiff = targetAngle - currentAngle;
-				 while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
-				 while (angleDiff < -3.14159f) angleDiff += 6.28318f;
+					while (angleDiff > 3.14159f) angleDiff -= 6.28318f;
+					while (angleDiff < -3.14159f) angleDiff += 6.28318f;
 					
 					float newAngle = currentAngle + (angleDiff * HorseRotationSpeed);  // Use config value
 					horse->rot.z = newAngle;
@@ -1502,7 +2003,7 @@ namespace MountedNPCCombatVR
 		
 		if (distanceToTarget < meleeRange)
 		{
-			TryRearUpOnApproach(horse, target, distanceToTarget);
+		 TryRearUpOnApproach(horse, target, distanceToTarget);
 			
 			// ============================================
 			// CLOSE RANGE MELEE ASSAULT - EMERGENCY CLOSE COMBAT
@@ -1537,7 +2038,7 @@ namespace MountedNPCCombatVR
 			
 			// ============================================
 			// TRY PLAYER AGGRO SWITCH (vs non-player NPCs only)
-			// 15% chance every 20 seconds when player is within 1500 units
+		 // 15% chance every 20 seconds when player is within 1500 units
 			// Switches target to player and triggers a charge!
 			// ============================================
 			if (!targetIsPlayer && !IsHorseCharging(horse->formID) && !IsInRapidFire(horse->formID))
@@ -1626,11 +2127,21 @@ namespace MountedNPCCombatVR
 					NiPointer<Actor> riderForAttack;
 					if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
 					{
-						PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						// ============================================
+						// MAGES USE MELEE ATTACKS WHEN IN MELEE MODE
+						// Mode is determined by UpdateMageCombatMode with buffer zone
+						// ============================================
+						MountedCombatClass attackerClass = DetermineCombatClass(riderForAttack.get());
+						bool mageInMeleeMode = (attackerClass == MountedCombatClass::MageCaster && IsMageInMeleeMode(riderForAttack->formID));
 						
-						if (IsRiderAttacking(riderForAttack.get()))
+						if (attackerClass != MountedCombatClass::MageCaster || mageInMeleeMode)
 						{
-							UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+							PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						
+							if (IsRiderAttacking(riderForAttack.get()))
+							{
+								UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+							}
 						}
 					}
 				}
@@ -1667,11 +2178,21 @@ namespace MountedNPCCombatVR
 					NiPointer<Actor> riderForAttack;
 					if (CALL_MEMBER_FN(horse, GetMountedBy)(riderForAttack) && riderForAttack)
 					{
-						PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						// ============================================
+						// MAGES USE MELEE ATTACKS WHEN IN MELEE MODE
+						// Mode is determined by UpdateMageCombatMode with buffer zone
+						// ============================================
+						MountedCombatClass attackerClass = DetermineCombatClass(riderForAttack.get());
+						bool mageInMeleeMode = (attackerClass == MountedCombatClass::MageCaster && IsMageInMeleeMode(riderForAttack->formID));
 						
-						if (IsRiderAttacking(riderForAttack.get()))
+						if (attackerClass != MountedCombatClass::MageCaster || mageInMeleeMode)
 						{
-							UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+							PlayMountedAttackAnimation(riderForAttack.get(), targetSide);
+						
+							if (IsRiderAttacking(riderForAttack.get()))
+							{
+								UpdateMountedAttackHitDetection(riderForAttack.get(), target);
+							}
 						}
 					}
 				}
@@ -1681,10 +2202,7 @@ namespace MountedNPCCombatVR
 		{
 			NotifyHorseLeftMeleeRange(horse->formID);
 			NotifyHorseLeftMobileTargetRange(horse->formID);
-			if (targetIsMounted)
-			{
-				NotifyHorseLeftAdjacentRange(horse->formID);
-			}
+			// Adjacent riding notification removed - system no longer in use
 			
 			// ============================================
 			// APPROACHING TARGET - Use interception for mobile NPCs
@@ -1706,7 +2224,7 @@ namespace MountedNPCCombatVR
 		// APPLY ROTATION
 		// ============================================
 
-		// CRITICAL: Skip ALL rotation if in stand ground!
+				// CRITICAL: Skip ALL rotation if in stand ground!
 		// Stand ground horses should NOT have any rotation applied here
 		if (IsInStandGround(horse->formID))
 		{
@@ -1716,7 +2234,8 @@ namespace MountedNPCCombatVR
 			
 			// Don't create travel package for stand ground horses
 			return attackState;
-		}
+		
+			}
 		
 		float currentAngle = horse->rot.z;
 		float angleDiff = targetAngle - currentAngle;
@@ -1734,7 +2253,7 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// CREATE TRAVEL PACKAGE
 		// ============================================
-		
+
 		if (distanceToTarget >= meleeRange)
 		{
 			TESPackage* package = CreatePackageByType(6);
@@ -1782,26 +2301,6 @@ namespace MountedNPCCombatVR
 	{
 		if (!rider) return false;
 		
-		// ============================================
-		// MAGES NEVER SWITCH WEAPONS - STAFF ONLY
-		// Mages equip warstaff once at combat start and keep it
-		// They do NOT switch to bow, melee, or anything else
-		// ============================================
-		MultiRiderData* riderData = GetMultiRiderData(rider->formID);
-		if (riderData && riderData->isMageCaster)
-		{
-			// Mage - ensure staff is equipped and drawn, nothing else
-			if (!IsStaffEquipped(rider))
-			{
-				RequestWeaponSwitch(rider, WeaponRequest::Staff);
-			}
-			else if (!IsWeaponDrawn(rider))
-			{
-				RequestWeaponDraw(rider);
-			}
-			return true;  // Exit early - mages don't use distance-based weapon switching
-		}
-		
 		// Use the centralized weapon state machine from WeaponDetection
 		return RequestWeaponForDistance(rider, distanceToTarget, targetIsMounted);
 	}
@@ -1846,11 +2345,15 @@ namespace MountedNPCCombatVR
 		}
 		g_horseProcessingCount = 0;
 		
+		// Clear ranged follow state tracking
+		ResetAllRangedFollowState();
+		
 		// Reset initialization flag so system can re-init
 		g_dynamicPackageSystemInitialized = false;
 		
 		_MESSAGE("DynamicPackages: State reset complete");
 	}
+	
 	
 	// ============================================
 	// CHECK IF OBSTRUCTION IS CAUSED BY NPC

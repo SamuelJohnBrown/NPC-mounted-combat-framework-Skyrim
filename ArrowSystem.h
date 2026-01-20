@@ -92,11 +92,14 @@ namespace MountedNPCCombatVR
 	// Rapid Fire Bow Attack System
 	// Special fast bow attack cycle for rapid fire maneuver
 	// Fires 4 quick shots during the 5 second stationary period
+	// For archers: Uses bow animations + arrow spell
+	// For mages: Casts Ice Spike spells (no bow animations)
 	// ============================================
 	
 	// Start a rapid fire bow attack sequence (4 quick shots)
 	// Call once when rapid fire maneuver begins
-	void StartRapidFireBowAttack(UInt32 riderFormID);
+	// isMage: if true, casts Ice Spike spells instead of using bow
+	void StartRapidFireBowAttack(UInt32 riderFormID, bool isMage = false);
 	
 	// Update rapid fire bow attack state
 	// Returns true if rapid fire attack is still in progress
@@ -108,4 +111,7 @@ namespace MountedNPCCombatVR
 	
 	// Check if rapid fire bow attack is active
 	bool IsRapidFireBowAttackActive(UInt32 riderFormID);
+	
+	// Check if mage rapid fire is active (for bypassing normal spell cooldowns)
+	bool IsMageRapidFireActive(UInt32 riderFormID);
 }

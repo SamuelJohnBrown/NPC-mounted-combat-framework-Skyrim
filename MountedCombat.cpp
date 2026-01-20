@@ -1,23 +1,22 @@
 #include "MountedCombat.h"
 #include "CombatStyles.h"
-#include "FleeingBehavior.h"
-#include "FactionData.h"
 #include "WeaponDetection.h"
+#include "CompanionCombat.h"  // For companion detection
+#include "SpecialMovesets.h"
+#include "FleeingBehavior.h"
 #include "NPCProtection.h"
 #include "AILogging.h"
 #include "ArrowSystem.h"
-#include "MultiMountedCombat.h"
 #include "DynamicPackages.h"
 #include "HorseMountScanner.h"
-#include "CompanionCombat.h"
-#include "SpecialMovesets.h"
-#include "MagicCastingSystem.h"
+#include "FactionData.h"  // For IsActorHostileToActor, IsHostileNPC, GetHostileTypeName
+#include "MagicCastingSystem.h"  // For ResetMagicCastingSystem
+#include "Helper.h"
+#include "config.h"
 #include "skse64/GameRTTI.h"
-#include "skse64/GameData.h"
-#include "skse64/GameObjects.h"
-#include "skse64_common/Utilities.h"
 #include <cmath>
 #include <ctime>
+#include <mutex>
 
 namespace MountedNPCCombatVR
 {
@@ -29,7 +28,7 @@ namespace MountedNPCCombatVR
 	const int MAX_TRACKED_NPCS_ARRAY = 10;  // Maximum array size (hardcoded for memory safety)
 	// Actual runtime limit is MaxTrackedMountedNPCs from config (1-10)
 	const float FLEE_SAFE_DISTANCE = 2001.0f;  // Distance at which fleeing NPCs feel safe (just over 1 cell)
-	const float ALLY_ALERT_RANGE = 700.0f;    // Range to alert allies when attacked
+	const float ALLY_ALERT_RANGE = 400.0f;    // Range to alert allies when attacked
 	
 	// ============================================
 	// Horse Animation Configuration (from SingleMountedCombat)
@@ -80,13 +79,14 @@ namespace MountedNPCCombatVR
 	
 	static MountedNPCData g_trackedNPCs[MAX_TRACKED_NPCS_ARRAY];
 	static bool g_systemInitialized = false;
+	static std::mutex g_trackedNPCsMutex;  // Thread safety for multi-rider tracking
 	
 	// ============================================
 	// DISENGAGE COOLDOWN TRACKING
 	// Prevents NPCs from immediately re-engaging after distance disengage
 	// ============================================
 	
-	const float DISENGAGE_COOLDOWN = 3.5f;  // 3.5 seconds before NPC can re-engage
+	const float DISENGAGE_COOLDOWN = 6.0f; // 6 seconds before NPC can re-engage (was 3.5s)
 	const int MAX_DISENGAGED_NPCS = 10;
 	
 	struct DisengagedNPCEntry
@@ -104,10 +104,14 @@ namespace MountedNPCCombatVR
 	};
 	
 	static DisengagedNPCEntry g_disengagedNPCs[MAX_DISENGAGED_NPCS];
+	static std::mutex g_disengagedNPCsMutex;  // Thread safety for disengage tracking
 	
 	// Check if an NPC is on disengage cooldown
+	// THREAD SAFE: Uses mutex lock
 	bool IsNPCOnDisengageCooldown(UInt32 npcFormID)
 	{
+		std::lock_guard<std::mutex> lock(g_disengagedNPCsMutex);
+		
 		float currentTime = GetCurrentGameTime();
 		
 		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
@@ -131,8 +135,11 @@ namespace MountedNPCCombatVR
 	}
 	
 	// Add an NPC to the disengage cooldown list
+	// THREAD SAFE: Uses mutex lock
 	void AddNPCToDisengageCooldown(UInt32 npcFormID)
 	{
+		std::lock_guard<std::mutex> lock(g_disengagedNPCsMutex);
+		
 		// Check if already in list
 		for (int i = 0; i < MAX_DISENGAGED_NPCS; i++)
 		{
@@ -284,6 +291,9 @@ namespace MountedNPCCombatVR
 	void ResetAllMountedNPCs()
 	{
 		_MESSAGE("MountedCombat: Resetting all runtime state...");
+		
+		// Lock for thread safety
+		std::lock_guard<std::mutex> lock(g_trackedNPCsMutex);
 		
 		// Count how many NPCs we're clearing
 		int clearedCount = 0;
@@ -478,8 +488,26 @@ namespace MountedNPCCombatVR
 		}
 
 		// ============================================
+		// GIVE BOW AND ARROWS TO ALL NON-MAGE RIDERS
+		// All riders (except mages) get a bow and arrows at battle start
+		// so they can switch between melee and ranged based on distance
+		// ============================================
+		if (data->combatClass != MountedCombatClass::MageCaster && 
+			data->combatClass != MountedCombatClass::CivilianFlee)
+		{
+			if (!HasBowInInventory(actor))
+			{
+				GiveDefaultBow(actor);
+				_MESSAGE("MountedCombat: Gave default bow to '%s' (%08X)", 
+					actorName ? actorName : "Unknown", actor->formID);
+			}
+			EquipArrows(actor);
+		}
+
+		// ============================================
 		// PRE-ASSIGN CAPTAIN OR LEADER TO RANGED ROLE
-		// Use centralized weapon system
+		// Use centralized weapon system and pre-assign ranged role data
+		// so InjectFollowPackage knows to use ranged distance from the start
 		// ============================================
 		if (actorName && (strstr(actorName, "Captain") != nullptr || strstr(actorName, "Leader") != nullptr))
 		{
@@ -488,50 +516,22 @@ namespace MountedNPCCombatVR
 				GiveDefaultBow(actor);
 			}
 			
+			// Give arrows if needed
+			EquipArrows(actor);
+			
 			// Use centralized weapon system to switch to bow
 			RequestWeaponSwitch(actor, WeaponRequest::Bow);
 			
-			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED", actorName);
-			
 			// Get the captain's actual combat target (not always player!)
-			Actor* target = GetCombatTarget(actor);
+			Actor* captainTarget = GetCombatTarget(actor);
 			
-			if (target)
-			{
-				RegisterMultiRider(actor, mount, target);
-				Actor_ClearKeepOffsetFromActor(mount);
-			}
+			// PRE-ASSIGN ranged role data BEFORE any follow package is injected
+			// This ensures InjectFollowPackage will use the ranged distance from the start
+			PreAssignRangedRoleForCaptain(actor, mount, captainTarget);
+			
+			_MESSAGE("MountedCombat: Captain '%s' pre-assigned to RANGED (bow + arrows given, ranged role set)", actorName);
 		}
 		
-		// ============================================
-		// PRE-ASSIGN MAGES TO USE WARSTAFF
-		// Mages get the warstaff from MountedNPCCombat.esp
-		// This is their primary weapon for mounted combat
-		// ============================================
-		if (data->combatClass == MountedCombatClass::MageCaster)
-		{
-			// Give warstaff if they don't have one
-			if (!HasStaffInInventory(actor))
-			{
-				GiveWarstaff(actor);
-				_MESSAGE("MountedCombat: Gave Warstaff to Mage '%s'", actorName ? actorName : "Unknown");
-			}
-			
-			// Use centralized weapon system to switch to staff
-			RequestWeaponSwitch(actor, WeaponRequest::Staff);
-			
-			_MESSAGE("MountedCombat: Mage '%s' pre-assigned to STAFF combat", actorName ? actorName : "Unknown");
-			
-			// Get the mage's actual combat target (not always player!)
-			Actor* target = GetCombatTarget(actor);
-			
-			if (target)
-			{
-				RegisterMultiRider(actor, mount, target);
-				Actor_ClearKeepOffsetFromActor(mount);
-			}
-		}
-
 		// Track player's mount status when combat with mounted NPC starts
 		OnPlayerTriggeredMountedCombat(actor);
 		
@@ -613,6 +613,160 @@ namespace MountedNPCCombatVR
 		UpdateCombatClassBools();
 	}
 	
+	// ============================================
+	// SCAN FOR UNTRACKED MOUNTED COMBAT NPCs
+	// ============================================
+	// This scans for mounted NPCs in combat that aren't being tracked.
+	// This handles re-engagement after distance disengage - when the
+	// player comes back within range, we find NPCs that are:
+	// - Mounted
+	// - In combat
+	// - Not on disengage cooldown
+	// - Not currently tracked by our system
+	// And re-register them so they get full combat capability.
+	// ============================================
+	
+	static float g_lastUntrackedScanTime = 0.0f;
+	const float UNTRACKED_SCAN_INTERVAL = 2.0f;  // Scan every 2 seconds (slower to prevent rapid re-engagement)
+	// RE_ENGAGE_DISTANCE now uses ReEngageDistance from config.h
+	const float RE_ENGAGE_MIN_DISTANCE = 500.0f;  // Must be at least this far to re-engage (prevents immediate CTD on return)
+	
+	// Track NPCs currently being re-engaged to prevent double-processing
+	static UInt32 g_reengagingNPCs[10] = {0};
+	static float g_reengageStartTimes[10] = {0};
+	static int g_reengagingCount = 0;
+	const float REENGAGE_LOCKOUT_TIME =5.0f; // Lock out NPC from re-engagement for5 seconds after attempt (was3.0s)
+	
+	static bool IsNPCBeingReengaged(UInt32 formID)
+	{
+		float currentTime = GetCurrentGameTime();
+		for (int i = 0; i < g_reengagingCount; i++)
+		{
+			if (g_reengagingNPCs[i] == formID)
+			{
+				// Check if lockout has expired
+				if ((currentTime - g_reengageStartTimes[i]) < REENGAGE_LOCKOUT_TIME)
+				{
+					return true;  // Still locked out
+				}
+				// Expired - remove from list
+				for (int j = i; j < g_reengagingCount - 1; j++)
+				{
+					g_reengagingNPCs[j] = g_reengagingNPCs[j + 1];
+					g_reengageStartTimes[j] = g_reengageStartTimes[j + 1];
+				}
+				g_reengagingCount--;
+				return false;
+			}
+		}
+		return false;
+	}
+	
+	static void MarkNPCAsReengaging(UInt32 formID)
+	{
+		// Check if already in list
+		for (int i = 0; i < g_reengagingCount; i++)
+		{
+			if (g_reengagingNPCs[i] == formID)
+			{
+				g_reengageStartTimes[i] = GetCurrentGameTime();
+				return;
+			}
+		}
+		// Add to list
+		if (g_reengagingCount < 10)
+		{
+			g_reengagingNPCs[g_reengagingCount] = formID;
+			g_reengageStartTimes[g_reengagingCount] = GetCurrentGameTime();
+			g_reengagingCount++;
+		}
+	}
+	
+	static void ScanForUntrackedMountedCombatNPCs()
+	{
+		if (!g_thePlayer || !(*g_thePlayer)) return;
+		
+		Actor* player = *g_thePlayer;
+		
+		if (player->IsDead(1)) return;
+		if (!IsPlayerInExteriorCell()) return;
+		
+		float currentTime = GetCurrentGameTime();
+		if ((currentTime - g_lastUntrackedScanTime) < UNTRACKED_SCAN_INTERVAL)
+		{
+			return;
+		}
+		g_lastUntrackedScanTime = currentTime;
+		
+		TESObjectCELL* cell = player->parentCell;
+		if (!cell) return;
+		
+		int reEngagedCount = 0;
+		
+		for (UInt32 i = 0; i < cell->objectList.count; i++)
+		{
+			TESObjectREFR* ref = nullptr;
+			cell->objectList.GetNthItem(i, ref);
+			
+			if (!ref) continue;
+			if (ref->formType != kFormType_Character) continue;
+			
+			Actor* actor = static_cast<Actor*>(ref);
+			
+			if (actor->IsPlayerRef()) continue;
+			if (actor == player) continue;
+			if (actor->IsDead(1)) continue;
+			if (!actor->IsInCombat()) continue;
+			
+			NiPointer<Actor> mount;
+			bool isMounted = CALL_MEMBER_FN(actor, GetMount)(mount);
+			if (!isMounted || !mount) continue;
+			
+			// Skip if already tracked by our system
+			if (IsNPCTracked(actor->formID)) continue;
+			
+			// Skip if on disengage cooldown
+			if (IsNPCOnDisengageCooldown(actor->formID)) continue;
+			
+			// Skip if currently being re-engaged (lockout period)
+			if (IsNPCBeingReengaged(actor->formID)) continue;
+			
+			// ============================================
+			// CRITICAL: CHECK IF NPC IS HOSTILE TO PLAYER
+			// Don't re-engage friendly NPCs (guards, companions, etc.)
+			// ============================================
+			if (!IsActorHostileToActor(actor, player))
+			{
+				continue;  // Not hostile - skip
+			}
+			
+			float distance = GetDistanceBetween(actor, player);
+			
+			// Must be within re-engage range but NOT too close
+			// Too close = player just ran back and we need to wait for things to stabilize
+			if (distance > ReEngageDistance) continue;
+			if (distance < RE_ENGAGE_MIN_DISTANCE) continue;
+			
+			const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+			_MESSAGE("MountedCombat: *** RE-ENGAGING untracked mounted NPC '%s' (%08X) at %.0f units ***",
+				actorName ? actorName : "Unknown", actor->formID, distance);
+			
+			// Mark as re-engaging BEFORE calling OnDismountBlocked to prevent double-processing
+			MarkNPCAsReengaging(actor->formID);
+			
+			OnDismountBlocked(actor, mount);
+			reEngagedCount++;
+			
+			// Only re-engage ONE NPC per scan to prevent overload
+			break;
+		}
+		
+		if (reEngagedCount > 0)
+		{
+			_MESSAGE("MountedCombat: Re-engaged %d untracked mounted NPCs", reEngagedCount);
+		}
+	}
+	
 	void UpdateMountedCombat()
 	{
 		if (!g_systemInitialized)
@@ -638,9 +792,6 @@ namespace MountedNPCCombatVR
 		// Update the combat styles system (reinforcement of follow packages)
 		UpdateCombatStylesSystem();
 		
-		// Update multi-mounted combat (ranged role behaviors, etc.)
-		UpdateMultiMountedCombat();
-		
 		// Update temporary stagger timers (restore protection after block stagger)
 		UpdateTemporaryStaggerTimers();
 		
@@ -653,20 +804,14 @@ namespace MountedNPCCombatVR
 		// Scan for hostile targets (guards/soldiers will engage hostiles within range)
 		ScanForHostileTargets();
 		
-		// Update horse mount scanner (independent system for tracking horses near combat NPCs)
-		UpdateHorseMountScanner();
-		
-		// Update NPC mounting detection scanner (logs NPCs mounting horses within 2000 units)
-		UpdateNPCMountingScanner();
-		
-		// Update mounted companion combat (player teammates on horseback)
-		UpdateMountedCompanionCombat();
-		
-		// Update tactical flee system (low health riders may temporarily retreat)
-		UpdateTacticalFlee();
-		
-		// Update civilian flee system (civilians flee from threats)
-		UpdateCivilianFlee();
+		// ============================================
+		// SCAN FOR UNTRACKED MOUNTED NPCs IN COMBAT
+		// This handles re-engagement after distance disengage
+		// When player comes back within range, NPCs that are:
+		// - Mounted, in combat, not on cooldown, not tracked
+		// Will be re-registered with full combat capability
+		// ============================================
+		ScanForUntrackedMountedCombatNPCs();
 		
 		float currentTime = GetCurrentGameTime();
 		
@@ -836,6 +981,8 @@ namespace MountedNPCCombatVR
 			return nullptr;
 		}
 		
+		std::lock_guard<std::mutex> lock(g_trackedNPCsMutex);
+		
 		UInt32 formID = actor->formID;
 		
 		// First, check if already tracked
@@ -864,6 +1011,8 @@ namespace MountedNPCCombatVR
 	
 	MountedNPCData* GetNPCData(UInt32 formID)
 	{
+		std::lock_guard<std::mutex> lock(g_trackedNPCsMutex);
+		
 		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid && g_trackedNPCs[i].actorFormID == formID)
@@ -876,6 +1025,8 @@ namespace MountedNPCCombatVR
 	
 	MountedNPCData* GetNPCDataByIndex(int index)
 	{
+		std::lock_guard<std::mutex> lock(g_trackedNPCsMutex);
+		
 		if (index < 0 || index >= MAX_TRACKED_NPCS_ARRAY)
 		{
 			return nullptr;
@@ -885,6 +1036,8 @@ namespace MountedNPCCombatVR
 	
 	void RemoveNPCFromTracking(UInt32 formID)
 	{
+		std::lock_guard<std::mutex> lock(g_trackedNPCsMutex);
+		
 		for (int i = 0; i < MAX_TRACKED_NPCS_ARRAY; i++)
 		{
 			if (g_trackedNPCs[i].isValid && g_trackedNPCs[i].actorFormID == formID)
@@ -913,7 +1066,7 @@ namespace MountedNPCCombatVR
 				// ============================================
 				ResetBowAttackState(formID);
 				ResetRapidFireBowAttack(formID);
-				ResetMageSpellState(formID);
+				// ResetMageSpellState(formID);  // Disabled - magic system not implemented yet
 				ClearWeaponStateData(formID);
 				
 				// ============================================
@@ -1200,7 +1353,7 @@ namespace MountedNPCCombatVR
 				(data->combatClass == MountedCombatClass::GuardMelee || 
 				 data->combatClass == MountedCombatClass::SoldierMelee))
 			{
-				// Check if player is actually hostile to this guard (attacked them, has bounty, etc.)
+				// Check if player is actually hostile
 				if (g_thePlayer && (*g_thePlayer))
 				{
 					Actor* player = *g_thePlayer;
@@ -1323,9 +1476,8 @@ namespace MountedNPCCombatVR
 		{
 			Actor* player = *g_thePlayer;
 			float distance = GetDistanceBetween(actor, player);
-			
-			// If player is close, they may be the target
-			if (distance < 4096.0f)
+			// Only return player if they are hostile to this actor (e.g. were attacked or are targeted)
+			if (distance <1950.0f && IsActorHostileToActor(player, actor))
 			{
 				return player;
 			}
@@ -1506,12 +1658,6 @@ namespace MountedNPCCombatVR
 				}
 				
 				ClearAllMountedProtection();
-				
-				// ============================================
-				// CRITICAL: Clear all multi-rider tracking on player death
-				// This resets ranged roles, horse state, weapon states, etc.
-				// ============================================
-				ClearAllMultiRiders();
 				
 				// ============================================
 				// CRITICAL: Reset all special moveset
@@ -1752,7 +1898,20 @@ namespace MountedNPCCombatVR
 			bool isMounted = CALL_MEMBER_FN(potentialAlly, GetMount)(mount);
 			if (!isMounted || !mount) continue;
 			
-			// Check distance
+			// ============================================
+			// CRITICAL: CHECK DISENGAGE COOLDOWN
+			// Don't alert allies that recently disengaged
+			// ============================================
+			if (IsNPCOnDisengageCooldown(potentialAlly->formID)) continue;
+			
+			// ============================================
+			// CRITICAL: CHECK DISTANCE TO ATTACKER (TARGET)
+			// Don't alert allies that are too far from the target
+			// ============================================
+			float distanceToTarget = GetDistanceBetween(potentialAlly, attacker);
+			if (distanceToTarget > MaxCombatDistance) continue;
+			
+			// Check distance to attacked ally
 			float distance = GetDistanceBetween(attackedNPC, potentialAlly);
 			if (distance > ALLY_ALERT_RANGE) continue;
 			
@@ -1831,9 +1990,6 @@ namespace MountedNPCCombatVR
 			
 			Actor* potentialTarget = DYNAMIC_CAST(ref, TESObjectREFR, Actor);
 			if (!potentialTarget) continue;
-			
-			// Skip self
-			if (potentialTarget->formID == rider->formID) continue;
 			
 			// Skip dead actors
 			if (potentialTarget->IsDead(1)) continue;
@@ -1965,7 +2121,7 @@ namespace MountedNPCCombatVR
 			if (!data->isValid) continue;
 			
 			// Only guards and soldiers scan for hostiles
-			if (data->combatClass != MountedCombatClass::GuardMelee &&
+		 if (data->combatClass != MountedCombatClass::GuardMelee &&
 				data->combatClass != MountedCombatClass::SoldierMelee)
 			{
 				continue;
@@ -2089,7 +2245,7 @@ namespace MountedNPCCombatVR
 	// ============================================
 	// HORSE SPRINT TRACKING
 	// ============================================
-	
+
 	static HorseSprintData* GetOrCreateSprintData(UInt32 horseFormID)
 	{
 		// Find existing

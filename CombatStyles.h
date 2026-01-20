@@ -80,6 +80,56 @@ namespace MountedNPCCombatVR
 	void SetHitDataPowerAttack(UInt32 riderFormID, bool isPowerAttack);
 
 	// ============================================
+	// RANGED ROLE ASSIGNMENT SYSTEM
+	// ============================================
+	// When 3+ riders of the same faction are in battle:
+	// - Leaders/Captains are always assigned ranged role
+	// - Otherwise, the furthest rider from target gets ranged role
+	// - Mages are EXCLUDED from this system (they have their own logic)
+	// - Ranged role maintains distance and uses bow
+	// - If target gets too close, switches to melee with full weapon switching
+	// ============================================
+	// NOTE: Distance/threshold values are INI configurable via config.h:
+	// - DynamicRangedRoleIdealDistance (default 800)
+	// - DynamicRangedRoleMeleeThreshold (default 350)
+	// - DynamicRangedRoleReturnThreshold (default 500)
+	// - DynamicRangedRoleModeSwitchCooldown (default 3.0)
+	// - DynamicRangedRoleMinRiders (default 3)
+	// ============================================
+	
+	enum class RangedRoleMode
+	{
+		None = 0,    // Not in ranged role
+		Ranged,      // Maintaining distance, using bow
+		Melee  // Close range, using melee weapons (still in ranged role but temp melee)
+	};
+	
+	// Update ranged role assignments (call periodically)
+	void UpdateRangedRoleAssignments();
+	
+	// Clear all ranged role assignments
+	void ClearRangedRoleAssignments();
+	
+	// Clear ranged role for a specific rider
+	void ClearRangedRoleForRider(UInt32 riderFormID);
+	
+	// Check if rider is in ranged role (either mode)
+	bool IsInRangedRole(UInt32 riderFormID);
+	
+	// Get current ranged role mode for a rider
+	RangedRoleMode GetRangedRoleMode(UInt32 riderFormID);
+	
+	// Check if rider is in ranged role's ranged mode (maintaining distance)
+	bool IsInRangedRoleRangedMode(UInt32 riderFormID);
+	
+	// ============================================
+	// PRE-ASSIGN RANGED ROLE FOR CAPTAINS/LEADERS
+	// Call this when a Captain/Leader is first detected to ensure they get
+	// the ranged follow package from the very start (not the default melee one)
+	// ============================================
+	bool PreAssignRangedRoleForCaptain(Actor* rider, Actor* mount, Actor* target);
+
+	// ============================================
 	// Combat Style Namespaces
 	// ============================================
 	

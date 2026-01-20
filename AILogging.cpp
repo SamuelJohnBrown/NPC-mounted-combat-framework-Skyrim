@@ -1,10 +1,46 @@
 #include "AILogging.h"
 #include "MountedCombat.h"
 #include "DynamicPackages.h"
-#include "SpecialMovesets.h"  // For IsInStandGround, IsInRapidFire
+#include "SpecialMovesets.h" // For IsInStandGround, IsInRapidFire
+#include <mutex>
+#include <vector>
+#include <thread>
 
 namespace MountedNPCCombatVR
 {
+	// Threading support for queuing StopCombatAlarm from worker threads
+	static DWORD g_mainThreadId =0;
+	static std::mutex g_stopQueueMutex;
+	static std::vector<UInt32> g_stopAlarmQueue;
+
+	void SetAILoggingMainThreadId(DWORD id)
+	{
+		g_mainThreadId = id;
+	}
+
+	void ProcessPendingStopCombatAlarms()
+	{
+		// Only process on main thread
+		if (g_mainThreadId ==0 || GetCurrentThreadId() != g_mainThreadId) return;
+
+		std::vector<UInt32> pending;
+		{
+			std::lock_guard<std::mutex> lock(g_stopQueueMutex);
+			if (g_stopAlarmQueue.empty()) return;
+			pending.swap(g_stopAlarmQueue);
+		}
+
+		for (UInt32 formID : pending)
+		{
+			TESForm* form = LookupFormByID(formID);
+			if (!form) continue;
+			Actor* actor = DYNAMIC_CAST(form, TESForm, Actor);
+			if (!actor) continue;
+			// Call directly on main thread
+			StopActorCombatAlarm(actor);
+		}
+	}
+
 	// ============================================
 	// ADDRESS DEFINITIONS
 	// ============================================
@@ -278,104 +314,549 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	// Stop combat alarm - clears the crime/alarm state (NPC forgives player)
-	// Address: 0x987A70
+	// Address: 0x987A70 (Skyrim VR 1.4.15)
+	// First two params are unused - just pass 0
 	typedef void (*_Actor_StopCombatAlarm)(UInt64 a1, UInt64 a2, Actor* actor);
-	RelocAddr<_Actor_StopCombatAlarm> Actor_StopCombatAlarm(0x987A70);
+	RelocAddr<_Actor_StopCombatAlarm> Actor_StopCombatAlarm_Native(0x987A70);
 	
-	void StopActorCombatAlarm(Actor* actor)
+	// ============================================
+	// COOLDOWN SYSTEM FOR MULTIPLE DISENGAGEMENTS
+	// Prevents CTD when multiple riders disengage in rapid succession
+	// ============================================
+	
+	struct CombatAlarmCooldown
 	{
-		// ============================================
-		// CRITICAL VALIDATION - Prevent CTD from invalid actors
-		// This function is called during combat cleanup and the actor
-		// may have become invalid (unloaded, deleted, etc.)
-		// ============================================
-		if (!actor) return;
-		
-		// Check if actor pointer is valid (basic sanity check)
-		__try
+		UInt32 actorFormID;
+		float lastCallTime;
+		bool isValid;
+	};
+	
+	static const int MAX_ALARM_COOLDOWNS = 20;  // Increased for multi-rider scenarios
+	static CombatAlarmCooldown g_alarmCooldowns[MAX_ALARM_COOLDOWNS];
+	static int g_alarmCooldownCount = 0;
+	static float g_lastGlobalAlarmCallTime = 0;
+	static const float GLOBAL_ALARM_COOLDOWN = 1.5f;  // 1.5s between ANY alarm calls (increased for safety)
+	static const float PER_ACTOR_COOLDOWN = 5.0f;   // 5 seconds per actor (increased for safety)
+	
+	// ============================================
+	// DISENGAGE QUEUE SYSTEM
+	// For multi-rider scenarios - queue disengagements to spread them out
+	// ============================================
+	
+	struct QueuedDisengage
+	{
+		UInt32 actorFormID;
+		float queueTime;
+		bool processed;
+		bool isValid;
+	};
+	
+	static const int MAX_DISENGAGE_QUEUE = 10;
+	static const float DISENGAGE_QUEUE_INTERVAL = 2.0f;  // Process one disengage every 2 seconds
+	static QueuedDisengage g_disengageQueue[MAX_DISENGAGE_QUEUE];
+	static int g_disengageQueueCount = 0;
+	static float g_lastDisengageProcessTime = 0;
+	
+	// Add an actor to the disengage queue
+	static bool QueueDisengage(UInt32 actorFormID)
+	{
+		// Check if already queued
+		for (int i = 0; i < g_disengageQueueCount; i++)
 		{
-			if (actor->formID == 0 || actor->formID == 0xFFFFFFFF)
+			if (g_disengageQueue[i].isValid && g_disengageQueue[i].actorFormID == actorFormID)
 			{
-				_MESSAGE("StopActorCombatAlarm: Invalid actor formID - skipping");
+				return true;  // Already queued
+			}
+		}
+		
+		// Add to queue
+		if (g_disengageQueueCount < MAX_DISENGAGE_QUEUE)
+		{
+			g_disengageQueue[g_disengageQueueCount].actorFormID = actorFormID;
+			g_disengageQueue[g_disengageQueueCount].queueTime = GetGameTime();
+			g_disengageQueue[g_disengageQueueCount].processed = false;
+			g_disengageQueue[g_disengageQueueCount].isValid = true;
+			g_disengageQueueCount++;
+			_MESSAGE("AILogging: Queued disengage for actor %08X (queue size: %d)", actorFormID, g_disengageQueueCount);
+			return true;
+		}
+		
+		return false;  // Queue full
+	}
+	
+	// Check if an actor is in the disengage queue (pending or processing)
+	static bool IsInDisengageQueue(UInt32 actorFormID)
+	{
+		for (int i = 0; i < g_disengageQueueCount; i++)
+		{
+			if (g_disengageQueue[i].isValid && g_disengageQueue[i].actorFormID == actorFormID)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+	
+	// Remove an actor from the disengage queue
+	static void RemoveFromDisengageQueue(UInt32 actorFormID)
+	{
+		for (int i = 0; i < g_disengageQueueCount; i++)
+		{
+			if (g_disengageQueue[i].isValid && g_disengageQueue[i].actorFormID == actorFormID)
+			{
+				// Shift remaining entries
+				for (int j = i; j < g_disengageQueueCount - 1; j++)
+				{
+					g_disengageQueue[j] = g_disengageQueue[j + 1];
+				}
+				g_disengageQueueCount--;
 				return;
 			}
 		}
+	}
+	
+	// Clear the entire disengage queue
+	void ClearDisengageQueue()
+	{
+		for (int i = 0; i < MAX_DISENGAGE_QUEUE; i++)
+		{
+			g_disengageQueue[i].isValid = false;
+		}
+		g_disengageQueueCount = 0;
+	}
+	
+	// Check if we can process a disengage now (rate limiting)
+	static bool CanProcessDisengageNow()
+	{
+		float currentTime = GetGameTime();
+		return (currentTime - g_lastDisengageProcessTime) >= DISENGAGE_QUEUE_INTERVAL;
+	}
+	
+	// Mark that we just processed a disengage
+	static void MarkDisengageProcessed()
+	{
+		g_lastDisengageProcessTime = GetGameTime();
+	}
+	
+	static CombatAlarmCooldown* GetOrCreateAlarmCooldown(UInt32 actorFormID)
+	{
+		// Find existing
+		for (int i = 0; i < g_alarmCooldownCount; i++)
+		{
+			if (g_alarmCooldowns[i].isValid && g_alarmCooldowns[i].actorFormID == actorFormID)
+			{
+				return &g_alarmCooldowns[i];
+			}
+		}
+		
+		// Create new
+		if (g_alarmCooldownCount < MAX_ALARM_COOLDOWNS)
+		{
+			CombatAlarmCooldown* cd = &g_alarmCooldowns[g_alarmCooldownCount];
+			cd->actorFormID = actorFormID;
+			cd->lastCallTime = 0;
+			cd->isValid = true;
+			g_alarmCooldownCount++;
+			return cd;
+		}
+		
+		// Reuse oldest slot
+		float oldestTime = 999999.0f;
+		int oldestIdx = 0;
+		for (int i = 0; i < MAX_ALARM_COOLDOWNS; i++)
+		{
+			if (g_alarmCooldowns[i].lastCallTime < oldestTime)
+			{
+				oldestTime = g_alarmCooldowns[i].lastCallTime;
+				oldestIdx = i;
+			}
+		}
+		
+		g_alarmCooldowns[oldestIdx].actorFormID = actorFormID;
+		g_alarmCooldowns[oldestIdx].lastCallTime = 0;
+		g_alarmCooldowns[oldestIdx].isValid = true;
+		return &g_alarmCooldowns[oldestIdx];
+	}
+	
+	static bool IsAlarmOnCooldown(UInt32 actorFormID)
+	{
+		float currentTime = GetGameTime();
+		
+		// Check global cooldown - prevents ANY alarm calls too close together
+		if ((currentTime - g_lastGlobalAlarmCallTime) < GLOBAL_ALARM_COOLDOWN)
+		{
+			return true;
+		}
+		
+		// Check per-actor cooldown
+		for (int i = 0; i < g_alarmCooldownCount; i++)
+		{
+			if (g_alarmCooldowns[i].isValid && g_alarmCooldowns[i].actorFormID == actorFormID)
+			{
+				if ((currentTime - g_alarmCooldowns[i].lastCallTime) < PER_ACTOR_COOLDOWN)
+				{
+					return true;
+				}
+			}
+		}
+		
+		return false;
+	}
+	
+	static void RecordAlarmCall(UInt32 actorFormID)
+	{
+		float currentTime = GetGameTime();
+		g_lastGlobalAlarmCallTime = currentTime;
+		
+		CombatAlarmCooldown* cd = GetOrCreateAlarmCooldown(actorFormID);
+		if (cd)
+		{
+			cd->lastCallTime = currentTime;
+		}
+	}
+	
+	void ClearAlarmCooldowns()
+	{
+		for (int i = 0; i < MAX_ALARM_COOLDOWNS; i++)
+		{
+			g_alarmCooldowns[i].isValid = false;
+		}
+		g_alarmCooldownCount = 0;
+		g_lastGlobalAlarmCallTime = 0;
+	}
+	
+	// ============================================
+	// DISENGAGE QUEUE SYSTEM (legacy)
+	// For compatibility with older code - should be deprecated
+	// ============================================
+	
+	// Add an actor to the disengage queue (legacy version)
+	static bool QueueDisengageLegacy(UInt32 actorFormID)
+	{
+		// Check if already queued
+		for (int i = 0; i < g_disengageQueueCount; i++)
+		{
+			if (g_disengageQueue[i].isValid && g_disengageQueue[i].actorFormID == actorFormID)
+			{
+				return true;  // Already queued
+			}
+		}
+		
+		// Add to queue
+		if (g_disengageQueueCount < MAX_DISENGAGE_QUEUE)
+		{
+			g_disengageQueue[g_disengageQueueCount].actorFormID = actorFormID;
+			g_disengageQueue[g_disengageQueueCount].queueTime = GetGameTime();
+			g_disengageQueue[g_disengageQueueCount].processed = false;
+			g_disengageQueue[g_disengageQueueCount].isValid = true;
+			g_disengageQueueCount++;
+			return true;
+		}
+		
+		return false;  // Queue full
+	}
+	
+	// ============================================
+	// STOP COMBAT ALARM HANDLER
+	// Called by HorseMountScanner when a horse is detected
+	// Also called by CombatStyles/MultiMountedCombat to disengage NPCs
+	// ============================================
+	
+	// ============================================
+	// SAFE FORM VALIDATION HELPER
+	// Uses SEH to safely validate actor pointers
+	// ============================================
+	static bool SafeValidateActor(Actor* actor, UInt32& outFormID)
+	{
+		outFormID = 0;
+		__try
+		{
+			if (!actor) return false;
+			if (actor->formID == 0 || actor->formID == 0xFFFFFFFF) return false;
+			if (actor->formType != kFormType_Character) return false;
+			outFormID = actor->formID;
+			return true;
+		}
 		__except(EXCEPTION_EXECUTE_HANDLER)
 		{
-			_MESSAGE("StopActorCombatAlarm: Exception accessing actor - skipping");
+			return false;
+		}
+	}
+	
+	static bool SafeCheckActorLoaded(Actor* actor)
+	{
+		__try
+		{
+			if (!actor) return false;
+			if (!actor->loadedState) return false;
+			if (!actor->GetNiNode()) return false;
+			if (!actor->processManager) return false;
+			return true;
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+	
+	static bool SafeCheckActorDead(Actor* actor)
+	{
+		__try
+		{
+			return actor && actor->IsDead(1);
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			return true;  // Assume dead if we can't check
+		}
+	}
+	
+	static bool SafeCallStopCombatAlarm(Actor* actor)
+	{
+		__try
+		{
+			Actor_StopCombatAlarm_Native(0, 0, actor);
+			return true;
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+	
+	static bool SafeCheckInCombat(Actor* actor)
+	{
+		__try
+		{
+			return actor && actor->IsInCombat();
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+	
+	static const char* SafeGetActorName(Actor* actor)
+	{
+		__try
+		{
+			return actor ? CALL_MEMBER_FN(actor, GetReferenceName)() : "Unknown";
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			return "Unknown";
+		}
+	}
+
+	void StopActorCombatAlarm(Actor* actor)
+	{
+		// ============================================
+		// CRITICAL: THREAD SAFETY CHECK
+		// Only call from main thread - queue if called from other threads
+		// ============================================
+		if (g_mainThreadId != 0 && GetCurrentThreadId() != g_mainThreadId)
+		{
+			_MESSAGE("StopActorCombatAlarm: Called from non-main thread - queueing");
+			UInt32 formID = 0;
+			if (SafeValidateActor(actor, formID) && formID != 0)
+			{
+				std::lock_guard<std::mutex> lock(g_stopQueueMutex);
+				g_stopAlarmQueue.push_back(formID);
+			}
+			return;
+		}
+		
+		// ============================================
+		// CRITICAL VALIDATION - Prevent CTD from invalid actors
+		// ============================================
+		UInt32 actorFormID = 0;
+		if (!SafeValidateActor(actor, actorFormID))
+		{
+			_MESSAGE("StopActorCombatAlarm: Invalid actor - skipping");
+			return;
+		}
+		
+		// ============================================
+		// VALIDATE FORM ID BY LOOKING IT UP
+		// This ensures the FormID is still valid in the game
+		// ============================================
+		TESForm* verifyForm = LookupFormByID(actorFormID);
+		if (!verifyForm)
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X form lookup failed - skipping", actorFormID);
+			RemoveFromDisengageQueue(actorFormID);
+			return;
+		}
+		
+		if (verifyForm != (TESForm*)actor)
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X form mismatch (stale pointer?) - skipping", actorFormID);
+			RemoveFromDisengageQueue(actorFormID);
+			return;
+		}
+		
+		// ============================================
+		// CHECK IF ALREADY IN DISENGAGE QUEUE
+		// If so, don't process now - let the queue handle it
+		// ============================================
+		if (IsInDisengageQueue(actorFormID))
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X already in disengage queue - skipping duplicate", actorFormID);
+			return;
+		}
+		
+		// ============================================
+		// CHECK COOLDOWNS - Prevent rapid-fire calls
+		// This is CRITICAL for multiple rider disengagement!
+		// ============================================
+		if (IsAlarmOnCooldown(actorFormID))
+		{
+			_MESSAGE("StopActorCombatAlarm: Actor %08X on COOLDOWN - queueing for later", actorFormID);
+			QueueDisengage(actorFormID);
+			return;
+		}
+		
+		// ============================================
+		// CHECK GLOBAL RATE LIMIT FOR MULTI-RIDER SCENARIOS
+		// If we just processed a disengage, queue this one
+		// ============================================
+		if (!CanProcessDisengageNow())
+		{
+			_MESSAGE("StopActorCombatAlarm: Global rate limit - queueing actor %08X", actorFormID);
+			QueueDisengage(actorFormID);
 			return;
 		}
 		
 		// Check if actor is still valid and loaded
-		if (!actor->loadedState)
+		if (!SafeCheckActorLoaded(actor))
 		{
-			_MESSAGE("StopActorCombatAlarm: Actor %08X is not loaded - skipping", actor->formID);
+			_MESSAGE("StopActorCombatAlarm: Actor %08X not fully loaded - skipping", actorFormID);
+			RemoveFromDisengageQueue(actorFormID);
 			return;
 		}
 		
-		// Check for valid NiNode (required for AI operations)
-		if (!actor->GetNiNode())
+		// Check if actor is dead
+		if (SafeCheckActorDead(actor))
 		{
-			_MESSAGE("StopActorCombatAlarm: Actor %08X has no NiNode - skipping", actor->formID);
+			_MESSAGE("StopActorCombatAlarm: Actor %08X is dead - skipping", actorFormID);
+			RemoveFromDisengageQueue(actorFormID);
 			return;
 		}
 		
-		// Check if actor has process manager (required for AI operations)
-		if (!actor->processManager)
+		// ============================================
+		// SKIP NON-HUMANOID ACTORS (creatures, animals)
+		// Only process humanoid NPCs to avoid corrupting AI for other actors
+		// ============================================
+		TESRace* race = actor->race;
+		if (race)
 		{
-			_MESSAGE("StopActorCombatAlarm: Actor %08X has no process manager - skipping", actor->formID);
-			return;
+			const char* raceName = race->fullName.name.data;
+			if (raceName)
+			{
+				// Skip creatures/animals that might have different AI structures
+				if (strstr(raceName, "Wisp") != nullptr ||
+					strstr(raceName, "Wolf") != nullptr ||
+					strstr(raceName, "Bear") != nullptr ||
+					strstr(raceName, "Spider") != nullptr ||
+					strstr(raceName, "Dragon") != nullptr ||
+					strstr(raceName, "Troll") != nullptr ||
+					strstr(raceName, "Giant") != nullptr ||
+					strstr(raceName, "Atronach") != nullptr ||
+					strstr(raceName, "Draugr") != nullptr ||
+					strstr(raceName, "Skeleton") != nullptr ||
+					strstr(raceName, "Horse") != nullptr)
+				{
+					_MESSAGE("StopActorCombatAlarm: Actor %08X is non-humanoid (%s) - skipping", 
+						actorFormID, raceName);
+					RemoveFromDisengageQueue(actorFormID);
+					return;
+				}
+			}
 		}
 		
-		// Check if actor is dead - don't try to stop combat for dead actors
-		if (actor->IsDead(1))
-		{
-			_MESSAGE("StopActorCombatAlarm: Actor %08X is dead - skipping", actor->formID);
-			return;
-		}
+		const char* actorName = SafeGetActorName(actor);
 		
-		// Check if actor is actually in combat before trying to stop it
-		if (!actor->IsInCombat())
-		{
-			_MESSAGE("StopActorCombatAlarm: Actor %08X is not in combat - skipping", actor->formID);
-			return;
-		}
-		
-		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		_MESSAGE("StopActorCombatAlarm: Stopping combat for '%s' (%08X)", 
-			actorName ? actorName : "Unknown", actor->formID);
+			actorName ? actorName : "Unknown", actorFormID);
 		
 		// ============================================
-		// SAFER APPROACH: Clear combat state without calling StopCombatAlarm
-		// The StopCombatAlarm function can cause CTD if called while
-		// CombatBehaviorTree is being processed
+		// RECORD THIS CALL FOR COOLDOWN TRACKING
+		// Must be done BEFORE the native call
 		// ============================================
+		RecordAlarmCall(actorFormID);
+		MarkDisengageProcessed();
+		RemoveFromDisengageQueue(actorFormID);
 		
-		// STEP 1: Clear combat target FIRST before any AI changes
-		// This should make the actor "lose" their target
-		actor->currentCombatTarget = 0;
-		
-		// STEP 2: Clear attack-on-sight flag
-		// Prevents immediate re-aggression
-		actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
-		
-		// STEP 3: Sheathe weapon to signal combat end
-		// This helps the AI transition back to normal packages
-		if (IsWeaponDrawn(actor))
+		// ============================================
+		// CALL THE NATIVE GAME FUNCTION
+		// Wrapped in SEH helper for safety
+		// ============================================
+		if (!SafeCallStopCombatAlarm(actor))
 		{
-			actor->DrawSheatheWeapon(false);
-			_MESSAGE("StopActorCombatAlarm: Sheathing weapon for '%s'", actorName ? actorName : "Unknown");
+			_MESSAGE("StopActorCombatAlarm: EXCEPTION in native call for '%s' (%08X) - survived", 
+				actorName ? actorName : "Unknown", actorFormID);
+			return;
 		}
-		
-		// STEP 4: Force AI re-evaluation
-		// This makes the NPC pick up their default package
-		// Do this INSTEAD of calling Actor_StopCombatAlarm which can CTD
-		Actor_EvaluatePackage(actor, false, false);
 		
 		// Log final state
-		bool stillInCombat = actor->IsInCombat();
+		bool stillInCombat = SafeCheckInCombat(actor);
 		_MESSAGE("StopActorCombatAlarm: '%s' combat state after: %s", 
 			actorName ? actorName : "Unknown", stillInCombat ? "STILL IN COMBAT" : "NOT IN COMBAT");
+	}
+	
+	// ============================================
+	// PROCESS QUEUED DISENGAGES
+	// Call this periodically from the main update loop
+	// ============================================
+	void ProcessQueuedDisengages()
+	{
+		if (g_disengageQueueCount == 0) return;
+		if (!CanProcessDisengageNow()) return;
+		
+		// Find the oldest queued disengage
+		float oldestTime = 999999.0f;
+		int oldestIdx = -1;
+		
+		for (int i = 0; i < g_disengageQueueCount; i++)
+		{
+			if (g_disengageQueue[i].isValid && !g_disengageQueue[i].processed)
+			{
+				if (g_disengageQueue[i].queueTime < oldestTime)
+				{
+					oldestTime = g_disengageQueue[i].queueTime;
+					oldestIdx = i;
+				}
+			}
+		}
+		
+		if (oldestIdx < 0) return;
+		
+		UInt32 actorFormID = g_disengageQueue[oldestIdx].actorFormID;
+		
+		// Look up the actor
+		TESForm* form = LookupFormByID(actorFormID);
+		if (!form)
+		{
+			_MESSAGE("ProcessQueuedDisengages: Actor %08X form not found - removing from queue", actorFormID);
+			RemoveFromDisengageQueue(actorFormID);
+			return;
+		}
+		
+		Actor* actor = DYNAMIC_CAST(form, TESForm, Actor);
+		if (!actor)
+		{
+			_MESSAGE("ProcessQueuedDisengages: Actor %08X cast failed - removing from queue", actorFormID);
+			RemoveFromDisengageQueue(actorFormID);
+			return;
+		}
+		
+		_MESSAGE("ProcessQueuedDisengages: Processing queued disengage for actor %08X", actorFormID);
+		
+		// Mark as processed first to prevent re-queueing
+		g_disengageQueue[oldestIdx].processed = true;
+		
+		// Call StopActorCombatAlarm - it will remove from queue when done
+		StopActorCombatAlarm(actor);
 	}
 	
 	// ============================================

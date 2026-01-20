@@ -377,35 +377,43 @@ namespace MountedNPCCombatVR
 	
 	void RegisterDismountedNPC(UInt32 npcFormID, UInt32 horseFormID)
 	{
-		if (npcFormID == 0) return;
+		if (npcFormID ==0) return;
 		
 		float currentTime = GetGameTime();
 		
 		// Check if already registered
-		for (int i = 0; i < MAX_DISMOUNTED_NPCS; i++)
+		for (int i =0; i < MAX_DISMOUNTED_NPCS; i++)
 		{
 			if (g_dismountedNPCs[i].isValid && g_dismountedNPCs[i].npcFormID == npcFormID)
 			{
 				// Update horse if we have one
-				if (horseFormID != 0)
+				if (horseFormID !=0)
 				{
 					g_dismountedNPCs[i].lastKnownHorseFormID = horseFormID;
 				}
-				// Update dismounted time on re-registration (they dismounted again)
-				g_dismountedNPCs[i].dismountedTime = currentTime;
+				// Preserve original dismounted time to prevent bypassing post-dismount delay
+				if (g_dismountedNPCs[i].dismountedTime ==0.0f)
+				{
+					g_dismountedNPCs[i].dismountedTime = currentTime;
+					_MESSAGE("HorseMountScanner: NPC %08X re-registered - set dismountedTime", npcFormID);
+				}
+				else
+				{
+					_MESSAGE("HorseMountScanner: NPC %08X already registered - preserving original dismount time (%.1f seconds ago)", npcFormID, currentTime - g_dismountedNPCs[i].dismountedTime);
+				}
 				return;
 			}
 		}
 		
 		// Find empty slot
-		for (int i = 0; i < MAX_DISMOUNTED_NPCS; i++)
+		for (int i =0; i < MAX_DISMOUNTED_NPCS; i++)
 		{
 			if (!g_dismountedNPCs[i].isValid)
 			{
 				g_dismountedNPCs[i].npcFormID = npcFormID;
 				g_dismountedNPCs[i].lastKnownHorseFormID = horseFormID;
 				g_dismountedNPCs[i].isValid = true;
-				g_dismountedNPCs[i].dismountedTime = currentTime;  // Set dismount time
+				g_dismountedNPCs[i].dismountedTime = currentTime; // Set dismount time
 				g_dismountedNPCCount++;
 				
 				TESForm* form = LookupFormByID(npcFormID);
@@ -1139,32 +1147,81 @@ namespace MountedNPCCombatVR
 	
 	static void CheckAndTriggerMounting()
 	{
-		// For each unmounted NPC, check if they're within range of a horse
+		float currentTime = GetGameTime();
+		
+		_MESSAGE("HorseMountScanner: CheckAndTriggerMounting - %d dismounted NPCs, %d available horses", 
+			g_dismountedNPCCount, g_availableHorseCount);
+		
+		// For each unmounted NPC, check if they can mount a horse
 		for (int ni = 0; ni < MAX_DISMOUNTED_NPCS; ni++)
 		{
 			if (!g_dismountedNPCs[ni].isValid) continue;
 			
+			_MESSAGE("HorseMountScanner:   Checking NPC slot %d (FormID: %08X)", ni, g_dismountedNPCs[ni].npcFormID);
+			
 			// Skip if mount attempt already in progress or succeeded
-			if (g_dismountedNPCs[ni].mountAttemptInProgress) continue;
-			if (g_dismountedNPCs[ni].mountActivationSucceeded) continue;
-			if (g_dismountedNPCs[ni].remountedSuccessfully) continue;
+			if (g_dismountedNPCs[ni].mountAttemptInProgress)
+			{
+				_MESSAGE("HorseMountScanner:     -> SKIP: mount attempt in progress");
+				continue;
+			}
+			if (g_dismountedNPCs[ni].mountActivationSucceeded)
+			{
+				_MESSAGE("HorseMountScanner:     -> SKIP: mount activation succeeded, waiting for mount");
+				continue;
+			}
+			if (g_dismountedNPCs[ni].remountedSuccessfully)
+			{
+				_MESSAGE("HorseMountScanner:     -> SKIP: already remounted, waiting for aggro");
+				continue;
+			}
+			
+			// Check post-dismount delay
+			float timeSinceDismount = currentTime - g_dismountedNPCs[ni].dismountedTime;
+			if (timeSinceDismount < POST_DISMOUNT_DELAY)
+			{
+				_MESSAGE("HorseMountScanner:     -> SKIP: post-dismount delay (%.1f/%.1f sec)", 
+					timeSinceDismount, POST_DISMOUNT_DELAY);
+				continue;
+			}
 			
 			TESForm* npcForm = LookupFormByID(g_dismountedNPCs[ni].npcFormID);
-			if (!npcForm) continue;
+			if (!npcForm)
+			{
+				_MESSAGE("HorseMountScanner:     -> SKIP: form lookup failed");
+				continue;
+			}
 			
 			Actor* npc = DYNAMIC_CAST(npcForm, TESForm, Actor);
-			if (!npc) continue;
+			if (!npc)
+			{
+				_MESSAGE("HorseMountScanner:     -> SKIP: not an Actor");
+				continue;
+			}
+			
+			const char* npcName = CALL_MEMBER_FN(npc, GetReferenceName)();
+			_MESSAGE("HorseMountScanner:     NPC: '%s'", npcName ? npcName : "Unknown");
 			
 			// Skip if already mounted (double-check)
-			if (IsActorMounted(npc)) continue;
+			if (IsActorMounted(npc))
+			{
+				_MESSAGE("HorseMountScanner:   -> SKIP: already mounted");
+				continue;
+			}
 			
 			// Skip if in ragdoll
-			if (IsActorInRagdoll(npc)) continue;
+			if (IsActorInRagdoll(npc))
+			{
+				_MESSAGE("HorseMountScanner:-> SKIP: in ragdoll state");
+				continue;
+			}
 		
-			// Find the nearest available horse
+			// Find the nearest available horse (remove distance restriction - we will teleport)
 			float nearestDist = 99999.0f;
 			int nearestHorseIdx = -1;
 			Actor* nearestHorse = nullptr;
+			
+			_MESSAGE("HorseMountScanner:     Searching %d horse slots...", MAX_AVAILABLE_HORSES);
 			
 			for (int hi = 0; hi < MAX_AVAILABLE_HORSES; hi++)
 			{
@@ -1177,9 +1234,15 @@ namespace MountedNPCCombatVR
 				if (!horse) continue;
 				
 				// Skip if horse now has rider
-				if (IsHorseRidden(horse)) continue;
+				if (IsHorseRidden(horse))
+				{
+					_MESSAGE("HorseMountScanner:       Horse %08X has rider, skip", horse->formID);
+					continue;
+				}
 				
 				float dist = CalculateDistance3D(npc, horse);
+				_MESSAGE("HorseMountScanner:       Horse %08X at %.0f units", horse->formID, dist);
+				
 				if (dist < nearestDist)
 				{
 					nearestDist = dist;
@@ -1188,20 +1251,28 @@ namespace MountedNPCCombatVR
 				}
 			}
 			
-			// If we found a horse within range, attempt to mount
-			if (nearestHorse && nearestDist <= MOUNT_ACTIVATION_DISTANCE)
+			// If we found ANY horse, attempt to mount (AttemptMountHorse will teleport)
+			if (nearestHorse)
 			{
-				const char* npcName = CALL_MEMBER_FN(npc, GetReferenceName)();
-				_MESSAGE("HorseMountScanner: NPC '%s' within %.0f units of horse - triggering mount!",
-					npcName ? npcName : "Unknown", nearestDist);
+				_MESSAGE("HorseMountScanner:*** TRIGGERING MOUNT -> Horse %08X (%.0f units) ***",
+					nearestHorse->formID, nearestDist);
 				
 				if (AttemptMountHorse(npc, nearestHorse, ni))
 				{
-					_MESSAGE("HorseMountScanner: Mount triggered for NPC %08X", g_dismountedNPCs[ni].npcFormID);
+					_MESSAGE("HorseMountScanner:     Mount attempt STARTED");
 				}
+				else
+				{
+					_MESSAGE("HorseMountScanner:     Mount attempt FAILED to start");
+				}
+			}
+			else
+			{
+				_MESSAGE("HorseMountScanner:     -> NO HORSE FOUND");
 			}
 		}
 	}
+	
 	
 	// ============================================
 	// MAIN SCAN - LOG UNMOUNTED NPCs + AVAILABLE HORSES
@@ -1450,7 +1521,29 @@ namespace MountedNPCCombatVR
 		if (!player->parentCell) return false;
 		
 		float currentTime = GetGameTime();
-		if ((currentTime - g_lastCombatCheckTime) < COMBAT_CHECK_INTERVAL) return g_scannerActive;
+		
+		// ============================================
+		// CRITICAL FIX: Check if we have dismounted NPCs waiting
+		// If so, we need to keep scanning even if player isn't in combat yet
+		// ============================================
+		bool hasDismountedNPCs = (g_dismountedNPCCount > 0);
+		bool hasPendingAggro = HasPendingAggroTriggers();
+		
+		// If we have dismounted NPCs, activate scanner immediately
+		if (hasDismountedNPCs && !g_scannerActive)
+		{
+			_MESSAGE("HorseMountScanner: *** ACTIVATING - Have %d dismounted NPCs waiting ***", g_dismountedNPCCount);
+			g_scannerActive = true;
+			g_lastScanTime = 0.0f;
+			g_scanAttempts = 0;
+			g_scanDisabledForSession = false;
+		}
+		
+		// Rate limit combat checks, but NOT if we have dismounted NPCs
+		if (!hasDismountedNPCs && !hasPendingAggro)
+		{
+			if ((currentTime - g_lastCombatCheckTime) < COMBAT_CHECK_INTERVAL) return g_scannerActive;
+		}
 		g_lastCombatCheckTime = currentTime;
 		
 		if (!IsOutdoorCell())
@@ -1468,7 +1561,6 @@ namespace MountedNPCCombatVR
 		}
 		
 		bool playerInCombat = player->IsInCombat();
-		bool hasPendingAggro = HasPendingAggroTriggers();
 		
 		if (playerInCombat && !g_playerWasInCombat)
 		{
@@ -1479,51 +1571,29 @@ namespace MountedNPCCombatVR
 			g_scanDisabledForSession = false;
 			PerformHorseScan();
 		}
-		else if (!playerInCombat && g_playerWasInCombat)
+		else if (!playerInCombat && g_playerWasInCombat && !hasDismountedNPCs && !hasPendingAggro)
 		{
-			// Combat ended - but DON'T deactivate if we have pending aggro triggers!
-			if (hasPendingAggro)
-			{
-				_MESSAGE("HorseMountScanner: Combat ended but has pending aggro triggers - staying active");
-				// Process pending aggro triggers
-				ScanForUnmountedAggressiveNPCs();
-			}
-			else
-			{
-				_MESSAGE("HorseMountScanner: Combat ended - deactivated");
-				g_scannerActive = false;
-				g_scanAttempts = 0;
-				g_scanDisabledForSession = false;
-				ClearAllDismountedTracking();
-			}
+			// Combat ended AND no dismounted NPCs waiting
+			_MESSAGE("HorseMountScanner: Combat ended - deactivated");
+			g_scannerActive = false;
+			g_scanAttempts = 0;
+			g_scanDisabledForSession = false;
+			ClearAllDismountedTracking();
 		}
-		else if (g_scannerActive && playerInCombat)
+		else if (g_scannerActive)
 		{
+			// Scanner is active - perform scans at interval
 			if ((currentTime - g_lastScanTime) >= SCAN_UPDATE_INTERVAL)
 			{
 				g_lastScanTime = currentTime;
+				_MESSAGE("HorseMountScanner: Performing scan (active=%d, dismounted=%d, pending=%d)", 
+					g_scannerActive, g_dismountedNPCCount, hasPendingAggro ? 1 : 0);
 				PerformHorseScan();
-			}
-		}
-		else if (!playerInCombat && hasPendingAggro)
-		{
-			// Player not in combat, but we have pending aggro - keep processing
-			_MESSAGE("HorseMountScanner: Processing pending aggro triggers (player not in combat)");
-			ScanForUnmountedAggressiveNPCs();
-			
-			// If no more pending, fully deactivate
-			if (!HasPendingAggroTriggers())
-			{
-				_MESSAGE("HorseMountScanner: All aggro triggers processed - deactivating");
-				g_scannerActive = false;
-				g_scanAttempts = 0;
-				g_scanDisabledForSession = false;
-				ClearAllDismountedTracking();
 			}
 		}
 		
 		g_playerWasInCombat = playerInCombat;
-		return g_scannerActive || hasPendingAggro;
+		return g_scannerActive || hasPendingAggro || hasDismountedNPCs;
 	}
 
 	bool IsScannerActive() { return g_scannerActive; }
@@ -1744,7 +1814,7 @@ namespace MountedNPCCombatVR
 				ClearMountingTracking();
 			}
 			return;
-		}
+		 }
 		
 		if (!g_thePlayer || !(*g_thePlayer)) return;
 		Actor* player = *g_thePlayer;

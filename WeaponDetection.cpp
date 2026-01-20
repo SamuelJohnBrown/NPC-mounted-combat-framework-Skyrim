@@ -1,6 +1,8 @@
 #include "WeaponDetection.h"
 #include "DynamicPackages.h"  // For get_vfunc
 #include "Helper.h" // For GetGameTime, GetFullFormIdMine
+#include "MountedCombat.h"  // For DetermineCombatClass, MountedCombatClass
+#include "CombatStyles.h"   // For IsInRangedRole
 #include "config.h"    // For WeaponSwitchDistance, SheatheTransitionTime
 #include "skse64/GameRTTI.h"
 #include "skse64/GameData.h"
@@ -23,10 +25,10 @@ namespace MountedNPCCombatVR
 	const char* WEAPON_ESP_NAME = "MountedNPCCombat.esp";
 	
 	// ============================================
-	// MAGE STAFF (Daedric Glaive 2H from MountedNPCCombat.esp)
-	// Used as the mage's "staff" weapon - visually distinct from normal glaives
+	// MAGE STAFF (from MountedNPCCombat.esp)
+	// Used as the mage's "staff" weapon
 	// ============================================
-	const UInt32 MAGE_STAFF_BASE_FORMID = 0x0008FF;  // Daedric Glaive from MountedNPCCombat.esp (ESL-flagged)
+	const UInt32 MAGE_STAFF_BASE_FORMID = 0x0008FF;  // Mage Staff from MountedNPCCombat.esp
 	const char* MAGE_STAFF_ESP_NAME = "MountedNPCCombat.esp";
 	
 	// ============================================
@@ -510,10 +512,10 @@ namespace MountedNPCCombatVR
 		{
 			// ============================================
 			// STAFF REQUEST - FOR MAGE CLASS ONLY
-			// Give Daedric Glaive 2H from GlaiveDanger.esp as mage "staff"
+			// Give Mage Staff from MountedNPCCombat.esp
 			// ============================================
 			
-			// Check if actor already has a Daedric glaive or staff - use it
+			// Check if actor already has a staff - use it
 			TESObjectWEAP* existingStaff = FindStaffInInventory(actor);
 			if (existingStaff)
 			{
@@ -529,7 +531,7 @@ namespace MountedNPCCombatVR
 				}
 			}
 			
-			// No existing staff - give Daedric Glaive 2H from GlaiveDanger.esp
+			// No existing staff - give Mage Staff from MountedNPCCombat.esp
 			UInt32 mageStaffFormID = GetFullFormIdMine(MAGE_STAFF_ESP_NAME, MAGE_STAFF_BASE_FORMID);
 			if (mageStaffFormID != 0)
 			{
@@ -550,14 +552,14 @@ namespace MountedNPCCombatVR
 							const char* weaponName = mageStaff->fullName.name.data;
 							_MESSAGE("WeaponState: Mage %08X '%s' EQUIPPED NEW '%s' (FormID: %08X)", 
 								actor->formID, actorName ? actorName : "Unknown", 
-								weaponName ? weaponName : "Daedric Glaive 2H", mageStaffFormID);
+								weaponName ? weaponName : "Mage Staff", mageStaffFormID);
 							return;
 						}
 					}
 				}
 			}
 			
-			_MESSAGE("WeaponState: ERROR - Could not equip mage staff for mage %08X (GlaiveDanger.esp may not be installed)", actor->formID);
+			_MESSAGE("WeaponState: ERROR - Could not equip mage staff for mage %08X (MountedNPCCombat.esp may not be installed)", actor->formID);
 		}
 	}
 	
@@ -668,9 +670,6 @@ namespace MountedNPCCombatVR
 		g_glaiveDangerChecked = false;
 		g_glaiveDangerAvailable = false;
 		
-		// Reset initialization flag so system can be re-initialized
-		g_weaponStateInitialized = false;
-		
 		_MESSAGE("WeaponState: Reset complete");
 	}
 	
@@ -766,6 +765,43 @@ namespace MountedNPCCombatVR
 	bool RequestWeaponForDistance(Actor* actor, float distanceToTarget, bool targetIsMounted)
 	{
 		if (!actor) return false;
+		
+		// ============================================
+		// MAGES NEVER SWITCH WEAPONS - STAFF ONLY
+		// Mages equip warstaff once at combat start and keep it
+		// They do NOT switch to bow, melee, or anything else
+		// Check combat class to identify mages
+		// ============================================
+		MountedCombatClass combatClass = DetermineCombatClass(actor);
+		if (combatClass == MountedCombatClass::MageCaster)
+		{
+			// Mage - ensure staff is equipped and drawn, nothing else
+			if (!IsStaffEquipped(actor))
+			{
+				RequestWeaponSwitch(actor, WeaponRequest::Staff);
+			}
+			else if (!IsWeaponDrawn(actor))
+			{
+				RequestWeaponDraw(actor);
+			}
+			return true;  // Exit early - mages don't use distance-based weapon switching
+		}
+		
+		// ============================================
+		// RANGED ROLE RIDERS - ENSURE THEY HAVE A BOW
+		// Ranged role riders (captains/leaders) should ALWAYS have a bow
+		// If they don't have one, give them one before weapon switching
+		// ============================================
+		if (IsInRangedRole(actor->formID))
+		{
+			if (!HasBowInInventory(actor))
+			{
+				// Give them a bow - they're supposed to be ranged!
+				GiveDefaultBow(actor);
+				EquipArrows(actor);
+				_MESSAGE("WeaponState: Ranged role rider %08X had no bow - gave default bow", actor->formID);
+			}
+		}
 		
 		// Use WeaponSwitchDistance for on-foot targets, WeaponSwitchDistanceMounted for mounted targets
 		// These values come from config.h and are loaded from INI
@@ -1241,7 +1277,7 @@ namespace MountedNPCCombatVR
 		
 		const float DEFAULT_UNARMED_REACH = 64.0f;
 		const float DEFAULT_MELEE_REACH = 96.0f;
-		const float DEFAULT_BOW_REACH = 2096.0f;
+		const float DEFAULT_BOW_REACH = 4096.0f;
 		
 		TESForm* rightHand = actor->GetEquippedObject(false);
 		if (!rightHand) return DEFAULT_UNARMED_REACH;
@@ -1292,6 +1328,30 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		
+		// ============================================
+		// FIRST: Check if actor has a bow EQUIPPED
+		// This catches bows in base inventory that aren't in ExtraContainerChanges
+		// ============================================
+		TESForm* equippedWeapon = actor->GetEquippedObject(false);  // Right hand
+		if (equippedWeapon)
+		{
+			TESObjectWEAP* weapon = DYNAMIC_CAST(equippedWeapon, TESForm, TESObjectWEAP);
+			if (weapon)
+			{
+				UInt8 type = weapon->type();
+				if (type == TESObjectWEAP::GameData::kType_Bow || 
+					type == TESObjectWEAP::GameData::kType_CrossBow)
+				{
+					return true;  // Already have a bow equipped!
+				}
+			}
+		}
+		
+		// ============================================
+		// SECOND: Check ExtraContainerChanges for bows in inventory
+		// NOTE: This only shows items ADDED to actor, not base inventory items
+		// Guards may have bows in base inventory that won't show here
+		// ============================================
 		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
 			actor->extraData.GetByType(kExtraData_ContainerChanges));
 		
@@ -1357,6 +1417,30 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return nullptr;
 		
+		// ============================================
+		// FIRST: Check if actor already has a bow EQUIPPED
+		// This catches bows that are in the base inventory (not in ExtraContainerChanges)
+		// ============================================
+		TESForm* equippedWeapon = actor->GetEquippedObject(false);  // Right hand
+		if (equippedWeapon)
+		{
+			TESObjectWEAP* weapon = DYNAMIC_CAST(equippedWeapon, TESForm, TESObjectWEAP);
+			if (weapon)
+			{
+				UInt8 type = weapon->type();
+				if (type == TESObjectWEAP::GameData::kType_Bow || 
+					type == TESObjectWEAP::GameData::kType_CrossBow)
+				{
+					return weapon;  // Already have a bow equipped!
+				}
+			}
+		}
+		
+		// ============================================
+		// SECOND: Check ExtraContainerChanges for bows in inventory
+		// NOTE: This only shows items ADDED to actor, not base inventory items
+		// Guards may have bows in base inventory that won't show here
+		// ============================================
 		ExtraContainerChanges* containerChanges = static_cast<ExtraContainerChanges*>(
 			actor->extraData.GetByType(kExtraData_ContainerChanges));
 		
@@ -1683,7 +1767,7 @@ namespace MountedNPCCombatVR
 			return true;
 		}
 		
-		// Also check if Daedric Glaive (our mage staff) is equipped
+		// Also check if our mage staff is equipped (by FormID)
 		TESForm* equippedWeapon = actor->GetEquippedObject(false);
 		if (equippedWeapon)
 		{
@@ -1701,7 +1785,7 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return nullptr;
 		
-		// Get the mage staff FormID to check for Daedric Glaive specifically
+		// Get the mage staff FormID to check for it specifically
 		UInt32 mageStaffFormID = GetFullFormIdMine(MAGE_STAFF_ESP_NAME, MAGE_STAFF_BASE_FORMID);
 		
 		// Check equipped weapon first
@@ -1711,12 +1795,12 @@ namespace MountedNPCCombatVR
 			TESObjectWEAP* weapon = DYNAMIC_CAST(equippedWeapon, TESForm, TESObjectWEAP);
 			if (weapon)
 			{
-				// Check if it's a staff type OR our specific mage staff (Daedric Glaive)
+				// Check if it's a staff type OR our specific mage staff
 				if (weapon->type() == TESObjectWEAP::GameData::kType_Staff)
 				{
 					return weapon;
 				}
-				// Check if it's the Daedric Glaive we use as mage staff
+				// Check if it's the mage staff from MountedNPCCombat.esp
 				if (mageStaffFormID != 0 && equippedWeapon->formID == mageStaffFormID)
 				{
 					return weapon;
@@ -1746,7 +1830,7 @@ namespace MountedNPCCombatVR
 				{
 					return weapon;
 				}
-				// Check if it's the Daedric Glaive we use as mage staff
+				// Check if it's the mage staff from MountedNPCCombat.esp
 				if (mageStaffFormID != 0 && entry->type->formID == mageStaffFormID)
 				{
 					return weapon;
@@ -1760,10 +1844,10 @@ namespace MountedNPCCombatVR
 	{
 		if (!actor) return false;
 		
-		// Don't give if actor already has a staff or Daedric glaive
+		// Don't give if actor already has a staff
 		if (HasStaffInInventory(actor)) return false;
 		
-		// Give Daedric Glaive 2H from GlaiveDanger.esp as the mage "staff"
+		// Give Mage Staff from MountedNPCCombat.esp
 		UInt32 mageStaffFormID = GetFullFormIdMine(MAGE_STAFF_ESP_NAME, MAGE_STAFF_BASE_FORMID);
 		if (mageStaffFormID == 0)
 		{
@@ -1789,7 +1873,7 @@ namespace MountedNPCCombatVR
 		
 		const char* weaponName = mageStaff->fullName.name.data;
 		_MESSAGE("WeaponDetection: Gave Mage Staff '%s' to actor %08X", 
-			weaponName ? weaponName : "Daedric Glaive 2H", actor->formID);
+			weaponName ? weaponName : "Mage Staff", actor->formID);
 		return true;
 	}
 
@@ -1817,14 +1901,14 @@ namespace MountedNPCCombatVR
 	
 	void LogInventoryWeapons(Actor* actor, UInt32 formID)
 	{
-	 if (!actor) return;
+		if (!actor) return;
 		// Minimal logging
 	}
 	
 	// ============================================
 	// Spell Detection
 	// ============================================
-
+	
 	void LogEquippedSpells(Actor* actor, UInt32 formID) { }
 	
 	bool HasSpellsAvailable(Actor* actor)

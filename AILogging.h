@@ -2,6 +2,7 @@
 
 #include "skse64/GameReferences.h"
 #include "skse64/GameForms.h"
+#include <Windows.h>
 
 namespace MountedNPCCombatVR
 {
@@ -25,8 +26,29 @@ namespace MountedNPCCombatVR
 	// ============================================
 	
 	// Stop combat alarm on actor - clears crime/alarm state so NPC can remount
+	// If called from a non-main thread this will queue the request to run on main thread
+	// Has built-in cooldown to prevent CTD when multiple riders disengage
 	void StopActorCombatAlarm(Actor* actor);
+
+	// Set main thread id for AILogging (should be called from InitMountedCombatSystem)
+	void SetAILoggingMainThreadId(DWORD id);
+
+	// Process any pending StopCombatAlarm requests queued from other threads
+	void ProcessPendingStopCombatAlarms();
 	
+	// Clear all alarm cooldowns (call on game load/reset)
+	void ClearAlarmCooldowns();
+	
+	// ============================================
+	// Disengage Queue System (for multi-rider scenarios)
+	// ============================================
+	
+	// Process queued disengages - call this from the main update loop
+	void ProcessQueuedDisengages();
+	
+	// Clear the disengage queue (call on game load/reset)
+	void ClearDisengageQueue();
+
 	// ============================================
 	// Mount Obstruction Detection & Logging
 	// ============================================
@@ -35,32 +57,32 @@ namespace MountedNPCCombatVR
 	enum class ObstructionType
 	{
 		None = 0,
-		Stationary,   // Not moving but should be
-		RunningInPlace,      // Animating but not moving
+		Stationary, // Not moving but should be
+		RunningInPlace, // Animating but not moving
 		CollisionBlocked, // Blocked by geometry/actors
-		PathfindingFailed    // Can't find path to target
+		PathfindingFailed // Can't find path to target
 	};
 	
 	// Which side the obstruction is on
 	enum class ObstructionSide
 	{
 		Unknown = 0,
-		Front,     // Directly ahead
-		Left,  // Left side blocked
-		Right,    // Right side blocked
-		Both   // Both sides blocked
+		Front, // Directly ahead
+		Left, // Left side blocked
+		Right, // Right side blocked
+		Both // Both sides blocked
 	};
 	
 	struct HorseObstructionInfo
 	{
 		UInt32 horseFormID;
 		ObstructionType type;
-		ObstructionSide side;      // Which side is obstructed
-		float stuckDuration;       // How long has it been stuck
-		float lastMovementTime;       // When it last moved significantly
-		NiPoint3 lastPosition;        // Last known good position
-		NiPoint3 intendedDirection;   // Where it's trying to go
-		int stuckCount;        // How many times stuck this session
+		ObstructionSide side; // Which side is obstructed
+		float stuckDuration; // How long has it been stuck
+		float lastMovementTime; // When it last moved significantly
+		NiPoint3 lastPosition; // Last known good position
+		NiPoint3 intendedDirection; // Where it's trying to go
+		int stuckCount; // How many times stuck this session
 		bool isValid;
 	};
 	
@@ -87,10 +109,7 @@ namespace MountedNPCCombatVR
 	// Sheer Drop Detection
 	// ============================================
 	
-	// Check for a sheer drop around the horse using heuristic Z-sampling.
-	// Returns true if a sheer drop (>= threshold) is detected near the horse.
 	bool CheckAndLogSheerDrop(Actor* horse);
 	
-	// Query if a horse is currently near a sheer drop (cached)
 	bool IsHorseNearSheerDrop(UInt32 horseFormID);
 }

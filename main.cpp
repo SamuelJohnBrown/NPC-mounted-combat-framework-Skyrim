@@ -8,8 +8,7 @@
 #include "Helper.h"
 #include "SpecialDismount.h"
 #include "HorseMountScanner.h"
-#include "skse64/GameMenus.h"  // For MenuManager, MenuOpenCloseEvent
-#include "skse64/GameEvents.h" // For BSTEventSink
+#include "skse64/GameMenus.h"  // For MenuOpenCloseEvent
 
 #include "skse64_common/BranchTrampoline.h"
 
@@ -38,95 +37,62 @@ namespace MountedNPCCombatVR
 	#pragma comment(lib, "Ws2_32.lib")
 
 	// ============================================
-	// MENU EVENT HANDLER - Hot reload config on menu close
+	// MENU OPEN/CLOSE EVENT SINK
+	// Hot-reloads INI config when any menu closes
 	// ============================================
 	class MenuOpenCloseHandler : public BSTEventSink<MenuOpenCloseEvent>
 	{
 	public:
 		virtual EventResult ReceiveEvent(MenuOpenCloseEvent* evn, EventDispatcher<MenuOpenCloseEvent>* dispatcher) override
 		{
-			if (!evn) return kEvent_Continue;
-			
-			// Only reload on menu CLOSE (not open)
-			if (!evn->opening)
+			if (evn && !evn->opening)
 			{
-				// Check for menus where user might have changed settings
-				// Journal Menu = Pause menu in VR (contains System)
-				// Console Menu = Debug console
-				// MCM menus typically have "MCM" in name or use custom menus
+				// Menu is closing - hot-reload config
+				// Only reload for major menus (not every tooltip, etc.)
 				const char* menuName = evn->menuName.data;
-				
 				if (menuName)
 				{
-					bool shouldReload = false;
-					
-					// Journal Menu (pause menu) - most common place to change INI
-					if (strcmp(menuName, "Journal Menu") == 0)
+					// Check for menus where user might have edited the INI
+					// System menu (ESC), Journal, Inventory, Map, etc.
+					if (strcmp(menuName, "Journal Menu") == 0 ||
+						strcmp(menuName, "InventoryMenu") == 0 ||
+						strcmp(menuName, "MagicMenu") == 0 ||
+						strcmp(menuName, "MapMenu") == 0 ||
+						strcmp(menuName, "StatsMenu") == 0 ||
+						strcmp(menuName, "TweenMenu") == 0 ||
+						strcmp(menuName, "Console") == 0 ||
+						strcmp(menuName, "Main Menu") == 0 ||
+						strcmp(menuName, "Loading Menu") == 0)
 					{
-						shouldReload = true;
-					}
-					// System pause menu 
-					else if (strcmp(menuName, "System Menu") == 0)
-					{
-						shouldReload = true;
-					}
-					// Console - user might have reloaded INI via console
-					else if (strcmp(menuName, "Console") == 0)
-					{
-						shouldReload = true;
-					}
-					// Main Menu - returning from main menu
-					else if (strcmp(menuName, "Main Menu") == 0)
-					{
-						shouldReload = true;
-					}
-					
-					if (shouldReload)
-					{
-						_MESSAGE("MenuHandler: '%s' closed - hot-reloading config", menuName);
+						_MESSAGE("MenuOpenCloseHandler: '%s' closed - hot-reloading config", menuName);
 						loadConfig();
 					}
 				}
 			}
-			
 			return kEvent_Continue;
 		}
 	};
 	
-	static MenuOpenCloseHandler g_menuHandler;
+	static MenuOpenCloseHandler g_menuOpenCloseHandler;
 	static bool g_menuHandlerRegistered = false;
 	
-	void RegisterMenuHandler()
+	// ============================================
+	// REGISTER MENU EVENT HANDLER
+	// ============================================
+	void RegisterMenuEventHandler()
 	{
 		if (g_menuHandlerRegistered) return;
 		
 		MenuManager* mm = MenuManager::GetSingleton();
 		if (mm)
 		{
-			EventDispatcher<MenuOpenCloseEvent>* dispatcher = mm->MenuOpenCloseEventDispatcher();
-			if (dispatcher)
-			{
-				dispatcher->AddEventSink(&g_menuHandler);
-				g_menuHandlerRegistered = true;
-				_MESSAGE("MenuHandler: Registered for menu open/close events (config hot-reload enabled)");
-			}
+			mm->MenuOpenCloseEventDispatcher()->AddEventSink(&g_menuOpenCloseHandler);
+			g_menuHandlerRegistered = true;
+			_MESSAGE("MenuOpenCloseHandler: Registered for hot-reload on menu close");
 		}
-	}
-	
-	void UnregisterMenuHandler()
-	{
-		if (!g_menuHandlerRegistered) return;
-		
-		MenuManager* mm = MenuManager::GetSingleton();
-		if (mm)
+		else
 		{
-			EventDispatcher<MenuOpenCloseEvent>* dispatcher = mm->MenuOpenCloseEventDispatcher();
-			if (dispatcher)
-			{
-				dispatcher->RemoveEventSink(&g_menuHandler);
-				g_menuHandlerRegistered = false;
-				_MESSAGE("MenuHandler: Unregistered from menu events");
-			}
+			_MESSAGE("MenuOpenCloseHandler: WARNING - MenuManager not available");
 		}
 	}
 
@@ -153,10 +119,10 @@ namespace MountedNPCCombatVR
 	{
 		_MESSAGE("Building Event Sinks...");
 		
-		// Register menu handler for config hot-reload
-		RegisterMenuHandler();
+		// Register menu event handler for INI hot-reload
+		RegisterMenuEventHandler();
 	}
-
+	
 	extern "C" {
 
 		bool SKSEPlugin_Query(const SKSEInterface* skse, PluginInfo* info) {	// Called by SKSE to learn about this plugin and check that it's safe to load it

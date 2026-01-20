@@ -5,10 +5,8 @@
 #include "WeaponDetection.h"
 #include "NPCProtection.h"
 #include "CombatStyles.h"  // For ClearNPCFollowTarget
-#include "MultiMountedCombat.h"  // For RegisterMultiRider
 #include "ArrowSystem.h"  // For ResetBowAttackState
 #include "SpecialMovesets.h"  // For ClearAllMovesetData
-#include "MagicCastingSystem.h"  // For ResetMageSpellState
 
 #include "Helper.h"  // For GetGameTime
 #include "config.h"
@@ -62,42 +60,18 @@ namespace MountedNPCCombatVR
 	
 	void ResetCompanionCombat()
 	{
-		_MESSAGE("CompanionCombat: Resetting all companion tracking...");
+		_MESSAGE("CompanionCombat: Resetting all companion tracking (data only - no form lookups)...");
 		
 		// Reset scan timer so companions are detected fresh
 		g_lastCompanionScanTime = 0;
 		
+		// ============================================
+		// CRITICAL: Do NOT call LookupFormByID during reset!
+		// During game load/death/transition, forms may be invalid
+		// Just clear the tracking data - let game handle actual actor cleanup
+		// ============================================
 		for (int i = 0; i < MAX_TRACKED_COMPANIONS; i++)
 		{
-			if (g_trackedCompanions[i].isValid)
-			{
-				// Clear protection and follow packages from companions
-				TESForm* form = LookupFormByID(g_trackedCompanions[i].companionFormID);
-				if (form)
-				{
-					Actor* companion = DYNAMIC_CAST(form, TESForm, Actor);
-					if (companion)
-					{
-						RemoveMountedProtection(companion);
-						ClearNPCFollowTarget(companion);
-					}
-				}
-				
-				// Clear horse packages
-				if (g_trackedCompanions[i].mountFormID != 0)
-				{
-					TESForm* mountForm = LookupFormByID(g_trackedCompanions[i].mountFormID);
-					if (mountForm)
-					{
-						Actor* mount = DYNAMIC_CAST(mountForm, TESForm, Actor);
-						if (mount)
-						{
-							Actor_ClearKeepOffsetFromActor(mount);
-							Actor_EvaluatePackage(mount, false, false);
-						}
-					}
-				}
-			}
 			g_trackedCompanions[i].Reset();
 		}
 		g_trackedCompanionCount = 0;
@@ -282,9 +256,6 @@ namespace MountedNPCCombatVR
 					}
 				}
 				
-				// Also unregister from MultiMountedCombat
-				UnregisterMultiRider(companionFormID);
-				
 				g_trackedCompanions[i].Reset();
 				g_trackedCompanionCount--;
 				return;
@@ -420,8 +391,7 @@ namespace MountedNPCCombatVR
 			
 			if (data)
 			{
-				// Also register with MultiMountedCombat for combat behavior
-				// Find their combat target (usually whoever is attacking the player)
+				// Find companion's combat target (usually whoever is attacking the player)
 				Actor* target = nullptr;
 				
 				// First check if companion is already in combat with a target
@@ -461,12 +431,12 @@ namespace MountedNPCCombatVR
 				
 				if (target && !target->IsDead(1))
 				{
-					// Register with multi-combat system
-					RegisterMultiRider(actor, mount, target);
+					// Set up companion combat through CombatStyles (same as all other riders)
+					SetNPCFollowTarget(actor, target);
 					
 					const char* companionName = CALL_MEMBER_FN(actor, GetReferenceName)();
 					const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
-					_MESSAGE("CompanionCombat: Companion '%s' registered for combat vs '%s'",
+					_MESSAGE("CompanionCombat: Companion '%s' set to follow '%s'",
 						companionName ? companionName : "Unknown",
 						targetName ? targetName : "Unknown");
 				}

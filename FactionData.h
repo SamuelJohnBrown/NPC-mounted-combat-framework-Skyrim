@@ -42,6 +42,7 @@ namespace MountedNPCCombatVR
 	bool IsHostileWerewolf(UInt32 baseFormID);
 	bool IsHostileSpider(UInt32 baseFormID);
 	bool IsHostileCreature(UInt32 baseFormID);
+	bool IsHostileDragon(UInt32 baseFormID);  // Dragon FormID check (backup to race detection)
 	
 	// ============================================
 	// DRAGON DETECTION (By Race)

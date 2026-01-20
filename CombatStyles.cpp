@@ -2,14 +2,13 @@
 #include "DynamicPackages.h"
 #include "Helper.h"
 #include "MountedCombat.h"
-#include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "WeaponDetection.h"
 #include "ArrowSystem.h"
 #include "AILogging.h"
 #include "NPCProtection.h"  // For AllowTemporaryStagger
-#include "CompanionCombat.h"  // For IsCompanion
-#include "MagicCastingSystem.h"  // For ResetMageSpellState
+#include "CompanionCombat.h"// For IsCompanion
+#include "FleeingBehavior.h"  // For StopTacticalFlee, StopCivilianFlee
 #include "FactionData.h"  // For IsActorHostileToActor
 #include "config.h"  // For MountedAttackStagger settings
 #include "skse64/GameData.h"
@@ -20,6 +19,11 @@
 
 namespace MountedNPCCombatVR
 {
+	// ============================================
+	// Forward Declarations
+	// ============================================
+	bool ShouldSkipFollowForRecentRangedAssignment(UInt32 riderFormID);
+	
 	// ============================================
 	// Configuration
 	// ============================================
@@ -60,6 +64,12 @@ namespace MountedNPCCombatVR
 	static TESIdleForm* g_idleAttackRight = nullptr;
 	static TESIdleForm* g_idlePowerAttackLeft = nullptr;
 	static TESIdleForm* g_idlePowerAttackRight = nullptr;
+	
+	// ============================================
+	// FOLLOW SETUP COOLDOWN - Forward declarations
+	// Prevents duplicate calls in quick succession causing CTD
+	// ============================================
+	static void ResetFollowSetupCooldowns();
 	
 	// ============================================
 	// Attack Animation Tracking
@@ -146,46 +156,46 @@ namespace MountedNPCCombatVR
 	void ResetCombatStylesCache()
 	{
 		_MESSAGE("CombatStyles: === RESETTING CACHE ===");
-		
+	
 		// Reset cached animation forms (they become invalid after reload)
 		g_idleAttackLeft = nullptr;
 		g_idleAttackRight = nullptr;
 		g_idlePowerAttackLeft = nullptr;
 		g_idlePowerAttackRight = nullptr;
 		g_attackAnimsInitialized = false;
-		
+	
 		// Reset cached mounted stagger animation
 		g_mountedStaggerIdle = nullptr;
 		g_mountedStaggerIdleInitialized = false;
-		
+	
 		// Reset blood impact effect cache
 		g_bloodImpactDataSet = nullptr;
 		g_bloodImpactInitialized = false;
-		
+	
 		// Reset combat styles initialization flag
 		g_combatStylesInitialized = false;
-		
+	
 		// Clear all following NPC data
 		for (int i = 0; i < 5; i++)
 		{
 			g_followingNPCs[i].isValid = false;
 		}
 		g_followingNPCCount = 0;
-		
+	
 		// Clear all rider attack data
 		for (int i = 0; i < 5; i++)
 		{
 			g_riderAttackData[i].isValid = false;
 		}
 		g_riderAttackCount = 0;
-		
+	
 		// Clear all hit detection data
 		for (int i = 0; i < 5; i++)
 		{
 			g_hitData[i].isValid = false;
 		}
 		g_hitDataCount = 0;
-		
+	
 		// Clear controlled mounts
 		for (int i = 0; i < 5; i++)
 		{
@@ -193,6 +203,12 @@ namespace MountedNPCCombatVR
 		}
 		g_controlledMountCount = 0;
 		
+		// Clear follow setup cooldowns
+		ResetFollowSetupCooldowns();
+		
+		// Note: Ranged role data is cleared in ClearRangedRoleAssignments() 
+		// which is called from Helper.cpp reset functions
+	
 		_MESSAGE("CombatStyles: Cache reset complete");
 	}
 	
@@ -205,7 +221,7 @@ namespace MountedNPCCombatVR
 	{
 		return GetGameTime();
 	}
-	
+
 	bool InitAttackAnimations()
 	{
 		if (g_attackAnimsInitialized) return true;
@@ -529,6 +545,99 @@ namespace MountedNPCCombatVR
 	// Note: FollowingNPCData struct and g_followingNPCs defined earlier
 	// ============================================
 	
+	// ============================================
+	// FOLLOW SETUP COOLDOWN - Prevents duplicate calls in quick succession
+	// This prevents CTD from multiple follow package injections
+	// ============================================
+	struct FollowSetupCooldown
+	{
+		UInt32 actorFormID;
+		UInt32 targetFormID;
+		float lastSetupTime;
+		bool isValid;
+	};
+	
+	static FollowSetupCooldown g_followSetupCooldowns[10];
+	static int g_followSetupCooldownCount = 0;
+	const float FOLLOW_SETUP_COOLDOWN = 0.5f;  // 500ms cooldown between setup calls
+	
+	// Check if this actor+target combo is on cooldown (thread-safe with SEH)
+	static bool IsFollowSetupOnCooldown(UInt32 actorFormID, UInt32 targetFormID)
+	{
+		__try
+		{
+			float currentTime = GetGameTime();
+			
+			for (int i = 0; i < g_followSetupCooldownCount; i++)
+			{
+				if (g_followSetupCooldowns[i].isValid && 
+					g_followSetupCooldowns[i].actorFormID == actorFormID &&
+					g_followSetupCooldowns[i].targetFormID == targetFormID)
+				{
+					float elapsed = currentTime - g_followSetupCooldowns[i].lastSetupTime;
+					if (elapsed < FOLLOW_SETUP_COOLDOWN)
+					{
+						return true;  // Still on cooldown
+					}
+					// Cooldown expired - update time and allow
+					g_followSetupCooldowns[i].lastSetupTime = currentTime;
+					return false;
+				}
+			}
+			
+			// Not tracked - add new entry
+			if (g_followSetupCooldownCount < 10)
+			{
+				g_followSetupCooldowns[g_followSetupCooldownCount].actorFormID = actorFormID;
+				g_followSetupCooldowns[g_followSetupCooldownCount].targetFormID = targetFormID;
+				g_followSetupCooldowns[g_followSetupCooldownCount].lastSetupTime = currentTime;
+				g_followSetupCooldowns[g_followSetupCooldownCount].isValid = true;
+				g_followSetupCooldownCount++;
+			}
+			
+			return false;  // Not on cooldown
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			return true;  // On exception, assume cooldown to be safe
+		}
+	}
+	
+	// Clear cooldown for an actor (call on disengage/death)
+	static void ClearFollowSetupCooldown(UInt32 actorFormID)
+	{
+		__try
+		{
+			for (int i = 0; i < g_followSetupCooldownCount; i++)
+			{
+				if (g_followSetupCooldowns[i].isValid && g_followSetupCooldowns[i].actorFormID == actorFormID)
+				{
+					// Shift remaining entries
+					for (int j = i; j < g_followSetupCooldownCount - 1; j++)
+					{
+						g_followSetupCooldowns[j] = g_followSetupCooldowns[j + 1];
+					}
+					g_followSetupCooldownCount--;
+					i--;  // Recheck this index
+				}
+			}
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			// Silent fail
+		}
+	}
+	
+	// Reset all cooldowns (call on game load)
+	static void ResetFollowSetupCooldowns()
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			g_followSetupCooldowns[i].isValid = false;
+		}
+		g_followSetupCooldownCount = 0;
+	}
+	
 	int FindFollowingNPCSlot(UInt32 formID)
 	{
 		for (int i = 0; i < g_followingNPCCount; i++)
@@ -557,47 +666,56 @@ namespace MountedNPCCombatVR
 		}
 		
 		// ============================================
-		// CRITICAL: Validate both actors before proceeding
+		// CRITICAL: Check cooldown FIRST before any other processing
+		// Prevents duplicate setup calls that cause CTD
+		// ============================================
+		if (IsFollowSetupOnCooldown(actor->formID, target->formID))
+		{
+			return;  // Skip - already setting up follow for this actor+target
+		}
+		
+		// ============================================
+		// CRITICAL: Validate both actors with SEH protection
 		// Prevents CTD when actors are in invalid state
 		// ============================================
-		if (!actor->loadedState || !actor->GetNiNode())
+		__try
 		{
-			_MESSAGE("CombatStyles: SetNPCFollowTarget - actor %08X invalid state, skipping", actor->formID);
-			return;
+			if (!actor->loadedState || !actor->GetNiNode())
+			{
+				_MESSAGE("CombatStyles: SetNPCFollowTarget - actor %08X invalid state, skipping", actor->formID);
+				return;
+			}
+			
+			if (!target->loadedState || !target->GetNiNode())
+			{
+				_MESSAGE("CombatStyles: SetNPCFollowTarget - target %08X invalid state, skipping", target->formID);
+				return;
+			}
+			
+			// Validate target is actually an Actor (formType check)
+			if (target->formType != kFormType_Character)
+			{
+				_MESSAGE("CombatStyles: SetNPCFollowTarget - target %08X is not an Actor (type: %d), skipping", 
+					target->formID, target->formType);
+				return;
+			}
 		}
-		
-		if (!target->loadedState || !target->GetNiNode())
+		__except(EXCEPTION_EXECUTE_HANDLER)
 		{
-			_MESSAGE("CombatStyles: SetNPCFollowTarget - target %08X invalid state, skipping", target->formID);
-			return;
-		}
-		
-		// Validate target is actually an Actor (formType check)
-		if (target->formType != kFormType_Character)
-		{
-			_MESSAGE("CombatStyles: SetNPCFollowTarget - target %08X is not an Actor (type: %d), skipping", 
-				target->formID, target->formType);
+			_MESSAGE("CombatStyles: SetNPCFollowTarget - SEH exception validating actors, skipping");
 			return;
 		}
 		
 		// ============================================
-		// EARLY DISTANCE CHECK - Don't set up follow if too far
-		// This prevents adding NPCs to tracking that will immediately be removed
+		// CALCULATE DISTANCE (used for weapon selection, not rejection)
+		// NOTE: No distance check here for INITIAL ENGAGEMENT
+		// NPCs should be allowed to engage targets at any distance and close in.
+		// The UPDATE loop (UpdateCombatStylesSystem) handles disengaging
+		// when the target moves too far away (>MaxCombatDistance).
 		// ============================================
 		float dx = target->pos.x - actor->pos.x;
 		float dy = target->pos.y - actor->pos.y;
 		float distanceToTarget = sqrt(dx * dx + dy * dy);
-		
-		bool isCompanion = IsCompanion(actor);
-		float maxDistance = isCompanion ? MaxCompanionCombatDistance : MaxCombatDistance;
-		
-		if (distanceToTarget > maxDistance)
-		{
-			const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-			_MESSAGE("CombatStyles: SetNPCFollowTarget - '%s' (%08X) target too far (%.0f > %.0f), skipping",
-				actorName ? actorName : "Unknown", actor->formID, distanceToTarget, maxDistance);
-			return;
-		}
 		
 		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
@@ -606,6 +724,14 @@ namespace MountedNPCCombatVR
 		int existingSlot = FindFollowingNPCSlot(actor->formID);
 		if (existingSlot >= 0)
 		{
+			// Skip follow package for recently assigned ranged role riders
+			// This prevents CTD from movement system not being ready
+			if (ShouldSkipFollowForRecentRangedAssignment(actor->formID))
+			{
+				g_followingNPCs[existingSlot].lastFollowUpdateTime = GetCurrentGameTime();
+				return;
+			}
+			
 			// Already tracked - just re-inject the package (no log needed)
 			InjectFollowPackage(actor, target);
 			g_followingNPCs[existingSlot].lastFollowUpdateTime = GetCurrentGameTime();
@@ -633,12 +759,8 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// INITIAL WEAPON EQUIP - USE CENTRALIZED SYSTEM
 		// Use the distance already calculated above
-		// MAGES: Skip - they keep warstaff equipped, no distance-based switching
 		// ============================================
-		if (!IsRiderMage(actor->formID))
-		{
-			RequestWeaponForDistance(actor, distanceToTarget, false);
-		}
+		RequestWeaponForDistance(actor, distanceToTarget, false);
 		
 		// Ensure attack flags are set
 		actor->flags2 |= Actor::kFlag_kAttackOnSight;
@@ -674,12 +796,11 @@ namespace MountedNPCCombatVR
 			ClearInjectedPackages(actor);
 			actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
 			
-			// Clear bow attack states
 			ResetBowAttackState(actor->formID);
 			ResetRapidFireBowAttack(actor->formID);
 			
-			// Clear mage spell states
-			ResetMageSpellState(actor->formID);
+			// Clear ranged role assignment for this rider
+			ClearRangedRoleForRider(actor->formID);
 			
 			NiPointer<Actor> mount;
 			if (CALL_MEMBER_FN(actor, GetMount)(mount) && mount)
@@ -691,6 +812,9 @@ namespace MountedNPCCombatVR
 				mount->flags2 &= ~Actor::kFlag_kAttackOnSight;
 			}
 			
+			// Clear follow setup cooldown for this actor
+			ClearFollowSetupCooldown(actor->formID);
+			
 			// Remove from tracking
 			for (int i = slot; i < g_followingNPCCount - 1; i++)
 				g_followingNPCs[i] = g_followingNPCs[i + 1];
@@ -700,28 +824,21 @@ namespace MountedNPCCombatVR
 	
 	void ClearAllFollowingNPCs()
 	{
-		_MESSAGE("CombatStyles: Clearing all %d following NPCs...", g_followingNPCCount);
+		_MESSAGE("CombatStyles: Clearing all %d following NPCs (data only - no form lookups)", g_followingNPCCount);
 		
-		for (int i = 0; i < g_followingNPCCount; i++)
+		// ============================================
+		// CRITICAL: Do NOT call LookupFormByID during reset!
+		// During game load/death/transition, forms may be invalid
+		// Just clear the tracking data - let game handle actual actor cleanup
+		// ============================================
+		for (int i = 0; i < 5; i++)
 		{
-			if (g_followingNPCs[i].isValid)
-			{
-				UInt32 actorFormID = g_followingNPCs[i].actorFormID;
-				
-				TESForm* form = LookupFormByID(actorFormID);
-				if (form && form->formType == kFormType_Character)
-				{
-					Actor* actor = static_cast<Actor*>(form);
-					ClearInjectedPackages(actor);
-					actor->flags2 &= ~Actor::kFlag_kAttackOnSight;
-				}
-				
-				// Clear bow and mage states (even if actor lookup failed)
-				ResetBowAttackState(actorFormID);
-				ResetRapidFireBowAttack(actorFormID);
-				ResetMageSpellState(actorFormID);
-			}
 			g_followingNPCs[i].isValid = false;
+			g_followingNPCs[i].actorFormID = 0;
+			g_followingNPCs[i].targetFormID = 0;
+			g_followingNPCs[i].hasInjectedPackage = false;
+			g_followingNPCs[i].inMeleeRange = false;
+			g_followingNPCs[i].inAttackPosition = false;
 		}
 		
 		g_followingNPCCount = 0;
@@ -736,32 +853,6 @@ namespace MountedNPCCombatVR
 	
 	void UpdateFollowBehavior()
 	{
-		// ============================================
-		// CRITICAL: EARLY EXIT IF PLAYER IS DEAD
-		// Prevents processing actors when game state is invalid
-		// This is the fix for CTD when player dies in mounted combat
-		// ============================================
-		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->IsDead(1))
-		{
-			// Player is dead - clear all tracking and exit immediately
-			// Do NOT call any actor functions - just invalidate entries
-			for (int i = 0; i < 5; i++)
-			{
-				g_followingNPCs[i].isValid = false;
-			}
-			g_followingNPCCount = 0;
-			return;
-		}
-		
-		// ============================================
-		// CRITICAL: EARLY EXIT IF MOD IS NOT ACTIVE
-		// Prevents processing during game transitions
-		// ============================================
-		if (!g_modActive)
-		{
-			return;
-		}
-		
 		float currentTime = GetCurrentGameTime();
 		
 		for (int i = g_followingNPCCount - 1; i >= 0; i--)
@@ -774,30 +865,24 @@ namespace MountedNPCCombatVR
 				continue;
 			}
 			
-			TESForm* form = LookupFormByID(g_followingNPCs[i].actorFormID);
+			UInt32 actorFormID = g_followingNPCs[i].actorFormID;
+			
+			TESForm* form = LookupFormByID(actorFormID);
 			if (!form || form->formType != kFormType_Character)
 			{
 				g_followingNPCs[i].isValid = false;
+				ClearRangedRoleForRider(actorFormID);  // Clear ranged role on removal
 				continue;
 			}
 			
 			Actor* actor = static_cast<Actor*>(form);
-			
-			// ============================================
-			// CRITICAL: Validate actor is fully loaded
-			// Prevents crashes from accessing unloaded actors
-			// ============================================
-			if (!actor->loadedState || !actor->GetNiNode())
-			{
-				g_followingNPCs[i].isValid = false;
-				continue;
-			}
 			
 			// Safety check - verify actor has process manager
 			if (!actor->processManager)
 			{
 				_MESSAGE("CombatStyles: NPC %08X has no process manager - removing from tracking", actor->formID);
 				g_followingNPCs[i].isValid = false;
+				ClearRangedRoleForRider(actorFormID);  // Clear ranged role on removal
 				continue;
 			}
 			
@@ -805,6 +890,7 @@ namespace MountedNPCCombatVR
 			if (actor->IsDead(1))
 			{
 				g_followingNPCs[i].isValid = false;
+				ClearRangedRoleForRider(actorFormID);  // Clear ranged role on death
 				continue;
 			}
 			
@@ -813,6 +899,7 @@ namespace MountedNPCCombatVR
 			if (!CALL_MEMBER_FN(actor, GetMount)(mount) || !mount)
 			{
 				g_followingNPCs[i].isValid = false;
+				ClearRangedRoleForRider(actorFormID);  // Clear ranged role on dismount
 				continue;
 			}
 			
@@ -822,6 +909,7 @@ namespace MountedNPCCombatVR
 				_MESSAGE("CombatStyles: Mount %08X has no process manager - removing NPC %08X from tracking", 
 					mount->formID, actor->formID);
 				g_followingNPCs[i].isValid = false;
+				ClearRangedRoleForRider(actorFormID);  // Clear ranged role on removal
 				continue;
 			}
 			
@@ -843,62 +931,52 @@ namespace MountedNPCCombatVR
 					distToPlayer = sqrt(dx * dx + dy * dy);
 				}
 				
-				// If player is in combat AND NPC is within 1500 units, re-engage with player
-				const float REENGAGE_DISTANCE = 1500.0f;
-				if (playerInCombat && distToPlayer < REENGAGE_DISTANCE)
+				// If player is in combat AND NPC is within re-engage distance, re-engage with player
+				// BUT ONLY if NPC is actually hostile to the player!
+				if (playerInCombat && distToPlayer < ReEngageDistance)
 				{
-					// Only re-engage if NPC is actually hostile to player
+					// ============================================
+					// CRITICAL: CHECK IF NPC IS HOSTILE TO PLAYER
+					// Don't re-engage friendly NPCs (guards, companions, etc.)
+					// ============================================
 					Actor* player = *g_thePlayer;
 					bool isHostileToPlayer = IsActorHostileToActor(actor, player);
 					
-					if (isHostileToPlayer)
+					if (!isHostileToPlayer)
 					{
+						// NPC is NOT hostile to player - don't re-engage, just clear
 						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-						_MESSAGE("CombatStyles: Rider '%s' (%08X) lost combat state but hostile to player (dist: %.0f) - RE-ENGAGING",
-						(actorName ? actorName : "Unknown"), actor->formID, distToPlayer);
-						
-						// Force re-engage with player
-						g_followingNPCs[i].targetFormID = player->formID;
-						g_followingNPCs[i].lastTargetSwitchTime = currentTime;
-						
-						// CRITICAL: Clear weapon switch data to allow immediate re-equip
-						ClearWeaponStateData(actor->formID);
-						
-						// Set combat flags
-						actor->flags2 |= Actor::kFlag_kAttackOnSight;
-						
-						// Update the NPC's combat target to the player
-						UInt32 playerHandle = player->CreateRefHandle();
-						if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
-						{
-							actor->currentCombatTarget = playerHandle;
-						}
-						
-						// Continue processing this NPC with player as target
-						// Don't clear follow
-					}
-					else
-					{
-						// Not hostile to player - just clear tracking
-						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-						_MESSAGE("CombatStyles: Rider '%s' (%08X) exited combat, not hostile to player - clearing",
+						_MESSAGE("CombatStyles: Rider '%s' (%08X) lost combat - NOT hostile to player, clearing follow",
 							actorName ? actorName : "Unknown", actor->formID);
+						
+						ClearWeaponStateData(actor->formID);
 						ClearNPCFollowTarget(actor);
 						continue;
 					}
-				}
-				else
-				{
-					// Player not in combat or NPC too far - actually clear
-					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-					_MESSAGE("CombatStyles: Rider '%s' (%08X) exited combat - clearing follow",
-						actorName ? actorName : "Unknown", actor->formID);
 					
-					// CRITICAL: Clear weapon state on combat exit
+					const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+					_MESSAGE("CombatStyles: Rider '%s' (%08X) lost combat state but player still fighting (dist: %.0f) - RE-ENGAGING",
+					(actorName ? actorName : "Unknown"), actor->formID, distToPlayer);
+					
+					// Force re-engage with player
+					g_followingNPCs[i].targetFormID = player->formID;
+					g_followingNPCs[i].lastTargetSwitchTime = currentTime;
+					
+					// CRITICAL: Clear weapon switch data to allow immediate re-equip
 					ClearWeaponStateData(actor->formID);
 					
-					ClearNPCFollowTarget(actor);
-					continue;
+					// Set combat flags
+					actor->flags2 |= Actor::kFlag_kAttackOnSight;
+					
+					// Update the NPC's combat target to the player
+					UInt32 playerHandle = player->CreateRefHandle();
+					if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+					{
+						actor->currentCombatTarget = playerHandle;
+					}
+					
+					// Continue processing this NPC with player as target
+					// Don't clear follow
 				}
 			}
 			
@@ -930,7 +1008,7 @@ namespace MountedNPCCombatVR
 						{
 							// New target - check cooldown
 							float timeSinceLastSwitch = currentTime - g_followingNPCs[i].lastTargetSwitchTime;
-							
+						
 							if (timeSinceLastSwitch < TARGET_SWITCH_COOLDOWN)
 							{
 								// Still on cooldown - keep current target, ignore the new one
@@ -952,13 +1030,15 @@ namespace MountedNPCCombatVR
 								// ============================================
 								ClearWeaponSwitchData(actor->formID);
 								
+
 								// Force weapon draw
 								if (!IsWeaponDrawn(actor))
 								{
 									actor->DrawSheatheWeapon(true);
 								}
+									
+	
 								
-
 								const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
 								const char* targetName = CALL_MEMBER_FN(combatTarget, GetReferenceName)();
 								_MESSAGE("CombatStyles: NPC '%s' (%08X) SWITCHED TARGET to '%s' (%08X) - weapon switch reset",
@@ -1006,7 +1086,7 @@ namespace MountedNPCCombatVR
 					else if (target->IsDead(1))
 					{
 						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
-						_MESSAGE("CombatStyles: Target died - NPC '%s' checking for new target",
+						_MESSAGE("CombatStyles: Target died - NPC '%s' switching to PLAYER",
 							actorName ? actorName : "Unknown");
 						target = nullptr;
 						g_followingNPCs[i].targetFormID = 0;
@@ -1014,41 +1094,25 @@ namespace MountedNPCCombatVR
 						// CRITICAL: Clear weapon state when target dies - allows fresh equip
 						ClearWeaponStateData(actor->formID);
 						
-						// Check if NPC is actually hostile to player before switching to them
+						// Immediately switch to player if available
 						if (g_thePlayer && (*g_thePlayer) && !(*g_thePlayer)->IsDead(1))
 						{
-							Actor* player = *g_thePlayer;
+							target = *g_thePlayer;
+							g_followingNPCs[i].targetFormID = target->formID;
+							g_followingNPCs[i].lastTargetSwitchTime = currentTime;
 							
-							// Only switch to player if NPC is hostile to player
-							bool isHostileToPlayer = IsActorHostileToActor(actor, player);
+							// Update the NPC's actual combat target
+							UInt32 playerHandle = target->CreateRefHandle();
+							if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
+							{
+								actor->currentCombatTarget = playerHandle;
+							}
 							
-							if (isHostileToPlayer)
-							{
-								target = player;
-								g_followingNPCs[i].targetFormID = target->formID;
-								g_followingNPCs[i].lastTargetSwitchTime = currentTime;
-								
-								// Update the NPC's actual combat target
-								UInt32 playerHandle = target->CreateRefHandle();
-								if (playerHandle != 0 && playerHandle != *g_invalidRefHandle)
-								{
-									actor->currentCombatTarget = playerHandle;
-								}
-								
-								// Ensure attack flags are set
-								actor->flags2 |= Actor::kFlag_kAttackOnSight;
-								
-								_MESSAGE("CombatStyles: NPC '%s' now targeting PLAYER after target death (was hostile)",
-									actorName ? actorName : "Unknown");
-							}
-							else
-							{
-								// Not hostile to player - just clear tracking, let game AI handle
-								_MESSAGE("CombatStyles: NPC '%s' target died but not hostile to player - clearing tracking",
-									actorName ? actorName : "Unknown");
-								ClearNPCFollowTarget(actor);
-								continue;
-							}
+							// Ensure attack flags are set
+							actor->flags2 |= Actor::kFlag_kAttackOnSight;
+							
+							_MESSAGE("CombatStyles: NPC '%s' now targeting PLAYER after target death",
+								actorName ? actorName : "Unknown");
 						}
 					}
 				}
@@ -1064,27 +1128,13 @@ namespace MountedNPCCombatVR
 			
 			// ============================================
 			// PRIORITY 3: Default to player if no target
-			// Only if NPC is actually hostile to player!
 			// ============================================
 			if (!target)
 			{
 				if (g_thePlayer && (*g_thePlayer))
 				{
-					Actor* player = *g_thePlayer;
-					
-					// Only target player if NPC is hostile to them
-					if (IsActorHostileToActor(actor, player))
-					{
-						target = player;
-						g_followingNPCs[i].targetFormID = target->formID;
-					}
-					else
-					{
-						// Not hostile to player - clear tracking
-						_MESSAGE("CombatStyles: NPC %08X has no target and not hostile to player - clearing", actor->formID);
-						ClearNPCFollowTarget(actor);
-						continue;
-					}
+					target = *g_thePlayer;
+					g_followingNPCs[i].targetFormID = target->formID;
 				}
 				else
 				{
@@ -1122,9 +1172,6 @@ namespace MountedNPCCombatVR
 				_MESSAGE("CombatStyles: Target too far (%.0f > %.0f) - NPC '%s' disengaging",
 					distanceToTarget, maxDistance, actorName ? actorName : "Unknown");
 				
-				float angleAwayFromTarget = atan2(-dx, -dy);
-				mount->rot.z = angleAwayFromTarget;
-				
 				// ============================================
 				// CRITICAL: ADD TO DISENGAGE COOLDOWN FIRST
 				// This prevents immediate re-engagement via OnDismountBlocked
@@ -1132,34 +1179,73 @@ namespace MountedNPCCombatVR
 				AddNPCToDisengageCooldown(actor->formID);
 				
 				// ============================================
-				// CRITICAL: STOP COMBAT COMPLETELY ON DISENGAGE
-				// Uses StopActorCombatAlarm - same method as HorseMountScanner
-				// This properly clears combat/alarm state and allows return to default AI
+				// CRITICAL: VALIDATE ACTOR STATES BEFORE CLEANUP
+				// Actors may be unloading during disengage - skip game calls if invalid
 				// ============================================
+				bool actorValid = actor->loadedState && actor->processManager;
+				bool mountValid = mount && mount->loadedState && mount->processManager;
 				
-				// Stop combat alarm - this properly clears combat state
-				StopActorCombatAlarm(actor);
-				
-				// Sheathe weapon to signal end of combat
-				if (IsWeaponDrawn(actor))
+				if (mountValid)
 				{
-					actor->DrawSheatheWeapon(false);
+					float angleAwayFromTarget = atan2(-dx, -dy);
+					mount->rot.z = angleAwayFromTarget;
 				}
 				
-				// Clear weapon state data
+				// Clear weapon state data (data only - no game calls)
 				ClearWeaponStateData(actor->formID);
 				
-				// Stop horse sprint
-				StopHorseSprint(mount.get());
+				// Clear ranged follow state (data only - no game calls)
+				ClearRangedFollowState(actor->formID);
 				
-				// Clear horse combat target and flags
-				mount->currentCombatTarget = 0;
-				mount->flags2 &= ~Actor::kFlag_kAttackOnSight;
+				// ============================================
+				// CLEAR BOW/ARROW SYSTEM STATE (data only)
+				// Prevents stale bow attack states from persisting
+				// ============================================
+				ResetBowAttackState(actor->formID);
+				ResetRapidFireBowAttack(actor->formID);
 				
-				// Force AI re-evaluation on horse
-				Actor_EvaluatePackage(mount.get(), false, false);
+				// ============================================
+				// CLEAR FLEE STATES (data only)
+				// Stop any active tactical or civilian flee for this rider
+				// ============================================
+				if (IsRiderFleeing(actor->formID))
+				{
+					StopTacticalFlee(actor->formID);
+				}
+				if (IsCivilianFleeing(actor->formID))
+				{
+					StopCivilianFlee(actor->formID, false);  // Don't reset AI again, we're already doing it
+				}
 				
-				_MESSAGE("CombatStyles: NPC '%s' combat STOPPED via StopActorCombatAlarm (10s cooldown)", actorName ? actorName : "Unknown");
+				// ============================================
+				// CLEAR SPECIAL MOVESET DATA FOR THE HORSE (data only)
+				// Prevents stale turn direction, charge data, etc.
+				// ============================================
+				ClearAllMovesetData(mount->formID);
+				
+				if (mountValid)
+				{
+					// Clear horse combat target and flags
+					mount->currentCombatTarget = 0;
+					mount->flags2 &= ~Actor::kFlag_kAttackOnSight;
+				}
+				
+				if (actorValid)
+				{
+					// Sheathe weapon to signal end of combat
+					if (IsWeaponDrawn(actor))
+					{
+						actor->DrawSheatheWeapon(false);
+					}
+				}
+				
+				// ============================================
+				// CRITICAL: STOP COMBAT ALARM LAST
+				// This properly clears combat/alarm state
+				// ============================================
+				StopActorCombatAlarm(actor);
+				
+				_MESSAGE("CombatStyles: NPC '%s' combat STOPPED via StopActorCombatAlarm", actorName ? actorName : "Unknown");
 				
 				// Clear our follow tracking
 				ClearNPCFollowTarget(actor);
@@ -1171,14 +1257,20 @@ namespace MountedNPCCombatVR
 				// ============================================
 				RemoveNPCFromTracking(actor->formID);
 				
-				// Also unregister from MultiMountedCombat
-				UnregisterMultiRider(actor->formID);
-				
 				continue;
 			}
 			
 			g_followingNPCs[i].lastFollowUpdateTime = currentTime;
 			g_followingNPCs[i].reinforceCount++;
+			
+			// ============================================
+			// CRITICAL: Skip follow package for recently assigned ranged role riders
+			// This prevents CTD from movement system not being ready after role change
+			// ============================================
+			if (ShouldSkipFollowForRecentRangedAssignment(actor->formID))
+			{
+				continue;  // Skip this frame, let movement system stabilize
+			}
 			
 			int attackState = 0;
 			InjectFollowPackage(actor, target, &attackState);
@@ -1191,23 +1283,8 @@ namespace MountedNPCCombatVR
 			// Skip if weapon is transitioning (sheathing/equipping/drawing)
 			if (!IsWeaponTransitioning(actor))
 			{
-				// ============================================
-				// MAGES: Skip weapon switching - they keep warstaff equipped
-				// ============================================
-				if (IsRiderMage(actor->formID))
-				{
-					// Mage - just ensure staff is equipped and drawn
-					if (!IsStaffEquipped(actor))
-					{
-						RequestWeaponSwitch(actor, WeaponRequest::Staff);
-					}
-					else if (!IsWeaponDrawn(actor))
-					{
-						RequestWeaponDraw(actor);
-					}
-				}
 				// If no melee or bow equipped at all, request weapon based on distance
-				else if (!IsMeleeEquipped(actor) && !IsBowEquipped(actor))
+				if (!IsMeleeEquipped(actor) && !IsBowEquipped(actor))
 				{
 					float dx = target->pos.x - actor->pos.x;
 					float dy = target->pos.y - actor->pos.y;
@@ -1221,7 +1298,7 @@ namespace MountedNPCCombatVR
 					RequestWeaponDraw(actor);
 				}
 			}
-			
+						
 			// Update attack position tracking (removed verbose per-frame logging)
 			bool wasInAttackPosition = g_followingNPCs[i].inAttackPosition;
 			g_followingNPCs[i].inMeleeRange = (attackState >= 1);
@@ -1242,6 +1319,9 @@ namespace MountedNPCCombatVR
 	{
 		// Update the centralized weapon state machine FIRST
 		UpdateWeaponStates();
+		
+		// Update ranged role assignments (3+ riders = assign one to ranged role)
+		UpdateRangedRoleAssignments();
 		
 		UpdateFollowBehavior();
 	}
@@ -1480,13 +1560,14 @@ namespace MountedNPCCombatVR
 	static const UInt32 SOUND_UNBLOCKED_HIT = 0x0001939D;    // Unblocked hit sound
 	static const UInt32 SOUND_WEAPON_BLOCK = 0x0001939B;    // Weapon block sound
 	static const UInt32 SOUND_SHIELD_BLOCK = 0x0001939F;    // Shield block sound
-	
+	static const UInt32 SOUND_MAGE_STAFF_HIT = 0x00019BC0;  // Bash/blunt hit sound for mage staff
+
 	// ============================================
 	// BLOOD IMPACT EFFECT SYSTEM
 	// Uses BGSImpactDataSet from Skyrim.esm to spawn blood splatter
 	// Note: g_bloodImpactDataSet and g_bloodImpactInitialized declared above
 	// ============================================
-	
+
 	// Blood Impact Data Set FormID from Skyrim.esm
 	static const UInt32 BLOOD_IMPACT_DATASET_FORMID = 0x0001F82A;
 	
@@ -1803,6 +1884,10 @@ namespace MountedNPCCombatVR
 		// Check if rider is a companion
 		bool riderIsCompanion = IsCompanion(rider);
 		
+				// Check if rider is a mage (using staff)
+		MountedCombatClass riderClass = DetermineCombatClass(rider);
+		bool riderIsMage = (riderClass == MountedCombatClass::MageCaster);
+		
 		// Check if target is blocking and with what
 		// 0 = not blocking, 1 = weapon block, 2 = shield block
 		// Pass rider as attacker for FOV check - can't block attacks from behind!
@@ -1819,16 +1904,20 @@ namespace MountedNPCCombatVR
 		// ============================================
 		// DAMAGE MULTIPLIER FOR MOUNTED COMBAT
 		// Applies to ALL targets including the player!
+		// EXCEPTION: Mages doNOT get the damage multiplier (staff does base damage only)
 		// Companions: CompanionRiderDamageMultiplier (default 2x)
 		// Hostile riders: HostileRiderDamageMultiplier (default 3x)
 		// ============================================
-		if (riderIsCompanion)
+		if (!riderIsMage)
 		{
-			baseDamage *= CompanionRiderDamageMultiplier;  // Companions use config multiplier
-		}
-		else
-		{
-			baseDamage *= HostileRiderDamageMultiplier;  // Hostile riders use config multiplier
+			if (riderIsCompanion)
+			{
+				baseDamage *= CompanionRiderDamageMultiplier;  // Companions use config multiplier
+			}
+			else
+			{
+				baseDamage *= HostileRiderDamageMultiplier;  // Hostile riders use config multiplier
+			}
 		}
 
 		// Blocking effects:
@@ -1872,7 +1961,7 @@ namespace MountedNPCCombatVR
 			}
 		}
 		
-			// Apply damage
+		// Apply damage
 		target->actorValueOwner.RestoreActorValue(Actor::kDamage, AV_Health, -actualDamage);
 		
 		// ============================================
@@ -1883,7 +1972,7 @@ namespace MountedNPCCombatVR
 		// Skip if target is the player (player shouldn't be staggered by this system)
 		// ============================================
 		bool staggerApplied = false;
-		if (MountedAttackStaggerEnabled && !blockSuccessful && !guardBroken)
+		if ( MountedAttackStaggerEnabled && !blockSuccessful && !guardBroken)
 		{
 			// Check if target is the player - NEVER stagger the player
 			bool targetIsPlayer = (g_thePlayer && (*g_thePlayer) && target == (*g_thePlayer));
@@ -1919,11 +2008,12 @@ namespace MountedNPCCombatVR
 			if (blockType == 2)
 			{
 				PlaySoundAtActor(SOUND_SHIELD_BLOCK, target);  // Shield block sound
-						}
+			}
 			else
 			{
 				PlaySoundAtActor(SOUND_WEAPON_BLOCK, target);  // Weapon block sound
 			}
+			
 			
 			// Apply stagger spell to the rider whose attack was blocked
 			// Pass target (blocker) as the spell source
@@ -1949,16 +2039,28 @@ namespace MountedNPCCombatVR
 		else
 		{
 			// Unblocked hit - play hit sound and spawn blood effect
-			PlaySoundAtActor(SOUND_UNBLOCKED_HIT, target);
+			// Mages use bash/blunt hit sound, others use standard hit sound
+			if (riderIsMage)
+			{
+				PlaySoundAtActor(SOUND_MAGE_STAFF_HIT, target);
+			}
+			else
+			{
+				PlaySoundAtActor(SOUND_UNBLOCKED_HIT, target);
+			}
 			SpawnBloodEffect(target, rider);
 		}
 		
 		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
 		const char* targetName = CALL_MEMBER_FN(target, GetReferenceName)();
 		
-		// Determine multiplier string for logging
+		// Prepare multiplier string for logging
 		char multiplierStr[32] = "";
-		if (riderIsCompanion)
+		if (riderIsMage)
+		{
+			sprintf_s(multiplierStr, " [STAFF]");  // Mages don't get damage multiplier
+		}
+		else if (riderIsCompanion)
 		{
 			sprintf_s(multiplierStr, " [%.1fx ALLY]", CompanionRiderDamageMultiplier);
 		}
@@ -2044,5 +2146,527 @@ namespace MountedNPCCombatVR
 		}
 		
 		return false;
+	}
+	
+	// ============================================
+	// RANGED ROLE ASSIGNMENT SYSTEM
+	// ============================================
+	// When 3+ riders of the same faction are in battle:
+	// - Leaders/Captains are always assigned ranged role
+	// - Otherwise, the furthest rider from target gets ranged role
+	// - Mages are EXCLUDED from this system (they have their own logic)
+	// - Ranged role maintains distance and uses bow
+	// - If target gets too close, switches to melee with full weapon switching
+	// ============================================
+	// NOTE: Distance/threshold values now come from config.h (INI tunable):
+	// - DynamicRangedRoleIdealDistance (default 800)
+	// - DynamicRangedRoleMeleeThreshold (default 350)
+	// - DynamicRangedRoleReturnThreshold (default 500)
+	// - DynamicRangedRoleModeSwitchCooldown (default 3.0)
+	// - DynamicRangedRoleMinRiders (default 3)
+	// ============================================
+
+	struct RangedRoleData
+	{
+		UInt32 riderFormID;
+		UInt32 horseFormID;
+		UInt32 targetFormID;
+		RangedRoleMode mode;
+		bool isLeaderOrCaptain;
+		float lastModeSwitchTime;
+		float assignedTime;
+		bool isValid;
+		
+		void Reset()
+		{
+			riderFormID = 0;
+			horseFormID = 0;
+			targetFormID = 0;
+			mode = RangedRoleMode::None;
+			isLeaderOrCaptain = false;
+			lastModeSwitchTime = 0;
+			assignedTime = 0;
+			isValid = false;
+		}
+	};
+	
+	const int MAX_RANGED_ROLE_TRACKED = 10;
+	static RangedRoleData g_rangedRoleData[MAX_RANGED_ROLE_TRACKED];
+	static int g_rangedRoleCount = 0;
+	
+	// ============================================
+	// RANGED ROLE ASSIGNMENT - Tracking variables
+	// ============================================
+	// Track last assignment time to prevent immediate follow package injection
+	static float g_lastRangedRoleAssignmentTime = 0.0f;
+	static UInt32 g_lastAssignedRiderFormID = 0;
+	
+	// ============================================
+	// RANGED ROLE ASSIGNMENT - Forward declarations
+	// ============================================
+	void UpdateRangedRoleAssignments();
+	void ClearRangedRoleAssignments();
+	
+	// ============================================
+	// RANGED ROLE HELPER FUNCTIONS
+	// ============================================
+	
+	// Check if we should skip follow package injection for this rider
+	// Returns true if rider was just assigned to ranged role (within 0.5 seconds)
+	bool ShouldSkipFollowForRecentRangedAssignment(UInt32 riderFormID)
+	{
+		if (g_lastAssignedRiderFormID != riderFormID) return false;
+		
+		float currentTime = GetCurrentGameTime();
+		float timeSinceAssignment = currentTime - g_lastRangedRoleAssignmentTime;
+		
+		// Skip for 0.5 seconds after assignment to let movement system stabilize
+		if (timeSinceAssignment < 0.5f)
+		{
+			return true;
+		}
+		
+		return false;
+	}
+	
+	static RangedRoleData* GetRangedRoleData(UInt32 riderFormID)
+	{
+		for (int i = 0; i < MAX_RANGED_ROLE_TRACKED; i++)
+		{
+			if (g_rangedRoleData[i].isValid && g_rangedRoleData[i].riderFormID == riderFormID)
+			{
+				return &g_rangedRoleData[i];
+			}
+		}
+		return nullptr;
+	}
+	
+	// Create or get existing ranged role data for a rider
+	static RangedRoleData* GetOrCreateRangedRoleData(UInt32 riderFormID)
+	{
+		// Find existing
+		RangedRoleData* existing = GetRangedRoleData(riderFormID);
+		if (existing) return existing;
+		
+		// Create new
+		for (int i = 0; i < MAX_RANGED_ROLE_TRACKED; i++)
+		{
+			if (!g_rangedRoleData[i].isValid)
+			{
+				g_rangedRoleData[i].Reset();
+				g_rangedRoleData[i].riderFormID = riderFormID;
+				g_rangedRoleData[i].isValid = true;
+				g_rangedRoleCount++;
+				return &g_rangedRoleData[i];
+			}
+		}
+		return nullptr;
+	}
+	
+	static bool IsLeaderOrCaptainByName(Actor* actor)
+	{
+		if (!actor) return false;
+		
+		const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+		if (!actorName) return false;
+		
+		// Check for Captain or Leader in name
+		if (strstr(actorName, "Captain") != nullptr) return true;
+		if (strstr(actorName, "Leader") != nullptr) return true;
+		if (strstr(actorName, "Chief") != nullptr) return true;
+		if (strstr(actorName, "Commander") != nullptr) return true;
+		
+		return false;
+	}
+	
+	// Check if rider is in ranged role
+	bool IsInRangedRole(UInt32 riderFormID)
+	{
+		RangedRoleData* data = GetRangedRoleData(riderFormID);
+		return (data != nullptr && data->mode != RangedRoleMode::None);
+	}
+	
+	// Get ranged role mode for a rider
+	RangedRoleMode GetRangedRoleMode(UInt32 riderFormID)
+	{
+		RangedRoleData* data = GetRangedRoleData(riderFormID);
+		if (data) return data->mode;
+		return RangedRoleMode::None;
+	}
+	
+	// Check if rider is in ranged role's ranged mode (maintaining distance)
+	bool IsInRangedRoleRangedMode(UInt32 riderFormID)
+	{
+		RangedRoleData* data = GetRangedRoleData(riderFormID);
+		return (data != nullptr && data->mode == RangedRoleMode::Ranged);
+	}
+	
+	// ============================================
+	// RANGED ROLE ASSIGNMENT - Main update function
+	// Called periodically to update which riders are in ranged role
+	// ============================================
+	
+	void UpdateRangedRoleAssignments()
+	{
+		// Skip if not enough riders for ranged role assignment
+		if (g_followingNPCCount < DynamicRangedRoleMinRiders)
+		{
+			return;
+		}
+		
+		float currentTime = GetCurrentGameTime();
+		
+		// ============================================
+		// STEP 1: Count valid non-mage riders and find their target
+		// ============================================
+		int validRiderCount = 0;
+		Actor* sharedTarget = nullptr;
+		
+		struct RiderInfo {
+			UInt32 riderFormID;
+			UInt32 horseFormID;
+			Actor* riderActor;
+			float distanceToTarget;
+			bool isLeaderOrCaptain;
+			bool isMage;
+		};
+		
+		RiderInfo riders[5];
+		
+		for (int i = 0; i < g_followingNPCCount && i < 5; i++)
+		{
+			if (!g_followingNPCs[i].isValid) continue;
+			
+			TESForm* riderForm = LookupFormByID(g_followingNPCs[i].actorFormID);
+			if (!riderForm || riderForm->formType != kFormType_Character) continue;
+			
+			Actor* rider = static_cast<Actor*>(riderForm);
+			if (!rider || rider->IsDead(1)) continue;
+			
+			// Get mount
+			NiPointer<Actor> mount;
+			if (!CALL_MEMBER_FN(rider, GetMount)(mount) || !mount) continue;
+			
+			// Check if mage - mages are EXCLUDED from ranged role
+			MountedCombatClass combatClass = DetermineCombatClass(rider);
+			if (combatClass == MountedCombatClass::MageCaster)
+			{
+				continue; // Skip mages entirely
+			}
+			
+			// Exclude companions from ranged role assignment
+			if (IsCompanion(rider))
+			{
+				continue; // Companions should not be considered for ranged role
+			}
+			
+			// Get target
+			Actor* target = nullptr;
+			if (rider->currentCombatTarget != 0)
+			{
+				NiPointer<TESObjectREFR> targetRef;
+				LookupREFRByHandle(rider->currentCombatTarget, targetRef);
+				if (targetRef && targetRef->formType == kFormType_Character)
+				{
+					target = static_cast<Actor*>(targetRef.get());
+				}
+			}
+			
+			if (!target)
+			{
+				// Default to player if no combat target
+				if (g_thePlayer && (*g_thePlayer))
+				{
+					target = *g_thePlayer;
+				}
+			}
+			
+			if (!target) continue;
+			
+			// Use first target as shared target reference
+			if (!sharedTarget)
+			{
+				sharedTarget = target;
+			}
+			
+			// Calculate distance to target
+			float dx = target->pos.x - rider->pos.x;
+			float dy = target->pos.y - rider->pos.y;
+			float distance = sqrt(dx * dx + dy * dy);
+			
+			riders[validRiderCount].riderFormID = rider->formID;
+			riders[validRiderCount].horseFormID = mount->formID;
+			riders[validRiderCount].riderActor = rider;
+			riders[validRiderCount].distanceToTarget = distance;
+			riders[validRiderCount].isLeaderOrCaptain = IsLeaderOrCaptainByName(rider);
+			riders[validRiderCount].isMage = false;
+			
+			validRiderCount++;
+		}
+		
+		// Need at least configured number of non-mage riders for ranged role assignment
+		if (validRiderCount < DynamicRangedRoleMinRiders)
+		{
+			return;
+		}
+		
+		// ============================================
+		// CHECK IF RANGED ROLE IS ALREADY ASSIGNED
+		// Once assigned, it stays until combat ends - NO REASSIGNMENT!
+		// ============================================
+		for (int i = 0; i < MAX_RANGED_ROLE_TRACKED; i++)
+		{
+			if (g_rangedRoleData[i].isValid && g_rangedRoleData[i].mode != RangedRoleMode::None)
+			{
+				// Ranged role already assigned - skip assignment, just update existing
+				// (mode switching between Ranged/Melee is handled in STEP 4)
+				goto step4_update_existing;
+			}
+		}
+		
+		// ============================================
+		// STEP 2: Determine who gets ranged role
+		// Priority: Leaders/Captains first, then furthest from target
+		// ============================================
+		int rangedRoleRiderIndex = -1;
+		
+		// First check for leader/captain
+		for (int i = 0; i < validRiderCount; i++)
+		{
+			if (riders[i].isLeaderOrCaptain)
+			{
+				rangedRoleRiderIndex = i;
+				break;
+			}
+		}
+		
+		// If no leader/captain, find furthest from target
+		if (rangedRoleRiderIndex == -1)
+		{
+			float maxDistance = 0;
+			for (int i = 0; i < validRiderCount; i++)
+			{
+				if (riders[i].distanceToTarget > maxDistance)
+				{
+					maxDistance = riders[i].distanceToTarget;
+					rangedRoleRiderIndex = i;
+				}
+			}
+		}
+		
+		// ============================================
+		// STEP 3: Assign ranged role to selected rider
+		// ============================================
+		if (rangedRoleRiderIndex >= 0)
+		{
+			UInt32 riderFormID = riders[rangedRoleRiderIndex].riderFormID;
+			
+			// Check if already assigned
+			RangedRoleData* existingData = GetRangedRoleData(riderFormID);
+			if (!existingData || existingData->mode == RangedRoleMode::None)
+			{
+				// Assign new ranged role
+				RangedRoleData* data = GetOrCreateRangedRoleData(riderFormID);
+				if (data)
+				{
+					data->horseFormID = riders[rangedRoleRiderIndex].horseFormID;
+					data->targetFormID = sharedTarget ? sharedTarget->formID : 0;
+					data->mode = RangedRoleMode::Ranged;
+					data->isLeaderOrCaptain = riders[rangedRoleRiderIndex].isLeaderOrCaptain;
+					data->lastModeSwitchTime = currentTime;
+					data->assignedTime = currentTime;
+					
+					const char* riderName = CALL_MEMBER_FN(riders[rangedRoleRiderIndex].riderActor, GetReferenceName)();
+					_MESSAGE("CombatStyles: '%s' (%08X) assigned RANGED role (%s, dist: %.0f)",
+						riderName ? riderName : "Unknown",
+						riderFormID,
+						riders[rangedRoleRiderIndex].isLeaderOrCaptain ? "leader/captain" : "furthest",
+						riders[rangedRoleRiderIndex].distanceToTarget);
+					
+					// Track this assignment to prevent immediate follow package crash
+					g_lastRangedRoleAssignmentTime = currentTime;
+					g_lastAssignedRiderFormID = riderFormID;
+					
+					// Give bow if needed
+					if (!HasBowInInventory(riders[rangedRoleRiderIndex].riderActor))
+					{
+						GiveDefaultBow(riders[rangedRoleRiderIndex].riderActor);
+					}
+					
+					// Give arrows if needed
+					EquipArrows(riders[rangedRoleRiderIndex].riderActor);
+					
+					// Request weapon switch to bow
+					RequestWeaponSwitch(riders[rangedRoleRiderIndex].riderActor, WeaponRequest::Bow);
+				}
+			}
+		}
+		
+		// ============================================
+		// STEP 4: Update mode for existing ranged role riders
+		// Switch between Ranged and Melee based on distance
+		// ============================================
+	step4_update_existing:
+		for (int i = 0; i < MAX_RANGED_ROLE_TRACKED; i++)
+		{
+			if (!g_rangedRoleData[i].isValid) continue;
+			if (g_rangedRoleData[i].mode == RangedRoleMode::None) continue;
+			
+			UInt32 riderFormID = g_rangedRoleData[i].riderFormID;
+			
+			TESForm* riderForm = LookupFormByID(riderFormID);
+			if (!riderForm || riderForm->formType != kFormType_Character)
+			{
+				g_rangedRoleData[i].Reset();
+				g_rangedRoleCount--;
+				continue;
+			}
+			
+			Actor* rider = static_cast<Actor*>(riderForm);
+			if (!rider || rider->IsDead(1))
+			{
+				g_rangedRoleData[i].Reset();
+				g_rangedRoleCount--;
+				continue;
+			}
+			
+			// Get target
+			Actor* target = nullptr;
+			if (rider->currentCombatTarget != 0)
+			{
+				NiPointer<TESObjectREFR> targetRef;
+				LookupREFRByHandle(rider->currentCombatTarget, targetRef);
+				if (targetRef && targetRef->formType == kFormType_Character)
+				{
+					target = static_cast<Actor*>(targetRef.get());
+				}
+			}
+			if (!target && g_thePlayer && (*g_thePlayer))
+			{
+				target = *g_thePlayer;
+			}
+			if (!target) continue;
+			
+			// Calculate distance
+			float dx = target->pos.x - rider->pos.x;
+			float dy = target->pos.y - rider->pos.y;
+			float distanceToTarget = sqrt(dx * dx + dy * dy);
+			
+			float timeSinceSwitch = currentTime - g_rangedRoleData[i].lastModeSwitchTime;
+			
+			switch (g_rangedRoleData[i].mode)
+			{
+				case RangedRoleMode::Ranged:
+					// ============================================
+					// RANGED ROLE STAYS IN RANGED MODE FOREVER
+					// Unlike regular riders, ranged role riders NEVER chase with melee.
+					// If target gets close, they stand ground and use bow/melee at close range.
+					// This is the same behavior as mages - maintain distance, don't chase.
+					// ============================================
+					// DO NOT switch to melee mode - removed the mode switching logic
+					break;
+					
+				case RangedRoleMode::Melee:
+					// ============================================
+					// FORCE BACK TO RANGED MODE
+					// Ranged role should never be in melee mode - if somehow they got here,
+					// force them back to ranged mode immediately.
+					// ============================================
+					g_rangedRoleData[i].mode = RangedRoleMode::Ranged;
+					g_rangedRoleData[i].lastModeSwitchTime = currentTime;
+					
+					const char* riderName2 = CALL_MEMBER_FN(rider, GetReferenceName)();
+					_MESSAGE("CombatStyles: '%s' (%08X) RANGED ROLE forced back to RANGED mode",
+						riderName2 ? riderName2 : "Unknown", riderFormID);
+					break;
+			}
+		}
+	}
+	
+	void ClearRangedRoleAssignments()
+	{
+		for (int i = 0; i < MAX_RANGED_ROLE_TRACKED; i++)
+		{
+			g_rangedRoleData[i].Reset();
+		}
+		g_rangedRoleCount = 0;
+		_MESSAGE("CombatStyles: Cleared all ranged role assignments");
+	}
+	
+	void ClearRangedRoleForRider(UInt32 riderFormID)
+	{
+		for (int i = 0; i < MAX_RANGED_ROLE_TRACKED; i++)
+		{
+			if (g_rangedRoleData[i].isValid && g_rangedRoleData[i].riderFormID == riderFormID)
+			{
+				g_rangedRoleData[i].Reset();
+				g_rangedRoleCount--;
+				_MESSAGE("CombatStyles: Cleared ranged role for rider %08X", riderFormID);
+				return;
+			}
+		}
+	}
+	
+	// ============================================
+	// PRE-ASSIGN RANGED ROLE FOR CAPTAINS/LEADERS
+	// Called from MountedCombat.cpp when a Captain/Leader is first detected
+	// This ensures they get the ranged follow package from the very start
+	// instead of getting the default melee follow package first
+	// ============================================
+	bool PreAssignRangedRoleForCaptain(Actor* rider, Actor* mount, Actor* target)
+	{
+		if (!rider || !mount) return false;
+		
+		// Check if already assigned
+		if (IsInRangedRole(rider->formID))
+		{
+			_MESSAGE("CombatStyles: Captain %08X already has ranged role assigned", rider->formID);
+			return true;  // Already assigned
+		}
+		
+		// Get or create ranged role data
+		RangedRoleData* data = GetOrCreateRangedRoleData(rider->formID);
+		if (!data)
+		{
+			_MESSAGE("CombatStyles: ERROR - Could not create ranged role data for captain %08X", rider->formID);
+			return false;
+		}
+		
+		float currentTime = GetCurrentGameTime();
+		
+		// Set up ranged role data
+		data->horseFormID = mount->formID;
+		data->targetFormID = target ? target->formID : 0;
+		data->mode = RangedRoleMode::Ranged;
+		data->isLeaderOrCaptain = true;
+		data->lastModeSwitchTime = currentTime;
+		data->assignedTime = currentTime;
+		
+		// Track this assignment to prevent immediate follow package crash
+		g_lastRangedRoleAssignmentTime = currentTime;
+		g_lastAssignedRiderFormID = rider->formID;
+		
+		const char* riderName = CALL_MEMBER_FN(rider, GetReferenceName)();
+		_MESSAGE("CombatStyles: PRE-ASSIGNED ranged role to captain '%s' (%08X) at combat start",
+			riderName ? riderName : "Unknown", rider->formID);
+		
+		// ============================================
+		// GIVE BOW AND ARROWS - CRITICAL FOR RANGED ROLE!
+		// Without this, the captain has no bow and falls back to melee
+		// ============================================
+		if (!HasBowInInventory(rider))
+		{
+			GiveDefaultBow(rider);
+			_MESSAGE("CombatStyles: Gave default bow to captain '%s' (%08X)", 
+				riderName ? riderName : "Unknown", rider->formID);
+		}
+		
+		// Give arrows if needed
+		EquipArrows(rider);
+		
+		// Request weapon switch to bow via the state machine
+		RequestWeaponSwitch(rider, WeaponRequest::Bow);
+		
+		return true;
 	}
 }

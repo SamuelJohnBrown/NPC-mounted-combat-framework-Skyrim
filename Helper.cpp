@@ -3,15 +3,14 @@
 #include "CombatStyles.h"
 #include "DynamicPackages.h"
 #include "SpecialDismount.h"
-#include "MultiMountedCombat.h"
 #include "SpecialMovesets.h"
 #include "ArrowSystem.h"
 #include "CompanionCombat.h"
 #include "WeaponDetection.h"
+#include "FleeingBehavior.h"
 #include "MagicCastingSystem.h"
 #include "HorseMountScanner.h"
-#include "AILogging.h"
-#include "FleeingBehavior.h"
+#include "AILogging.h"  // For ClearAlarmCooldowns
 #include "config.h"
 
 namespace MountedNPCCombatVR
@@ -294,6 +293,15 @@ namespace MountedNPCCombatVR
 		// Update mounted combat system
 		UpdateMountedCombat();
 		
+		// Update horse mount scanner (for remounting dismounted NPCs)
+		UpdateHorseMountScanner();
+		
+		// ============================================
+		// PROCESS QUEUED DISENGAGES
+		// For multi-rider scenarios - process one disengage at a time
+		// ============================================
+		ProcessQueuedDisengages();
+		
 		// Validate actor with SEH protection
 		if (!IsActorValid(actor))
 		{
@@ -410,6 +418,39 @@ namespace MountedNPCCombatVR
 			// ============================================
 			if (inCombat)
 			{
+				// ============================================
+				// CRITICAL: CHECK DISENGAGE COOLDOWN FIRST
+				// If NPC recently disengaged, do NOT re-engage them!
+				// This prevents the rapid engage/disengage CTD loop
+				// ============================================
+				if (IsNPCOnDisengageCooldown(actor->formID))
+				{
+					// NPC is on disengage cooldown - allow dismount, don't re-engage
+					return OriginalDismount(actor);
+				}
+				
+				// ============================================
+				// CRITICAL: CHECK DISTANCE TO PLAYER
+				// If NPC is too far from player, don't engage them
+				// This prevents engaging NPCs that are beyond combat range
+				// ============================================
+				if (g_thePlayer && (*g_thePlayer))
+				{
+					Actor* player = *g_thePlayer;
+					float dx = actor->pos.x - player->pos.x;
+					float dy = actor->pos.y - player->pos.y;
+					float distToPlayer = sqrt(dx * dx + dy * dy);
+					
+					// If beyond MaxCombatDistance, don't engage
+					if (distToPlayer > MaxCombatDistance)
+					{
+						const char* actorName = CALL_MEMBER_FN(actor, GetReferenceName)();
+						_MESSAGE("DismountHook: NPC '%s' too far (%.0f > %.0f) - skipping engagement",
+							actorName ? actorName : "Unknown", distToPlayer, MaxCombatDistance);
+						return OriginalDismount(actor);
+					}
+				}
+				
 				// Check if this is a companion (uses CompanionCombat tracking)
 				bool isTrackedCompanion = (GetCompanionData(actor->formID) != nullptr);
 				
@@ -514,11 +555,19 @@ namespace MountedNPCCombatVR
 		_MESSAGE("MountedNPCCombatVR: === DEACTIVATING MOD ===");
 		g_modActive = false;
 		
+		// ============================================
+		// RELEASE AI CONTROL
+		// ============================================
+		
 		// Release all controlled mounts (restore their AI movement)
 		ReleaseAllMountControl();
 		
 		// Clear all follow tracking
 		ClearAllFollowingNPCs();
+		
+		// ============================================
+		// RESET CORE TRACKING SYSTEMS
+		// ============================================
 		
 		// Reset mounted combat tracking to clear any stored FormIDs
 		ResetAllMountedNPCs();
@@ -529,43 +578,66 @@ namespace MountedNPCCombatVR
 		// Reset CombatStyles cached forms (attack animations, etc.)
 		ResetCombatStylesCache();
 		
-		// Reset MultiMountedCombat system (ranged riders, Captain tracking, etc.)
-		ClearAllMultiRiders();
+		// Clear ranged role assignments
+		ClearRangedRoleAssignments();
+		
+		// Reset alarm cooldowns (prevents CTD on multiple disengagement)
+		ClearAlarmCooldowns();
+		
+		// Clear disengage queue (prevents stale disengages from processing)
+		ClearDisengageQueue();
 		
 		// Reset SpecialMovesets system (charge, rapid fire, turn tracking, etc.)
 		ResetAllSpecialMovesets();
 		
-		// Reset Arrow system
+		// ============================================
+		// RESET WEAPON SYSTEMS
+		// ============================================
+		
+		// Reset Weapon state machine (equip/draw/sheathe state)
+		ResetWeaponStateSystem();
+		
+		// Reset Arrow system (bow attacks, rapid fire)
 		ResetArrowSystem();
+		
+		// ============================================
+		// RESET FLEE SYSTEMS
+		// ============================================
+		
+		// Reset Tactical Flee system (health-based retreat)
+		ResetTacticalFlee();
+		
+		// Reset Civilian Flee system (flee to safe distance)
+		ResetCivilianFlee();
+		
+		// ============================================
+		// RESET MAGIC SYSTEM
+		// ============================================
+		
+		// Reset Magic Casting system (mage spell casting state)
+		ResetMagicCastingSystem();
+		
+		// ============================================
+		// RESET PACKAGE/MOVEMENT SYSTEMS
+		// ============================================
 		
 		// Reset DynamicPackage state (weapon switch tracking, horse movement, etc.)
 		ResetDynamicPackageState();
 		
+		// ============================================
+		// RESET COMPANION SYSTEM
+		// ============================================
+		
 		// Reset CompanionCombat system (mounted teammates/followers)
 		ResetCompanionCombat();
 		
-		// Reset WeaponDetection state (weapon state machine, equip tracking)
-		ResetWeaponStateSystem();
+		// ============================================
+		// RESET SCANNER SYSTEM
+		// ============================================
 		
-		// Reset MagicCastingSystem (spell casting state, delayed casts)
-		ResetMagicCastingSystem();
-		
-		// Reset HorseMountScanner (dismounted NPCs, available horses tracking)
+		// Stop and reset horse mount scanner
+		StopHorseMountScanner();
 		ResetHorseMountScanner();
-		ClearAllDismountedTracking();
-		
-		// Reset NPC Mounting Scanner
-		ResetNPCMountingScanner();
-		
-		// Reset AILogging (obstruction tracking, sheer drop detection)
-		ClearAllObstructionInfo();
-		
-		// Reset FleeingBehavior (tactical flee, civilian flee tracking)
-		ResetTacticalFlee();
-		ResetCivilianFlee();
-		
-		// Reset SpecialDismount (grabbed actors, horse grabs, controller tracking)
-		ShutdownSpecialDismount();
 		
 		_MESSAGE("MountedNPCCombatVR: Mod DEACTIVATED - all state reset");
 	}
@@ -869,13 +941,6 @@ namespace MountedNPCCombatVR
 		// Hot-reload config on every game load
 		loadConfig();
 		
-		// ============================================
-		// CRITICAL: Reset all cached forms on game load
-		// Cached pointers become invalid after load
-		// ============================================
-		ResetArrowSystemCache();
-		ResetMagicCastingSystemCache();
-		
 		if (g_thePlayer && (*g_thePlayer) && (*g_thePlayer)->loadedState)
 		{
 			_MESSAGE("MountedNPCCombatVR: Player loaded successfully - activating mod with delay");
@@ -889,10 +954,6 @@ namespace MountedNPCCombatVR
 		
 		// Hot-reload config on new game
 		loadConfig();
-		
-		// Reset cached forms for new game
-		ResetArrowSystemCache();
-		ResetMagicCastingSystemCache();
 		
 		ActivateModWithDelay();
 	}
